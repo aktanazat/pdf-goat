@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Launcher for pdf-goat. Runs the CLI inside its uv-managed environment,
+# syncing dependencies on first use.
+set -euo pipefail
+# Self-locating: resolve the symlink in ~/.local/bin back to this launcher so the
+# project works no matter where it's cloned (no hardcoded home path).
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+PROJECT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+exec uv run --project "$PROJECT_DIR" --quiet pdf-goat-cli "$@"

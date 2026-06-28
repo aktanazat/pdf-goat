@@ -1,0 +1,31 @@
+[project]
+name = "pdf-goat"
+version = "1.0.0"
+description = "Powerful PDF-editing CLI for the terminal"
+requires-python = ">=3.10"
+dependencies = [
+    "pymupdf>=1.24",
+    "pikepdf>=9",
+    "pypdf>=5",
+    "img2pdf>=0.5",
+    "Pillow>=10",
+    "markdown>=3.5",
+    "pdfplumber>=0.11",
+    "ocrmypdf>=16",
+    "pyhanko>=0.25",
+    "cryptography>=42",
+    "pdf2docx>=0.5",
+    "openpyxl>=3.1",
+    "python-pptx>=0.6",
+    "python-docx>=1.1",
+]
+
+[project.scripts]
+pdf-goat-cli = "pdf_goat.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pdf_goat"]
