@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+configuration=${CONFIGURATION:-release}
+destination=${1:-"$root/.build/PDF Goat.app"}
+case $destination in
+  *.app) ;;
+  *) printf '%s\n' "destination must end in .app: $destination" >&2; exit 2 ;;
+esac
+staging="$destination.building.$$"
+
+cleanup() {
+  rm -rf "$staging"
+}
+trap cleanup EXIT HUP INT TERM
+
+swift build --package-path "$root" -c "$configuration"
+bin_dir=$(swift build --package-path "$root" -c "$configuration" --show-bin-path)
+
+mkdir -p "$staging/Contents/MacOS" "$staging/Contents/Resources"
+cp "$bin_dir/PDFGoat" "$staging/Contents/MacOS/PDFGoat"
+cp "$root/App/Info.plist" "$staging/Contents/Info.plist"
+cp "$root/Sources/PDFGoat/Resources/AppIcon.icns" "$staging/Contents/Resources/AppIcon.icns"
+chmod 755 "$staging/Contents/MacOS/PDFGoat"
+/usr/bin/codesign --force --sign - "$staging"
+
+rm -rf "$destination"
+mv "$staging" "$destination"
+trap - EXIT HUP INT TERM
+printf '%s\n' "$destination"
