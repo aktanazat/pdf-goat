@@ -1,0 +1,31 @@
+{
+  "generator_schema_version": 1,
+  "marker": {
+    "schema_version": 1,
+    "arrangement": "red-green/blue-yellow",
+    "red": [230, 48, 48],
+    "green": [38, 176, 82],
+    "blue": [48, 96, 218],
+    "yellow": [235, 190, 28],
+    "channel_tolerance": 45,
+    "minimum_cell_pixels": 12
+  },
+  "documents": [
+    {
+      "document_id": "tiny",
+      "file_name": "tiny-3-page.pdf",
+      "sha256": "962e1bfdbfcf8f8e2cdd05de14ca0e595947f3e0733cff745306b5818b883dba",
+      "byte_count": 4229,
+      "page_count": 3,
+      "media_box": [0, 0, 612, 792]
+    },
+    {
+      "document_id": "mixed",
+      "file_name": "mixed-12-page.pdf",
+      "sha256": "f0552970305658a0d9fc3fe0ae1d8c6762fefbc085b0fa16d33b9e7db279a0ed",
+      "byte_count": 674282,
+      "page_count": 12,
+      "media_box": [0, 0, 612, 792]
+    }
+  ]
+}

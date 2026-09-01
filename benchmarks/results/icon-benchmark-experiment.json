@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "kind": "retained_a_b_experiment",
+  "publication_scope": "This receipt set is retained evidence for the runtime-icon A/B experiment. Its temporary app and PDF paths are not the general benchmark corpus.",
+  "raw_receipts": {
+    "path": "benchmarks/results/icon-benchmark-runs.jsonl",
+    "sha256": "04fd9283b14dc985be26acd73784d6051098188fadac9ffdad863d683d10dd72",
+    "bytes": 19765,
+    "records": 15
+  },
+  "summary_command": "python3 benchmarks/results/summarize_icon_benchmark.py",
+  "host": {
+    "cpu": "Apple M4 Pro",
+    "memory_bytes": 25769803776,
+    "memory_gib": 24,
+    "macos_version": "26.6.2",
+    "macos_build": "25G83",
+    "power_source": "ac",
+    "disk_cache_purged": false
+  },
+  "design": {
+    "rounds": 5,
+    "order": "interleaved",
+    "variants_per_round": 3,
+    "total_runs": 15
+  },
+  "document": {
+    "original_path": "/tmp/PDF-Goat-Demo.pdf",
+    "path_portable": false,
+    "page_count": 3,
+    "sha256": "87331a8c3f57fb5c24c9e157215587ed692fd5c7c2a3f924c0ce7be800064a17"
+  },
+  "apps": [
+    {
+      "arm": "baseline",
+      "original_path": "/tmp/PDF Goat Baseline.app",
+      "path_portable": false,
+      "bundle_id": "com.aktanazat.PDFGoat.PerfBaseline",
+      "executable_sha256": "a715db113eb9cae984917fc4cf3d6f680b38de44610aecaa9242423f924cb323",
+      "signing": "ad-hoc"
+    },
+    {
+      "arm": "no_runtime_icon",
+      "original_path": "/tmp/PDF Goat No Runtime Icon.app",
+      "path_portable": false,
+      "executable_sha256": "fb55482481883d393f82619b0e333864964bc9db6910b20ae3731bda67c1edb3"
+    },
+    {
+      "arm": "bundle_icon",
+      "original_path": "/tmp/PDF Goat Bundle Icon.app",
+      "path_portable": false,
+      "bundle_id": "com.aktanazat.PDFGoat.BundleIcon",
+      "executable_sha256": "04ba6109c22d82a1c81bf03a5e20fbc0a9dba3922788ca07afaf588b2e7bdc47",
+      "signing": "ad-hoc"
+    }
+  ],
+  "readiness_detector": {
+    "meaning": "first captured frame with a large light paper region and at least 24 dark interior pixels",
+    "claim_limit": "visible document content, not full-page completion",
+    "window_selection": "largest on-screen layer-0 window owned by the exact launched PID, minimum 720 by 500 points",
+    "capture_resolution": "nominal",
+    "analysis_size_pixels": [320, 240],
+    "region_of_interest_fraction": {
+      "x": [0.28, 0.92],
+      "y": [0.15, 0.90]
+    },
+    "paper_pixel": "red, green, and blue channels at least 235; alpha at least 240",
+    "paper_extent": "qualifying rows and columns each contain paper pixels across at least one quarter of the applicable span; paper width and height each cover at least one quarter of the region of interest",
+    "ink_pixel": "weighted luminance at most 105; alpha at least 240",
+    "paper_inset_pixels": 4,
+    "minimum_ink_pixels": 24,
+    "poll_interval_ms": 5,
+    "passing_frames_required": 1,
+    "observed_receipt_metrics": {
+      "captured_image_pixels": [1120, 780],
+      "detected_paper_pixels": [205, 180],
+      "detected_ink_pixels": 901
+    }
+  },
+  "main_process_medians": {
+    "baseline": {
+      "launch_to_visible_ms": 302.401,
+      "phys_footprint_ready_plus_750_ms_mib": 353.595,
+      "phys_footprint_ready_plus_2_s_mib": 226.548,
+      "startup_peak_phys_footprint_mib": 375.345
+    },
+    "bundle_icon": {
+      "launch_to_visible_ms": 272.132,
+      "phys_footprint_ready_plus_750_ms_mib": 270.079,
+      "phys_footprint_ready_plus_2_s_mib": 150.657,
+      "startup_peak_phys_footprint_mib": 297.392
+    }
+  }
+}
