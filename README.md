@@ -45,7 +45,7 @@ Requires [uv](https://docs.astral.sh/uv/). A few verbs need system tools.
 ```bash
 # 1. system deps (macOS; on Linux, use apt/dnf equivalents)
 brew install ghostscript qpdf tesseract          # compress, repair, OCR
-brew install --cask libreoffice                   # PDF<->Office conversion (optional)
+cargo install office2pdf-cli                      # DOCX/XLSX/PPTX->PDF (optional, Rust toolchain)
 
 # 2. clone anywhere (the launcher self-locates; no hardcoded paths)
 git clone https://github.com/aktanazat/pdf-goat.git ~/Documents/projects/pdf-goat

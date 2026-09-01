@@ -2640,41 +2640,50 @@ def cmd_convert_pptx(a):
 
 
 def cmd_convert_from_office(a):
-    src = resolve(a.file)
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    if not soffice:
-        raise PdfGoatError("convert from-office requires LibreOffice on PATH")
-    out = ensure_parent(a.output or str(src.with_suffix(".pdf")))
-    import tempfile
+    import pymupdf
 
-    with tempfile.TemporaryDirectory() as td:
+    src = resolve(a.file)
+    office2pdf = shutil.which("office2pdf")
+    if not office2pdf:
+        raise PdfGoatError(
+            "convert from-office requires office2pdf on PATH "
+            "(cargo install office2pdf-cli)"
+        )
+    out = ensure_parent(a.output or str(src.with_suffix(".pdf")))
+    # office2pdf truncates its output path before writing, so it writes a
+    # sibling that only replaces `out` once the run has succeeded.
+    partial = Path(out).with_name(Path(out).name + ".part")
+    try:
         proc = subprocess.run(
-            [
-                soffice,
-                "--headless",
-                f"-env:UserInstallation=file://{td}/profile",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                td,
-                str(src),
-            ],
+            [office2pdf, str(src), "-o", str(partial)],
             capture_output=True,
             text=True,
             timeout=180,
             check=False,
         )
-        produced = Path(td) / (src.stem + ".pdf")
-        if proc.returncode != 0 or not produced.exists():
-            raise PdfGoatError(
-                f"libreoffice failed: {(proc.stderr or proc.stdout).strip()[:200]}"
-            )
-        shutil.move(str(produced), out)
+    except subprocess.TimeoutExpired:
+        partial.unlink(missing_ok=True)
+        raise PdfGoatError("office2pdf timed out after 180s")
+    if proc.returncode != 0 or not partial.exists():
+        partial.unlink(missing_ok=True)
+        raise PdfGoatError(
+            f"office2pdf failed: {(proc.stderr or proc.stdout).strip()[:200]}"
+        )
+    os.replace(partial, out)
+    warnings = [
+        line.removeprefix("Warning: ")
+        for line in proc.stderr.splitlines()
+        if line.startswith("Warning: ")
+    ]
+    with pymupdf.open(out) as doc:
+        pages = doc.page_count
     return {
         "verb": "convert-from-office",
         "inputs": [str(src)],
         "outputs": [out],
-        "engine": "libreoffice",
+        "engine": "office2pdf",
+        "pages": pages,
+        "warnings": warnings,
     }
 
 
@@ -3234,6 +3243,12 @@ def render_human(result):
         )
         print(f"out  {result['outputs'][0]}")
         return
+    if verb == "convert-from-office":
+        print(f"out  {result['outputs'][0]}")
+        for warning in result["warnings"]:
+            print(f"warn {warning}")
+        print(f"engine={result['engine']}  pages={result['pages']}")
+        return
     line = []
     for key, value in result.items():
         if key in ("inputs", "verb"):
@@ -3594,7 +3609,8 @@ def _add_convert(sub):
     p.add_argument("-o", "--output")
     p.set_defaults(func=cmd_convert_pptx)
     p = ns.add_parser(
-        "from-office", help="convert an Office document to PDF with LibreOffice"
+        "from-office",
+        help="convert a .docx, .xlsx, or .pptx file to PDF with office2pdf",
     )
     p.add_argument("file")
     p.add_argument("-o", "--output")
