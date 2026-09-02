@@ -219,6 +219,30 @@ Specific rules:
 The [escalation gates](PLAN.md#escalation-gates) own the conditions for a
 compiled helper, foreign parser, or replacement renderer.
 
+### Launch signposts
+
+A document is attached and scrolled to its first page while the window is still
+off screen. The form-widget lock runs on every visible-pages change. The
+thumbnail sidebar is built one main-queue turn after the first frame, so its
+PDFKit thumbnail rendering never delays the second frame. Each step signposts
+on subsystem `dev.aktan.pdfgoat`, category `launch`.
+
+| Name | Kind | What it bounds |
+| --- | --- | --- |
+| `open.document` | interval | The `PDFDocument(url:)` parse for the requested file. |
+| `attach.document` | interval | The `pdfView.document` assignment, which lays out every page. |
+| `window.shown` | point | The window's first `showWindow`, after `displayIfNeeded`. |
+| `first.visible` | interval | Document attached to the turn after PDFKit first reports visible pages. |
+| `sidebar.ready` | interval | Building the `PDFThumbnailView` and linking it to the `PDFView`. |
+
+A `begin first.visible` with no `end` means the deferred turn never ran.
+
+The thumbnail view is the only memory PDF Goat can hand back: PDFKit exposes no
+API for its tile cache or decoded pages. A memory-pressure warning removes the
+thumbnail view from every document window; the return to normal rebuilds it,
+which emits `sidebar.ready` again. Read one launch with
+`log show --last 2m --signpost --predicate 'subsystem == "dev.aktan.pdfgoat"'`.
+
 ## Failure model and recovery
 
 | Small failures that can combine | Bad result | Defense layers |

@@ -1,5 +1,12 @@
 import AppKit
+import OSLog
 import PDFKit
+
+/// Launch signposts, read with
+/// `log show --last 2m --signpost --predicate 'subsystem == "dev.aktan.pdfgoat"'`.
+enum LaunchTrace {
+    static let signposter = OSSignposter(subsystem: "dev.aktan.pdfgoat", category: "launch")
+}
 
 @MainActor
 final class PDFGoatDocument: NSDocument {
@@ -7,11 +14,14 @@ final class PDFGoatDocument: NSDocument {
 
     init(sourceURL: URL) throws {
         let normalizedURL = sourceURL.standardizedFileURL.resolvingSymlinksInPath()
-        guard sourceURL.isFileURL, let pdfDocument = PDFDocument(url: normalizedURL) else {
+        let opened = LaunchTrace.signposter.withIntervalSignpost("open.document") {
+            sourceURL.isFileURL ? PDFDocument(url: normalizedURL) : nil
+        }
+        guard let opened else {
             throw DocumentOpenError.unreadable(sourceURL.lastPathComponent)
         }
 
-        self.pdfDocument = pdfDocument
+        pdfDocument = opened
         super.init()
         fileURL = normalizedURL
     }

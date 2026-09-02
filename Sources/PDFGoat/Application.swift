@@ -16,8 +16,11 @@ enum PDFGoatApplication {
 
 @MainActor
 final class ApplicationDelegate: NSObject, NSApplicationDelegate {
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMainMenu()
+        observeMemoryPressure()
         NSApp.activate()
 
         let paths = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-") }
@@ -113,6 +116,30 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         } else {
             alert.runModal()
         }
+    }
+
+    private func observeMemoryPressure() {
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical], queue: .main)
+        source.setEventHandler { [weak source] in
+            MainActor.assumeIsolated {
+                guard let source else {
+                    return
+                }
+                let relieved = source.data.contains(.normal)
+                for controller in NSDocumentController.shared.documents.flatMap(\.windowControllers) {
+                    guard let controller = controller as? DocumentWindowController else {
+                        continue
+                    }
+                    if relieved {
+                        controller.linkThumbnailSidebar()
+                    } else {
+                        controller.releaseThumbnailSidebar()
+                    }
+                }
+            }
+        }
+        source.activate()
+        memoryPressureSource = source
     }
 
     private func configureMainMenu() {

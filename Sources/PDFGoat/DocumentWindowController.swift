@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 import PDFKit
 import QuartzCore
 
@@ -11,13 +12,13 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
     private static let zoomStep: CGFloat = 1.189207115
 
     private let pdfView = PDFView()
-    private let thumbnailView = PDFThumbnailView()
+    private let sidebar = NSVisualEffectView()
     private let splitViewController = NSSplitViewController()
+    private var thumbnailView: PDFThumbnailView?
     private var pageStatus: NSTextField?
     private var pageTargetIndex: Int?
     private var zoomTarget: CGFloat?
-    private var protectedPages = Set<ObjectIdentifier>()
-    private var deferredSetupStarted = false
+    private var firstVisibleInterval: OSSignpostIntervalState?
 
     init(document: PDFDocument) {
         let window = NSWindow(
@@ -35,13 +36,13 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
 
         super.init(window: window)
 
-        configureDocumentView(document)
+        configureDocumentView()
         window.initialFirstResponder = pdfView
         configureToolbar()
         observePageChanges()
-        updatePageStatus()
         window.setContentSize(Self.defaultContentSize)
         window.center()
+        attach(document)
     }
 
     @available(*, unavailable)
@@ -50,23 +51,24 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
     }
 
     override func showWindow(_ sender: Any?) {
+        let firstShow = window.map { !$0.isVisible && !$0.isMiniaturized } ?? true
         super.showWindow(sender)
         window?.displayIfNeeded()
-        guard !deferredSetupStarted else {
-            return
-        }
-        deferredSetupStarted = true
-        DispatchQueue.main.async { [weak self] in
-            guard let self else {
-                return
-            }
-            thumbnailView.pdfView = pdfView
-            makeVisibleAnnotationsReadOnly()
+        if firstShow {
+            LaunchTrace.signposter.emitEvent("window.shown")
         }
     }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+    }
+
+    /// Drops the thumbnail view and its PDFKit-rendered images. The only
+    /// memory the app can hand back under pressure; `linkThumbnailSidebar`
+    /// rebuilds it.
+    func releaseThumbnailSidebar() {
+        thumbnailView?.removeFromSuperview()
+        thumbnailView = nil
     }
 
     @objc func toggleSidebar(_ sender: NSObject?) {
@@ -172,6 +174,24 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
 
     @objc private func visiblePagesChanged(_: Notification) {
         makeVisibleAnnotationsReadOnly()
+        // PDFKit posts the first notification before `visiblePages` is
+        // populated, so the first layout finishes one turn later.
+        guard let interval = firstVisibleInterval else {
+            return
+        }
+        firstVisibleInterval = nil
+        DispatchQueue.main.async { [weak self] in
+            LaunchTrace.signposter.endInterval("first.visible", interval)
+            self?.finishFirstLayout()
+        }
+    }
+
+    @objc private func liveScrollStarted(_: Notification) {
+        pdfView.interpolationQuality = .low
+    }
+
+    @objc private func liveScrollEnded(_: Notification) {
+        pdfView.interpolationQuality = .high
     }
 
     func pdfViewWillClick(onLink _: PDFView, with _: URL) {
@@ -187,22 +207,21 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         alert.beginSheetModal(for: window)
     }
 
-    private func configureDocumentView(_ document: PDFDocument) {
+    private func configureDocumentView() {
         pdfView.delegate = self
         pdfView.displayMode = .singlePageContinuous
         pdfView.displayDirection = .vertical
         pdfView.displaysPageBreaks = true
         pdfView.pageShadowsEnabled = true
         pdfView.autoScales = true
+        pdfView.interpolationQuality = .high
         pdfView.animations = ["scaleFactor": CABasicAnimation()]
-        thumbnailView.thumbnailSize = NSSize(width: 100, height: 130)
-        thumbnailView.maximumNumberOfColumns = 1
-        thumbnailView.allowsDragging = false
-        thumbnailView.allowsMultipleSelection = false
-        thumbnailView.backgroundColor = NSColor.unemphasizedSelectedContentBackgroundColor.withAlphaComponent(0.15)
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .behindWindow
+        sidebar.state = .followsWindowActiveState
 
         let sidebarController = NSViewController()
-        sidebarController.view = makeSidebar()
+        sidebarController.view = sidebar
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarController)
         sidebarItem.minimumThickness = 170
         sidebarItem.maximumThickness = 260
@@ -217,25 +236,54 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         splitViewController.addSplitViewItem(sidebarItem)
         splitViewController.addSplitViewItem(canvasItem)
         window?.contentViewController = splitViewController
-        pdfView.document = document
     }
 
-    private func makeSidebar() -> NSView {
-        let sidebar = NSVisualEffectView()
-        sidebar.material = .sidebar
-        sidebar.blendingMode = .behindWindow
-        sidebar.state = .followsWindowActiveState
-        thumbnailView.translatesAutoresizingMaskIntoConstraints = false
-        sidebar.addSubview(thumbnailView)
+    private func attach(_ document: PDFDocument) {
+        LaunchTrace.signposter.withIntervalSignpost("attach.document") {
+            pdfView.document = document
+        }
+        showDocumentStart(document)
+        updatePageStatus()
+        firstVisibleInterval = LaunchTrace.signposter.beginInterval("first.visible")
+    }
+
+    private func showDocumentStart(_ document: PDFDocument) {
+        guard let first = document.page(at: 0) else {
+            return
+        }
+        pdfView.go(to: first)
+    }
+
+    private func finishFirstLayout() {
+        observeLiveScroll()
+        makeVisibleAnnotationsReadOnly()
+        linkThumbnailSidebar()
+    }
+
+    func linkThumbnailSidebar() {
+        guard thumbnailView == nil else {
+            return
+        }
+        let interval = LaunchTrace.signposter.beginInterval("sidebar.ready")
+        let thumbnails = PDFThumbnailView()
+        thumbnails.thumbnailSize = NSSize(width: 100, height: 130)
+        thumbnails.maximumNumberOfColumns = 1
+        thumbnails.allowsDragging = false
+        thumbnails.allowsMultipleSelection = false
+        thumbnails.backgroundColor = NSColor.unemphasizedSelectedContentBackgroundColor.withAlphaComponent(0.15)
+        thumbnails.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(thumbnails)
 
         NSLayoutConstraint.activate([
-            thumbnailView.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 8),
-            thumbnailView.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
-            thumbnailView.topAnchor.constraint(equalTo: sidebar.safeAreaLayoutGuide.topAnchor, constant: 8),
-            thumbnailView.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -8),
+            thumbnails.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 8),
+            thumbnails.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
+            thumbnails.topAnchor.constraint(equalTo: sidebar.safeAreaLayoutGuide.topAnchor, constant: 8),
+            thumbnails.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -8),
         ])
 
-        return sidebar
+        thumbnails.pdfView = pdfView
+        thumbnailView = thumbnails
+        LaunchTrace.signposter.endInterval("sidebar.ready", interval)
     }
 
     private func configureToolbar() {
@@ -262,9 +310,26 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         )
     }
 
+    private func observeLiveScroll() {
+        guard let scrollView = pdfView.documentView?.enclosingScrollView else {
+            return
+        }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(liveScrollStarted(_:)),
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(liveScrollEnded(_:)),
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+    }
+
     private func makeVisibleAnnotationsReadOnly() {
-        for page in pdfView.visiblePages
-        where protectedPages.insert(ObjectIdentifier(page)).inserted {
+        for page in pdfView.visiblePages {
             for annotation in page.annotations
             where annotation.type == Self.widgetAnnotationType && !annotation.isReadOnly {
                 annotation.isReadOnly = true
