@@ -72,6 +72,20 @@ A capability record reports:
 - Whether it requires a dry run.
 - Its input, output, and error schema versions.
 
+## Standalone verb results
+
+Every standalone verb returns one JSON object per run. Five of them bound or reshape that object.
+
+`search` returns every hit on every page by default. `--first` stops at the first hit, `--limit N` stops after N hits, and `--pages RANGE` restricts the scan to a page range. `--first` is `--limit 1`; when both are given the last one wins. The result carries `truncated`, which is true only when a limit stopped the scan before the selected pages ran out. A caller that needs the full count runs the same query without a limit.
+
+`preflight` reports a page in its `empty_pages` finding when the page declares no font and no image. It does not extract page text, so a page that declares a font but draws no glyphs is not reported empty, and neither is a blank page whose font resources are inherited from the page tree.
+
+`text` with `-o` and without `--layout` streams the page text to that file. The result then reports `page_count` and the file path in `outputs`, and carries no `pages` list. Without `-o` the result carries the per-page text in `pages`. `--layout` always returns the per-page layout in `pages`, with or without `-o`.
+
+`get images` writes each stored stream as it stands: `.jpg` for DCT, `.jp2` for JPX, `.tif` for CCITT, `.tiff` for CMYK rasters, `.png` otherwise. A stencil mask is written with the PDF's sample values, not its painted appearance. An image pikepdf cannot read falls back to MuPDF, which re-encodes it.
+
+`split`, `extract`, `compress`, and `convert from-office` write through a sibling `.part` file and rename it over the destination. A failed run leaves neither file. An existing read-only destination is replaced, because the rename needs write access to the directory, not the file.
+
 ## Request envelope
 
 Every live document request has this outer shape:

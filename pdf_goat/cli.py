@@ -8,9 +8,6 @@ import argparse
 import json
 import os
 import re
-import shutil
-import sqlite3
-import subprocess
 import sys
 import time
 import unicodedata
@@ -18,7 +15,6 @@ from itertools import islice
 from pathlib import Path
 
 from .layout import extract_page_layout
-from .transcript import discover_transcripts, parse_transcript
 
 HOME = Path(os.environ.get("PDF_GOAT_HOME", Path.home() / ".pdf-goat"))
 DB_PATH = HOME / "ledger.db"
@@ -30,6 +26,8 @@ _DEFAULT_PAGE_WINDOW = 25
 # Ledger
 # --------------------------------------------------------------------------- #
 def _db():
+    import sqlite3
+
     HOME.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -108,6 +106,28 @@ def ensure_parent(path):
     return str(Path(path).expanduser().resolve())
 
 
+class AtomicOutput:
+    """Write through a sibling `.part` file so a failed write leaves nothing.
+
+    For verbs that write a whole file in one step. An in-place `.save(out)` on
+    an open pikepdf document keeps pikepdf's own same-file guard instead.
+    """
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.partial = f"{self.path}.part"
+
+    def __enter__(self):
+        return self.partial
+
+    def __exit__(self, error_type, error, traceback):
+        try:
+            if error_type is None:
+                os.replace(self.partial, self.path)
+        finally:
+            Path(self.partial).unlink(missing_ok=True)
+
+
 def parse_pages(spec, n):
     """Parse '2-5,9' (1-based, inclusive) into ordered 0-based indices."""
     out = []
@@ -137,6 +157,8 @@ def human_size(num):
 
 
 def weasyprint_bin():
+    import shutil
+
     wp = shutil.which("weasyprint")
     if not wp:
         raise PdfGoatError("from-html and from-md require weasyprint on PATH")
@@ -144,6 +166,8 @@ def weasyprint_bin():
 
 
 def run_weasyprint(args, stdin=None):
+    import subprocess
+
     proc = subprocess.run(
         [weasyprint_bin(), *args],
         input=stdin,
@@ -281,7 +305,7 @@ def _leaf_command_count(parser):
 
 
 def cmd_capabilities(a):
-    parser = build_parser()
+    parser = a.root_parser
     top_level = _subcommand_parsers(parser)
     if a.family and a.family not in top_level:
         raise PdfGoatError(f"unknown top-level command: {a.family}")
@@ -306,8 +330,19 @@ def cmd_capabilities(a):
     }
 
 
+def _page_text_and_words(page):
+    """Extract both forms from one text page; MuPDF builds it once per page."""
+    import pymupdf
+
+    textpage = page.get_textpage(flags=pymupdf.TEXTFLAGS_TEXT)
+    return (
+        page.get_text("text", textpage=textpage),
+        page.get_text("words", textpage=textpage),
+    )
+
+
 def _page_inventory(page, index):
-    text = page.get_text("text")
+    text, words = _page_text_and_words(page)
     return {
         "page": index + 1,
         "label": page.get_label(),
@@ -315,7 +350,7 @@ def _page_inventory(page, index):
         "height_pt": round(page.rect.height, 1),
         "rotation": page.rotation,
         "text_chars": len(text),
-        "word_count": len(page.get_text("words")),
+        "word_count": len(words),
         "image_count": len(page.get_images(full=True)),
         "link_count": len(page.get_links()),
         "annotation_count": sum(1 for _ in (page.annots() or ())),
@@ -390,7 +425,7 @@ def _page_preflight(page):
         "form_fields": sum(1 for _ in (page.widgets() or ())),
         "external_links": external_links,
         "unsafe_links": unsafe_links,
-        "empty": not page.get_text("text").strip() and not page.get_images(full=True),
+        "empty": not page.get_fonts() and not page.get_images(full=True),
     }
 
 
@@ -559,7 +594,7 @@ def _preflight_findings(content, structure, title, attachment_count):
             {
                 "code": "empty_pages",
                 "severity": "info",
-                "message": "Some pages contain neither text nor images.",
+                "message": "Some pages declare no font and no image.",
                 "pages": content["empty_pages"][:100],
                 "count": len(content["empty_pages"]),
             }
@@ -664,7 +699,8 @@ def cmd_split(a):
             for p in range(start, min(start + every, n)):
                 part.pages.append(pdf.pages[p])
             out = outdir / f"{src.stem}_{idx + 1:03d}.pdf"
-            part.save(out)
+            with AtomicOutput(out) as partial:
+                part.save(partial)
             part.close()
             outputs.append(str(out))
     return {
@@ -686,7 +722,8 @@ def cmd_extract(a):
         new = pikepdf.Pdf.new()
         for i in idxs:
             new.pages.append(pdf.pages[i])
-        new.save(out)
+        with AtomicOutput(out) as partial:
+            new.save(partial)
         new.close()
     return {
         "verb": "extract",
@@ -865,6 +902,9 @@ def cmd_form_fields(a):
 
 
 def fill_pdf_form(src, data, out, flatten):
+    import shutil
+    import subprocess
+
     from pypdf import PdfReader, PdfWriter
 
     reader = PdfReader(src)
@@ -960,6 +1000,9 @@ def cmd_watermark(a):
 
 
 def cmd_compress(a):
+    import shutil
+    import subprocess
+
     import pikepdf
 
     src = resolve(a.file)
@@ -970,7 +1013,9 @@ def cmd_compress(a):
     if gs:
         import tempfile
 
-        tmp = Path(tempfile.gettempdir()) / f"{src.stem}.gs.pdf"
+        handle, name = tempfile.mkstemp(prefix=f"{src.stem}.", suffix=".gs.pdf")
+        os.close(handle)
+        tmp = Path(name)
         proc = subprocess.run(
             [
                 gs,
@@ -986,23 +1031,27 @@ def cmd_compress(a):
             capture_output=True,
             check=False,
         )
-        if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+        if proc.returncode == 0 and tmp.stat().st_size > 0:
             source = tmp
-    with pikepdf.open(source) as pdf:
-        pdf.save(
-            out,
-            linearize=True,
-            compress_streams=True,
-            object_stream_mode=pikepdf.ObjectStreamMode.generate,
-        )
-    if source != src:
-        Path(source).unlink(missing_ok=True)
-    new = Path(out).stat().st_size
-    # Keep the input bytes if recompression produces a larger file.
-    kept_original = new >= orig
-    if kept_original:
-        shutil.copyfile(src, out)
-        new = orig
+        else:
+            tmp.unlink(missing_ok=True)
+    try:
+        with pikepdf.open(source) as pdf, AtomicOutput(out) as partial:
+            pdf.save(
+                partial,
+                linearize=True,
+                compress_streams=True,
+                object_stream_mode=pikepdf.ObjectStreamMode.generate,
+            )
+            new = Path(partial).stat().st_size
+            # Keep the input bytes if recompression produces a larger file.
+            kept_original = new >= orig
+            if kept_original:
+                shutil.copyfile(src, partial)
+                new = orig
+    finally:
+        if source != src:
+            Path(source).unlink(missing_ok=True)
     return {
         "verb": "compress",
         "inputs": [str(src)],
@@ -1021,30 +1070,41 @@ def cmd_text(a):
     import pymupdf
 
     src = resolve(a.file)
+    out = ensure_parent(a.output) if a.output else None
     doc = pymupdf.open(src)
+    result = {
+        "verb": "text",
+        "inputs": [str(src)],
+        "outputs": [out] if out else [],
+    }
+    if out and not a.layout:
+        # The file is the output, so stream to it and report a page count
+        # instead of holding the whole corpus twice more.
+        chars = 0
+        with Path(out).open("w") as handle:
+            for index in range(doc.page_count):
+                text = ("\n" if index else "") + doc[index].get_text("text")
+                handle.write(text)
+                chars += len(text)
+        result["char_count"] = chars
+        result["page_count"] = doc.page_count
+        doc.close()
+        return result
     pages = []
     for index in range(doc.page_count):
         page = doc[index]
         if a.layout:
-            layout = extract_page_layout(page)
-            pages.append({"page": index + 1, **layout})
+            pages.append({"page": index + 1, **extract_page_layout(page)})
         else:
             pages.append({"page": index + 1, "text": page.get_text("text")})
     full = "\n".join(page["text"] for page in pages)
     doc.close()
-    result = {
-        "verb": "text",
-        "inputs": [str(src)],
-        "outputs": [],
-        "char_count": len(full),
-        "pages": pages,
-    }
+    result["char_count"] = len(full)
+    result["pages"] = pages
     if a.layout:
         result["mode"] = "layout"
-    if a.output:
-        out = ensure_parent(a.output)
+    if out:  # layout mode only; plain text with -o returned above
         Path(out).write_text(full)
-        result["outputs"] = [out]
     return result
 
 
@@ -1087,6 +1147,8 @@ def cmd_from_md(a):
 
 
 def cmd_jobs(a):
+    import sqlite3
+
     with _db() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -1440,6 +1502,9 @@ def cmd_annotations(a):
 
 
 def cmd_annot_flatten(a):
+    import shutil
+    import subprocess
+
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "flat"))
     qpdf = shutil.which("qpdf")
@@ -2190,24 +2255,56 @@ def cmd_pages_replace(a):
 # --------------------------------------------------------------------------- #
 # Extract assets
 # --------------------------------------------------------------------------- #
+def _extract_image_with_mupdf(doc, xref, outdir):
+    """Write an image pikepdf could not extract.
+
+    pikepdf refuses a CMYK JPEG with an Adobe colour transform, and MuPDF
+    would re-encode that one, so a lone DCT stream with no Decode array is
+    copied as stored. Everything else goes through MuPDF.
+    """
+    lone_dct = doc.xref_get_key(xref, "Filter") in (
+        ("name", "/DCTDecode"),
+        ("array", "[/DCTDecode]"),
+    )
+    if lone_dct and doc.xref_get_key(xref, "Decode") == ("null", "null"):
+        written = outdir / f"img_{xref}.jpg"
+        written.write_bytes(doc.xref_stream_raw(xref))
+    else:
+        extracted = doc.extract_image(xref)
+        written = outdir / f"img_{xref}.{extracted['ext']}"
+        written.write_bytes(extracted["image"])
+    return str(written)
+
+
 def cmd_get_images(a):
+    import pikepdf
     import pymupdf
 
     src = resolve(a.file)
     outdir = out_dir(a, src, "images")
-    doc = pymupdf.open(src)
     outputs, seen = [], set()
-    for i in range(doc.page_count):
-        for img in doc.get_page_images(i):
-            xref = img[0]
-            if xref in seen:
-                continue
-            seen.add(xref)
-            d = doc.extract_image(xref)
-            p = outdir / f"img_{xref}.{d['ext']}"
-            p.write_bytes(d["image"])
-            outputs.append(str(p))
-    doc.close()
+    # MuPDF finds the images, including those nested in form XObjects; pikepdf
+    # writes the compressed stream out as it stands instead of re-encoding it.
+    # pikepdf declines with a dozen exception types (its own, Pillow's,
+    # NotImplementedError, ValueError), and MuPDF reads all of them.
+    with pymupdf.open(src) as doc, pikepdf.open(src) as pdf:
+        for i in range(doc.page_count):
+            for img in doc.get_page_images(i):
+                xref = img[0]
+                if xref in seen:
+                    continue
+                seen.add(xref)
+                obj = pdf.get_object(xref, 0)
+                if obj is None:  # the object sits at a later generation
+                    written = _extract_image_with_mupdf(doc, xref, outdir)
+                else:
+                    try:
+                        written = pikepdf.PdfImage(obj).extract_to(
+                            fileprefix=str(outdir / f"img_{xref}")
+                        )
+                    except Exception:  # noqa: BLE001
+                        written = _extract_image_with_mupdf(doc, xref, outdir)
+                outputs.append(written)
     return {
         "verb": "get-images",
         "inputs": [str(src)],
@@ -2528,6 +2625,9 @@ def cmd_convert_tables(a):
 
 
 def cmd_convert_pdfa(a):
+    import shutil
+    import subprocess
+
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "pdfa"))
     gs = shutil.which("gs")
@@ -2640,6 +2740,9 @@ def cmd_convert_pptx(a):
 
 
 def cmd_convert_from_office(a):
+    import shutil
+    import subprocess
+
     import pymupdf
 
     src = resolve(a.file)
@@ -2652,24 +2755,21 @@ def cmd_convert_from_office(a):
     out = ensure_parent(a.output or str(src.with_suffix(".pdf")))
     # office2pdf truncates its output path before writing, so it writes a
     # sibling that only replaces `out` once the run has succeeded.
-    partial = Path(out).with_name(Path(out).name + ".part")
-    try:
-        proc = subprocess.run(
-            [office2pdf, str(src), "-o", str(partial)],
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        partial.unlink(missing_ok=True)
-        raise PdfGoatError("office2pdf timed out after 180s")
-    if proc.returncode != 0 or not partial.exists():
-        partial.unlink(missing_ok=True)
-        raise PdfGoatError(
-            f"office2pdf failed: {(proc.stderr or proc.stdout).strip()[:200]}"
-        )
-    os.replace(partial, out)
+    with AtomicOutput(out) as partial:
+        try:
+            proc = subprocess.run(
+                [office2pdf, str(src), "-o", partial],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise PdfGoatError("office2pdf timed out after 180s")
+        if proc.returncode != 0 or not Path(partial).exists():
+            raise PdfGoatError(
+                f"office2pdf failed: {(proc.stderr or proc.stdout).strip()[:200]}"
+            )
     warnings = [
         line.removeprefix("Warning: ")
         for line in proc.stderr.splitlines()
@@ -2688,6 +2788,9 @@ def cmd_convert_from_office(a):
 
 
 def cmd_convert_audio(a):
+    import shutil
+    import subprocess
+
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "audio", "aiff"))
     say = shutil.which("say")
@@ -2735,6 +2838,9 @@ def cmd_convert_audio(a):
 # Optimize
 # --------------------------------------------------------------------------- #
 def cmd_optimize_reduce(a):
+    import shutil
+    import subprocess
+
     import pikepdf
 
     src = resolve(a.file)
@@ -2904,6 +3010,9 @@ def cmd_access_set(a):
 # Flatten annotations, forms, and transparency
 # --------------------------------------------------------------------------- #
 def cmd_pages_flatten(a):
+    import shutil
+    import subprocess
+
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "flattened"))
     qpdf = shutil.which("qpdf")
@@ -3019,6 +3128,9 @@ def cmd_compare_visual(a):
 # Misc
 # --------------------------------------------------------------------------- #
 def cmd_repair(a):
+    import shutil
+    import subprocess
+
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "repaired"))
     qpdf = shutil.which("qpdf")
@@ -3106,12 +3218,22 @@ def cmd_search(a):
     import pymupdf
 
     src = resolve(a.file)
-    doc = pymupdf.open(src)
+    limit = a.limit
+    if limit is not None and limit < 1:
+        raise PdfGoatError("--limit must be 1 or more")
     hits = []
-    for i in range(doc.page_count):
-        for r in doc[i].search_for(a.query):
-            hits.append({"page": i + 1, "rect": [round(v, 1) for v in r]})
-    doc.close()
+    truncated = False
+    with pymupdf.open(src) as doc:
+        indices = list(
+            parse_pages(a.pages, doc.page_count) if a.pages else range(doc.page_count)
+        )
+        for position, index in enumerate(indices):
+            for rect in doc[index].search_for(a.query):
+                hits.append({"page": index + 1, "rect": [round(v, 1) for v in rect]})
+            if limit and len(hits) >= limit:
+                truncated = len(hits) > limit or position + 1 < len(indices)
+                del hits[limit:]
+                break
     return {
         "verb": "search",
         "inputs": [str(src)],
@@ -3119,6 +3241,7 @@ def cmd_search(a):
         "query": a.query,
         "count": len(hits),
         "hits": hits,
+        "truncated": truncated,
     }
 
 
@@ -3144,8 +3267,11 @@ def cmd_count(a):
 
     src = resolve(a.file)
     doc = pymupdf.open(src)
-    words = sum(len(doc[i].get_text("words")) for i in range(doc.page_count))
-    chars = sum(len(doc[i].get_text("text")) for i in range(doc.page_count))
+    words = chars = 0
+    for index in range(doc.page_count):
+        text, page_words = _page_text_and_words(doc[index])
+        words += len(page_words)
+        chars += len(text)
     pages = doc.page_count
     doc.close()
     return {
@@ -3218,6 +3344,12 @@ def render_human(result):
                 print(f"  {key:<12}{value}")
         return
     if verb == "text":
+        if "page_count" in result:
+            print(
+                f"# {result['char_count']} chars across {result['page_count']} pages"
+                f" -> {result['outputs'][0]}"
+            )
+            return
         print(f"# {result['char_count']} chars across {len(result['pages'])} pages")
         print()
         for page in result["pages"]:
@@ -3695,6 +3827,15 @@ def _add_misc(sub):
     p = sub.add_parser("search", help="find text and return PDF-point rectangles")
     p.add_argument("file")
     p.add_argument("query")
+    p.add_argument(
+        "--first",
+        action="store_const",
+        const=1,
+        dest="limit",
+        help="stop at the first hit",
+    )
+    p.add_argument("--limit", type=int, help="stop after this many hits")
+    p.add_argument("--pages", help="default: all pages")
     p.set_defaults(func=cmd_search)
     p = sub.add_parser("overlay", help="stamp one PDF over another")
     p.add_argument("file")
@@ -3710,6 +3851,8 @@ def _add_misc(sub):
 # CLI
 # --------------------------------------------------------------------------- #
 def cmd_transcript_read(a):
+    from .transcript import parse_transcript
+
     src = resolve(a.file)
     output_path = None
     if a.output:
@@ -3732,6 +3875,8 @@ def cmd_transcript_read(a):
 
 
 def cmd_transcript_resolve(a):
+    from .transcript import discover_transcripts
+
     rows = discover_transcripts(a.root, a.glob)
     return {
         "verb": "transcript-resolve",
@@ -3772,7 +3917,8 @@ def build_parser():
     p = PdfGoatArgumentParser(
         prog="pdf-goat", description="Local PDF editing and inspection tool"
     )
-    p.set_defaults(ledger=True)
+    # `capabilities` reports this parser instead of building a second copy.
+    p.set_defaults(root_parser=p, ledger=True)
     p.add_argument(
         "--agent", action="store_true", help="write JSON output even on a TTY"
     )

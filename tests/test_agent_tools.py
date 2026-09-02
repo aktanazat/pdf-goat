@@ -9,9 +9,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pikepdf
 import pymupdf
 
 from pdf_goat import cli
+from tests.fixtures import (
+    jpeg_bytes,
+    write_declined_image_pdf,
+    write_empty_page_pdf,
+    write_image_pdf,
+)
 
 
 class AgentToolTests(unittest.TestCase):
@@ -544,6 +551,118 @@ class AgentToolTests(unittest.TestCase):
         self.assertEqual(preflight["risk"], "high")
         self.assertEqual(preflight["unsafe_links"], 1)
         self.assertEqual(preflight["launch_actions"], 1)
+
+    def test_count_reports_mupdf_word_boxes_and_text_characters(self) -> None:
+        counted = self.run_agent("count", str(self.source))
+        with pymupdf.open(self.source) as document:
+            words = sum(len(page.get_text("words")) for page in document)
+            characters = sum(len(page.get_text("text")) for page in document)
+        self.assertEqual(counted["pages"], 2)
+        self.assertEqual(counted["words"], words)
+        self.assertEqual(counted["chars"], characters)
+
+        inspected = self.run_agent("inspect", str(self.source))
+        with pymupdf.open(self.source) as document:
+            first = document[0]
+            self.assertEqual(
+                inspected["pages"][0]["word_count"], len(first.get_text("words"))
+            )
+            self.assertEqual(
+                inspected["pages"][0]["text_chars"], len(first.get_text("text"))
+            )
+
+    def test_preflight_calls_a_page_empty_only_without_fonts_and_images(self) -> None:
+        source = write_empty_page_pdf(self.tempdir / "empty-pages.pdf")
+        preflight = self.run_agent("preflight", str(source))
+        finding = next(
+            item for item in preflight["findings"] if item["code"] == "empty_pages"
+        )
+        self.assertEqual(finding["pages"], [1])
+        self.assertEqual(finding["count"], 1)
+
+    def test_image_extraction_writes_the_compressed_stream_unchanged(self) -> None:
+        rgb = jpeg_bytes("RGB", (32, 24))
+        cmyk = jpeg_bytes("CMYK", (16, 12))
+        source = write_image_pdf(self.tempdir / "images.pdf", rgb, cmyk)
+        outdir = self.tempdir / "extracted-images"
+        result = self.run_agent("get", "images", str(source), "-o", str(outdir))
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(
+            {Path(path).read_bytes() for path in result["outputs"]}, {rgb, cmyk}
+        )
+
+    def test_images_pikepdf_declines_fall_back_to_mupdf(self) -> None:
+        source = write_declined_image_pdf(self.tempdir / "declined.pdf")
+        outdir = self.tempdir / "declined-images"
+        result = self.run_agent("get", "images", str(source), "-o", str(outdir))
+        self.assertEqual(result["count"], 2)
+        for path in result["outputs"]:
+            self.assertTrue(Path(path).stat().st_size > 0, path)
+
+    def test_search_stops_early_and_reports_truncation(self) -> None:
+        every = self.run_agent("search", str(self.source), "Page")
+        self.assertEqual(every["count"], 2)
+        self.assertFalse(every["truncated"])
+
+        first = self.run_agent("search", str(self.source), "Page", "--first")
+        self.assertEqual(first["count"], 1)
+        self.assertEqual(first["hits"][0]["page"], 1)
+        self.assertTrue(first["truncated"])
+
+        limited = self.run_agent("search", str(self.source), "Page", "--limit", "2")
+        self.assertEqual(limited["count"], 2)
+        self.assertFalse(limited["truncated"])
+
+        second = self.run_agent("search", str(self.source), "Page", "--pages", "2")
+        self.assertEqual([hit["page"] for hit in second["hits"]], [2])
+        self.assertFalse(second["truncated"])
+
+        inside = self.run_agent("search", str(self.source), "e", "--limit", "5")
+        self.assertEqual(inside["count"], 5)
+        self.assertTrue(inside["truncated"])
+        self.assertGreater(self.run_agent("search", str(self.source), "e")["count"], 5)
+
+        error = self.run_agent_error("search", str(self.source), "Page", "--limit", "0")
+        self.assertIn("--limit", error["error"])
+
+    def test_text_output_file_replaces_the_page_bodies(self) -> None:
+        out = self.tempdir / "text.txt"
+        written = self.run_agent("text", str(self.source), "-o", str(out))
+        self.assertEqual(written["page_count"], 2)
+        self.assertNotIn("pages", written)
+        self.assertEqual(written["outputs"], [str(out.resolve())])
+        self.assertEqual(written["char_count"], len(out.read_text()))
+        self.assertNotIn("Page 1 agent text", json.dumps(written))
+        self.assertIn("Page 1 agent text", out.read_text())
+
+        inline = self.run_agent("text", str(self.source))
+        self.assertEqual(inline["char_count"], written["char_count"])
+        self.assertIn("Page 1 agent text", inline["pages"][0]["text"])
+
+    def test_compress_in_place_reports_the_size_on_disk(self) -> None:
+        target = self.tempdir / "inplace.pdf"
+        shutil.copyfile(self.source, target)
+        result = self.run_agent("compress", str(target), "-o", str(target))
+        self.assertEqual(result["compressed_bytes"], target.stat().st_size)
+        with pikepdf.open(target) as pdf:
+            self.assertEqual(len(pdf.pages), 2)
+
+    def test_a_failed_write_leaves_no_output_and_no_partial(self) -> None:
+        target = self.tempdir / "atomic" / "out.pdf"
+        target.parent.mkdir()
+        with self.assertRaises(ZeroDivisionError), cli.AtomicOutput(target) as partial:
+            Path(partial).write_bytes(b"half a file")
+            raise ZeroDivisionError
+        self.assertEqual(list(target.parent.iterdir()), [])
+
+        # The rename can fail as well; a directory in the way is one way.
+        blocked = self.tempdir / "blocked.pdf"
+        blocked.mkdir()
+        error = self.run_agent_error(
+            "extract", str(self.source), "--pages", "1", "-o", str(blocked)
+        )
+        self.assertIn("directory", error["error"].lower())
+        self.assertEqual(sorted(self.tempdir.glob("blocked.pdf*")), [blocked])
 
 
 if __name__ == "__main__":
