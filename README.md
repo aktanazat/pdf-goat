@@ -69,6 +69,7 @@ pdf-goat redact statement.pdf --find "[0-9]{3}-[0-9]{2}-[0-9]{4}" -o clean.pdf
 pdf-goat --agent capabilities pages    # discover one command family
 pdf-goat --agent inspect report.pdf --limit 10
 pdf-goat --agent preflight report.pdf
+pdf-goat --agent search report.pdf invoice --first   # stop at the first hit
 pdf-goat render report.pdf --pages 1 --clip 72,72,540,720 -o renders
 pdf-goat --agent info report.pdf        # JSON output for scripts and agents
 ```
@@ -106,3 +107,20 @@ swift benchmarks/pdf_benchmark.swift summarize \
 `--preview` is optional. Every included comparator needs an explicit app path.
 The summary reports the median, median absolute deviation, p95, minimum, and
 maximum.
+
+A corpus manifest can also time files it did not generate. A document entry
+that carries a `path`, absolute or relative to the manifest directory, is
+external: `generate` skips it, and `run` verifies the file on disk against the
+entry's `sha256` and `byte_count` before copying it into the session
+directory, so the corpus stays content addressed. An entry missing either
+field fails with `corpus_mismatch` and prints the computed digest and byte
+count to paste back. Each entry also declares how a trial decides the document
+is on screen with `readiness`: `marker` looks for the four-colour marker the
+generated fixtures carry, and `content` looks for white paper carrying dark
+ink, which is what a real file has. `marker` is the default. The detector that
+confirmed each trial is recorded in `readiness.detector`, and the summary
+names it per group in `metric`. Both detectors confirm on two consecutive
+passing frames whose scores agree within a tenth, so a page still painting
+does not count as ready. `generate` copies the manifest verbatim, so a
+relative external `path` must be resolvable from the output directory too;
+point `run --corpus` at the manifest's own directory for external entries.

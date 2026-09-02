@@ -13,7 +13,7 @@ let footprintDelayNS: UInt64 = 750_000_000
 let footprintToleranceNS: UInt64 = 25_000_000
 let windowSize = CGSize(width: 1_200, height: 800)
 let timeoutNS: UInt64 = 15_000_000_000
-let schemaVersion = 2
+let schemaVersion = 3
 
 struct BenchError: Error, CustomStringConvertible {
     let code: String
@@ -140,13 +140,28 @@ struct Marker: Codable {
     let minimumCellPixels: Int
 }
 
+// How a trial decides the document is on screen. `marker` looks for the generated four-colour
+// marker, `content` for white paper carrying dark ink. Absent in a manifest means `marker`.
+enum Readiness: String, Codable {
+    case marker
+    case content
+
+    var metric: String { "request_to_confirmed_visible_\(rawValue)" }
+}
+
+// A document entry either names a generated fixture (`path` nil, bytes rebuilt from `generated`)
+// or points at an external file through `path`, absolute or relative to the manifest directory.
+// Both carry sha256 and byte_count, so the corpus stays content addressed either way.
 struct Fixture: Codable {
     let documentId: String
     let fileName: String
-    let sha256: String
-    let byteCount: Int
+    let path: String?
+    let sha256: String?
+    let byteCount: Int?
     let pageCount: Int
-    let mediaBox: [Int]
+    let readiness: Readiness?
+
+    var isGenerated: Bool { path == nil }
 }
 
 struct Manifest: Codable {
@@ -258,12 +273,17 @@ func generated(_ manifest: Manifest) -> [String: Data] {
     ]
 }
 
+// Digest and byte count as the manifest declares them, for the message an operator pastes back.
+func declared(_ fixture: Fixture) -> String {
+    "\(fixture.sha256 ?? "no sha256")/\(fixture.byteCount.map(String.init) ?? "no byte_count")"
+}
+
 func checkedCorpus(_ manifest: Manifest) throws -> [String: Data] {
     let files = generated(manifest)
-    for fixture in manifest.documents {
+    for fixture in manifest.documents where fixture.isGenerated {
         guard let data = files[fixture.fileName], digest(data) == fixture.sha256, data.count == fixture.byteCount else {
             let actual = files[fixture.fileName].map { "\(digest($0))/\($0.count)" } ?? "missing"
-            throw BenchError(code: "corpus_mismatch", detail: "\(fixture.fileName) expected \(fixture.sha256)/\(fixture.byteCount), got \(actual)")
+            throw BenchError(code: "corpus_mismatch", detail: "\(fixture.fileName) expected \(declared(fixture)), got \(actual)")
         }
     }
     return files
@@ -273,14 +293,15 @@ func generateMode(output: String) throws {
     let manifest = try loadManifest()
     let files = try checkedCorpus(manifest)
     let directory = canonical(output)
-    let outputs = manifest.documents.map {
+    let fixtures = manifest.documents.filter(\.isGenerated)
+    let outputs = fixtures.map {
         directory.appendingPathComponent($0.fileName)
     } + [directory.appendingPathComponent("corpus.json")]
     if let existing = outputs.first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
         throw BenchError(code: "output_exists", detail: existing.path)
     }
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    for fixture in manifest.documents {
+    for fixture in fixtures {
         try files[fixture.fileName]!.write(
             to: directory.appendingPathComponent(fixture.fileName), options: .atomic
         )
@@ -288,7 +309,7 @@ func generateMode(output: String) throws {
     try Data(contentsOf: URL(fileURLWithPath: manifestPath())).write(
         to: directory.appendingPathComponent("corpus.json"), options: .atomic
     )
-    print("generated \(manifest.documents.count) fixtures in \(directory.path)")
+    print("generated \(fixtures.count) fixtures in \(directory.path)")
 }
 
 // MARK: Process, app, and host identity
@@ -467,11 +488,15 @@ struct HostReceipt: Codable {
     let diskCachePurged: Bool
 }
 
-func host() -> HostReceipt {
+func host() throws -> HostReceipt {
     let display = CGMainDisplayID()
     let bounds = CGDisplayBounds(display)
-    let pixelWidth = Int(CGDisplayPixelsWide(display))
-    let mode = CGDisplayCopyDisplayMode(display)
+    // CGDisplayPixelsWide/High return points on a Retina display, so the display mode owns the
+    // pixel dimensions and the backing scale is derived from them.
+    guard let mode = CGDisplayCopyDisplayMode(display) else {
+        throw BenchError(code: "geometry_mismatch", detail: "no display mode for the main display")
+    }
+    let pixelWidth = mode.pixelWidth
     let power = (try? command("/usr/bin/pmset", ["-g", "batt"]).stdout).map { $0.contains("AC Power") ? "ac" : ($0.contains("Battery Power") ? "battery" : "unknown") } ?? "unknown"
     let colorName = CGDisplayCopyColorSpace(display).name.map { $0 as String } ?? "unknown"
     return HostReceipt(
@@ -481,9 +506,9 @@ func host() -> HostReceipt {
         osVersion: ProcessInfo.processInfo.operatingSystemVersionString,
         osBuild: sysctlString("kern.osversion") ?? "unknown",
         displayPoints: [Int(bounds.width), Int(bounds.height)],
-        displayPixels: [pixelWidth, Int(CGDisplayPixelsHigh(display))],
+        displayPixels: [pixelWidth, mode.pixelHeight],
         backingScale: bounds.width > 0 ? Double(pixelWidth) / Double(bounds.width) : 0,
-        refreshHz: mode?.refreshRate ?? 0,
+        refreshHz: mode.refreshRate,
         colorSpace: colorName,
         powerSource: power,
         lowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled,
@@ -738,19 +763,143 @@ func markerScore(_ pixels: Pixels, marker: Marker) -> Double? {
     return nil
 }
 
+// The content detector, for real documents that carry no generated marker: white paper with dark
+// ink on it. Thresholds, region of interest, and stage names come from the wave-2 open-time probe
+// they were calibrated on. The ink gate is a count, not a fraction, because pst-geo page 1 is
+// sparse vector art with 434 ink samples at 0.41 percent ink, which a 0.5 percent gate rejects on
+// a drawn page.
+let contentStride = 2
+let contentRegion = (x: 0.28...0.92, y: 0.15...0.90)
+let paperChannelMin = 235
+let inkLumaMax = 105
+let contentAlphaMin: UInt8 = 240
+let minimumInkPixels = 24
+let minimumPaperFraction = 0.5
+let paperInset = 4
+
+struct InkScore {
+    var stage: String
+    var paperWidth = 0
+    var paperHeight = 0
+    var inkPixels = 0
+    var inkFraction = 0.0
+    var paperFraction = 0.0
+    var qualifyingRows = 0
+    var qualifyingColumns = 0
+    var alphaMax: UInt8 = 0
+    var lumaHistogram: [Int] = []
+
+    var passes: Bool { stage == "measured" && inkPixels >= minimumInkPixels && paperFraction >= minimumPaperFraction }
+    var line: String {
+        "stage=\(stage) paper=\(paperWidth)x\(paperHeight) rows=\(qualifyingRows) cols=\(qualifyingColumns) ink=\(inkPixels) inkFrac=\(String(format: "%.4f", inkFraction)) paperFrac=\(String(format: "%.4f", paperFraction)) alphaMax=\(alphaMax) luma16=\(lumaHistogram)"
+    }
+}
+
+struct Sample {
+    let red: Int, green: Int, blue: Int, alpha: UInt8
+
+    init(_ pixels: Pixels, x: Int, y: Int) {
+        let offset = (y * pixels.width + x) * 4
+        red = Int(pixels.bytes[offset]); green = Int(pixels.bytes[offset + 1]); blue = Int(pixels.bytes[offset + 2])
+        alpha = pixels.bytes[offset + 3]
+    }
+
+    var luma: Int { (red * 299 + green * 587 + blue * 114) / 1_000 }
+    var opaque: Bool { alpha >= contentAlphaMin }
+    var isPaper: Bool { red >= paperChannelMin && green >= paperChannelMin && blue >= paperChannelMin }
+    var isInk: Bool { luma <= inkLumaMax }
+}
+
+// At least a quarter of `span` samples.
+func quarterSpan(_ count: Int, of span: Int) -> Bool { count * 4 >= span }
+
+func inkScore(_ pixels: Pixels) -> InkScore {
+    let x0 = Int(Double(pixels.width) * contentRegion.x.lowerBound), x1 = Int(Double(pixels.width) * contentRegion.x.upperBound)
+    let y0 = Int(Double(pixels.height) * contentRegion.y.lowerBound), y1 = Int(Double(pixels.height) * contentRegion.y.upperBound)
+    guard x1 - x0 > 40, y1 - y0 > 40 else { return InkScore(stage: "roi_too_small") }
+    // Rows and columns carrying paper across at least a quarter of their span bound the page.
+    var rowPaper = [Int](repeating: 0, count: y1 - y0)
+    var columnPaper = [Int](repeating: 0, count: x1 - x0)
+    var alphaMax: UInt8 = 0
+    var luma16 = [Int](repeating: 0, count: 16)
+    for y in stride(from: y0, to: y1, by: contentStride) {
+        for x in stride(from: x0, to: x1, by: contentStride) {
+            let sample = Sample(pixels, x: x, y: y)
+            alphaMax = max(alphaMax, sample.alpha)
+            luma16[min(15, sample.luma / 16)] += 1
+            if sample.opaque, sample.isPaper {
+                rowPaper[y - y0] += 1
+                columnPaper[x - x0] += 1
+            }
+        }
+    }
+    let rows = (0..<(y1 - y0)).filter { quarterSpan(rowPaper[$0], of: (x1 - x0) / contentStride) }
+    let columns = (0..<(x1 - x0)).filter { quarterSpan(columnPaper[$0], of: (y1 - y0) / contentStride) }
+    var score = InkScore(stage: "no_paper_span", qualifyingRows: rows.count, qualifyingColumns: columns.count, alphaMax: alphaMax, lumaHistogram: luma16)
+    guard let top = rows.first, let bottom = rows.last, let left = columns.first, let right = columns.last else { return score }
+    score.paperWidth = right - left + 1
+    score.paperHeight = bottom - top + 1
+    let inkX0 = x0 + left + paperInset, inkX1 = x0 + right - paperInset
+    let inkY0 = y0 + top + paperInset, inkY1 = y0 + bottom - paperInset
+    guard quarterSpan(score.paperWidth, of: x1 - x0), quarterSpan(score.paperHeight, of: y1 - y0), inkX1 > inkX0, inkY1 > inkY0 else {
+        score.stage = "paper_too_small"
+        return score
+    }
+    var ink = 0, paper = 0, total = 0
+    for y in stride(from: inkY0, through: inkY1, by: contentStride) {
+        for x in stride(from: inkX0, through: inkX1, by: contentStride) {
+            let sample = Sample(pixels, x: x, y: y)
+            total += 1
+            guard sample.opaque else { continue }
+            if sample.isInk { ink += 1 }
+            if sample.isPaper { paper += 1 }
+        }
+    }
+    guard total > 0 else {
+        score.stage = "empty_paper_box"
+        return score
+    }
+    score.stage = "measured"
+    score.inkPixels = ink
+    score.inkFraction = Double(ink) / Double(total)
+    score.paperFraction = Double(paper) / Double(total)
+    return score
+}
+
+// One frame's verdict: a score when the document is on screen, and the line an operator reads
+// out of a timeout to see how far the frame got.
+func frameScore(_ pixels: Pixels, readiness: Readiness, marker: Marker) -> (score: Double?, line: String) {
+    switch readiness {
+    case .marker:
+        let score = markerScore(pixels, marker: marker)
+        return (score, "stage=marker score=\(score.map { String(format: "%.3f", $0) } ?? "none")")
+    case .content:
+        let ink = inkScore(pixels)
+        return (ink.passes ? ink.inkFraction : nil, ink.line)
+    }
+}
+
+// Two consecutive passing frames with a steady score confirm readiness. A page still painting
+// grows its ink fraction frame to frame, so a score that moved by more than a tenth restarts the
+// candidate instead of confirming it.
+let confirmTolerance = 0.1
+
 struct Tracker {
     var candidate: (UInt64, Double)?
     var frames = 0
     mutating func add(time: UInt64, score: Double?) -> (UInt64, UInt64, Double, Double)? {
         frames += 1
         guard let score else { candidate = nil; return nil }
-        if let candidate { return (candidate.0, time, candidate.1, score) }
+        if let candidate, abs(score - candidate.1) <= confirmTolerance * max(score, candidate.1) {
+            return (candidate.0, time, candidate.1, score)
+        }
         candidate = (time, score)
         return nil
     }
 }
 
 struct ReadinessReceipt: Codable {
+    let detector: Readiness
     let framesExamined: Int
     let tFirstPassNs: UInt64
     let tConfirmNs: UInt64
@@ -790,14 +939,16 @@ struct DelayedFootprintSample {
     let bytes: UInt64
 }
 
-func waitForMarker(
+func waitForReady(
     window: BoundWindow,
     process: ProcessID,
     requestNS: UInt64,
+    readiness: Readiness,
     marker: Marker,
     samples: inout [MemorySample]
 ) throws -> ReadySample {
     var tracker = Tracker()
+    var lastFrame = "no frame captured"
     var next = nowNS()
     while nowNS() < requestNS + timeoutNS {
         sleep(until: next)
@@ -806,13 +957,16 @@ func waitForMarker(
             throw BenchError(code: "capture_denied", detail: "window capture failed")
         }
         let t = nowNS()
-        let ready = tracker.add(time: t, score: markerScore(pixels, marker: marker))
+        let frame = frameScore(pixels, readiness: readiness, marker: marker)
+        lastFrame = frame.line
+        let ready = tracker.add(time: t, score: frame.score)
         guard let bytes = footprint(process.pid) else {
             throw BenchError(code: "rusage_failed", detail: "startup sample failed")
         }
         samples.append(MemorySample(tNs: t, afterRequestNs: t - requestNS, bytes: bytes))
         if let ready {
             let receipt = ReadinessReceipt(
+                detector: readiness,
                 framesExamined: tracker.frames,
                 tFirstPassNs: ready.0,
                 tConfirmNs: ready.1,
@@ -824,8 +978,8 @@ func waitForMarker(
         }
         next = t + pollNS
     }
-    let code = tracker.candidate == nil ? "marker_timeout" : "marker_unstable"
-    throw BenchError(code: code, detail: "two consecutive passing marker frames were not observed")
+    let code = "\(readiness.rawValue)_\(tracker.candidate == nil ? "timeout" : "unstable")"
+    throw BenchError(code: code, detail: "two consecutive passing \(readiness.rawValue) frames were not observed; last frame \(lastFrame)")
 }
 
 func sampleDelayedFootprint(
@@ -859,11 +1013,11 @@ func sampleDelayedFootprint(
     return DelayedFootprintSample(dueNS: due, actualNS: actual, latenessNS: late, bytes: bytes)
 }
 
-func observe(process: ProcessID, pdf: String, requestNS: UInt64, marker: Marker) throws -> Observation {
+func observe(process: ProcessID, pdf: DocumentReceipt, requestNS: UInt64, marker: Marker) throws -> Observation {
     var samples: [MemorySample] = []
-    let window = try bindWindow(process: process, pdf: pdf, requestNS: requestNS, samples: &samples)
+    let window = try bindWindow(process: process, pdf: pdf.path, requestNS: requestNS, samples: &samples)
     let firstWindow = nowNS()
-    let ready = try waitForMarker(window: window, process: process, requestNS: requestNS, marker: marker, samples: &samples)
+    let ready = try waitForReady(window: window, process: process, requestNS: requestNS, readiness: pdf.readiness, marker: marker, samples: &samples)
     let delayed = try sampleDelayedFootprint(process: process, requestNS: requestNS, readyNS: ready.receipt.tConfirmNs, samples: &samples)
     let memory = FootprintReceipt(
         api: "proc_pid_rusage.RUSAGE_INFO_V4.ri_phys_footprint",
@@ -912,7 +1066,7 @@ func warmIdle(_ process: ProcessID) throws {
     let start = nowNS()
     while nowNS() - start < 500_000_000 {
         try requireProcess(process)
-        guard standardWindows(process.pid).isEmpty else { throw BenchError(code: "marker_unstable", detail: "warm process was not window-free for 500 ms") }
+        guard standardWindows(process.pid).isEmpty else { throw BenchError(code: "window_lingered", detail: "warm process was not window-free for 500 ms") }
         sleep(until: nowNS() + pollNS)
     }
 }
@@ -959,6 +1113,7 @@ struct DocumentReceipt: Codable {
     let sha256: String
     let bytes: Int
     let pages: Int
+    let readiness: Readiness
     let generatorSchema: Int
     let markerSchema: Int
 }
@@ -1180,7 +1335,7 @@ func fresh(session: String, item: ScheduleItem, app: App, pdf: DocumentReceipt, 
         try verify(app, pdf: pdf)
         receipt.process = identity.receipt
         receipt.processGenerationId = "\(identity.pid)-\(identity.startNS)"
-        let result = try observe(process: identity, pdf: pdf.path, requestNS: requested, marker: marker)
+        let result = try observe(process: identity, pdf: pdf, requestNS: requested, marker: marker)
         store(result, pdf: pdf.path, receipt: &receipt)
         receipt.close = try close(result.window, process: identity)
         if keep {
@@ -1216,7 +1371,7 @@ func warm(session: String, item: ScheduleItem, app: App, pdf: DocumentReceipt, m
         guard opened.status == 0 else { throw BenchError(code: "request_failed", detail: "open exited \(opened.status)") }
         try requireProcess(identity)
         guard exactProcesses(app.executable) == [identity] else { throw BenchError(code: "process_replaced", detail: "warm request changed process generation") }
-        let result = try observe(process: identity, pdf: pdf.path, requestNS: requested, marker: marker)
+        let result = try observe(process: identity, pdf: pdf, requestNS: requested, marker: marker)
         store(result, pdf: pdf.path, receipt: &receipt)
         receipt.close = try close(result.window, process: identity)
         if last {
@@ -1273,25 +1428,28 @@ func configuredApps(_ arguments: [String]) throws -> [App] {
 }
 
 func copyDocuments(manifest: Manifest, corpusPath: String, destination: URL) throws -> [DocumentReceipt] {
+    let corpus = canonical(corpusPath)
     var documents: [DocumentReceipt] = []
     for fixture in manifest.documents {
-        let source = canonical(corpusPath).appendingPathComponent(fixture.fileName)
-        let metadata = try source.resourceValues(forKeys: [.fileSizeKey])
-        guard metadata.fileSize == fixture.byteCount,
-              try digestFile(source.path) == fixture.sha256 else {
-            throw BenchError(code: "corpus_mismatch", detail: fixture.fileName)
+        let source = canonical(fixture.path.map { $0.hasPrefix("/") ? $0 : corpus.appendingPathComponent($0).path }
+            ?? corpus.appendingPathComponent(fixture.fileName).path)
+        let bytes = try source.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1
+        let sha256 = try digestFile(source.path)
+        guard bytes == fixture.byteCount, sha256 == fixture.sha256 else {
+            throw BenchError(code: "corpus_mismatch", detail: "\(source.path) is \(sha256)/\(bytes), manifest declares \(declared(fixture))")
         }
         let output = destination.appendingPathComponent(fixture.fileName)
         try FileManager.default.copyItem(at: source, to: output)
-        guard try digestFile(output.path) == fixture.sha256 else {
+        guard try digestFile(output.path) == sha256 else {
             throw BenchError(code: "corpus_mismatch", detail: "copy changed \(fixture.fileName)")
         }
         documents.append(DocumentReceipt(
             documentId: fixture.documentId,
             path: output.path,
-            sha256: fixture.sha256,
-            bytes: fixture.byteCount,
+            sha256: sha256,
+            bytes: bytes,
             pages: fixture.pageCount,
+            readiness: fixture.readiness ?? .marker,
             generatorSchema: manifest.generatorSchemaVersion,
             markerSchema: manifest.marker.schemaVersion
         ))
@@ -1407,8 +1565,9 @@ struct HarnessReceipt: Codable {
     let warmRuns: Int
 }
 
+// The metric is no longer one string per session: it is one per document, named by that
+// document's readiness detector, and repeated per trial in `readiness.detector`.
 struct ScopeReceipt: Codable {
-    let metric: String
     let freshLane: String
     let footprintOwner: String
     let pdfGoatScope: String
@@ -1463,7 +1622,7 @@ func runMode(arguments: [String]) throws {
     defer { try? FileManager.default.removeItem(at: temporary) }
     let documents = try copyDocuments(manifest: manifest, corpusPath: corpusPath, destination: temporary)
     let plan = schedule(apps: apps, documents: documents, freshRuns: freshRuns, warmRuns: warmRuns)
-    let startHost = host()
+    let startHost = try host()
     let writer = try RawWriter(output)
     let harness = HarnessReceipt(
         scriptSha256: try digestFile(#filePath),
@@ -1477,7 +1636,6 @@ func runMode(arguments: [String]) throws {
         warmRuns: warmRuns
     )
     let scope = ScopeReceipt(
-        metric: "request_to_confirmed_visible_marker",
         freshLane: "fresh_process",
         footprintOwner: "main_process_only",
         pdfGoatScope: "read_only"
@@ -1495,7 +1653,7 @@ func runMode(arguments: [String]) throws {
         schedule: plan
     ))
     let counts = try execute(plan, session: session, apps: apps, documents: documents, marker: manifest.marker, warmRuns: warmRuns, writer: writer)
-    let endHost = host()
+    let endHost = try host()
     let stableHost = hostStateMatches(startHost, endHost)
     let cleanupComplete = removeSessionDirectory(temporary)
     let complete = !counts.aborted && counts.terminal == plan.count && stableHost.stable && cleanupComplete
@@ -1537,6 +1695,7 @@ struct SummaryGroup: Codable {
     let appId: String
     let documentId: String
     let lane: Lane
+    let metric: String
     let latencyNs: SummaryMetric
     let physFootprintBytes: SummaryMetric
     let startupPeakBytes: SummaryMetric
@@ -1688,6 +1847,7 @@ func summaryGroups(session: SessionReceipt, trials: [TrialReceipt]) throws -> [S
             guard primeCount == 1 else {
                 throw UsageError(description: "incomplete warm prime \(app.appId)/\(document.documentId)")
             }
+            let declared = document.readiness
             for lane in [Lane.fresh, .warm] {
                 let group = trials.filter { $0.appId == app.appId && $0.documentId == document.documentId && $0.lane == lane }
                 let expected = lane == .fresh ? session.harness.freshRuns : session.harness.warmRuns
@@ -1699,10 +1859,14 @@ func summaryGroups(session: SessionReceipt, trials: [TrialReceipt]) throws -> [S
                 guard readiness.count == group.count, footprints.count == group.count else {
                     throw UsageError(description: "missing metric receipt")
                 }
+                guard readiness.allSatisfy({ $0.detector == declared }) else {
+                    throw UsageError(description: "trial detector does not match the declared readiness of \(document.documentId)")
+                }
                 groups.append(SummaryGroup(
                     appId: app.appId,
                     documentId: document.documentId,
                     lane: lane,
+                    metric: declared.metric,
                     latencyNs: try metric(readiness.map(\.latencyNs)),
                     physFootprintBytes: try metric(footprints.map(\.bytes)),
                     startupPeakBytes: try metric(footprints.map(\.startupPeakBytes))
@@ -1745,6 +1909,30 @@ func synthetic(marker: Marker, correct: Bool) -> Pixels {
     return Pixels(width: width, height: height, bytes: bytes)
 }
 
+// Frames the content detector has to judge: white paper carrying black ink, the blank white
+// window Preview showed on dive, and the grey window it showed on pst-geo with restored scroll
+// state. `paper` bounds the white area (the whole frame by default) and `ink` the black area.
+// Alpha stays opaque, as it was in those captures.
+typealias FrameBox = (x: Range<Int>, y: Range<Int>)
+let inkStripe: FrameBox = (x: 80..<200, y: 60..<70)
+
+func syntheticFrame(background: UInt8, ink: FrameBox?, paper: FrameBox? = nil) -> Pixels {
+    let width = 240, height = 160
+    var bytes = [UInt8](repeating: background, count: width * height * 4)
+    for offset in stride(from: 3, to: bytes.count, by: 4) { bytes[offset] = 255 }
+    func paint(_ value: UInt8, _ box: FrameBox) {
+        for row in box.y {
+            for column in box.x {
+                let offset = (row * width + column) * 4
+                bytes[offset] = value; bytes[offset + 1] = value; bytes[offset + 2] = value
+            }
+        }
+    }
+    if let paper { paint(255, paper) }
+    if let ink { paint(0, ink) }
+    return Pixels(width: width, height: height, bytes: bytes)
+}
+
 func check(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     if !condition() { throw UsageError(description: "self-test failed: \(message)") }
 }
@@ -1780,12 +1968,30 @@ func selfTest() throws {
         throw UsageError(description: "self-test failed: capture conversion")
     }
     try check(markerScore(converted, marker: manifest.marker) != nil, "capture orientation")
+    let inked = inkScore(syntheticFrame(background: 255, ink: inkStripe))
+    try check(inked.passes && inked.stage == "measured", "content detector on paper and ink")
+    try check(frameScore(syntheticFrame(background: 255, ink: inkStripe), readiness: .content, marker: manifest.marker).score != nil, "content frame score")
+    let blank = inkScore(syntheticFrame(background: 255, ink: nil))
+    try check(!blank.passes && blank.stage == "measured" && blank.inkPixels == 0, "content detector on blank paper")
+    let grey = inkScore(syntheticFrame(background: 128, ink: nil))
+    try check(!grey.passes && grey.stage == "no_paper_span" && grey.alphaMax == 255, "content detector on a grey window")
+    // A white patch too small to span a quarter of any row, then a white-bordered page whose
+    // interior is ink.
+    let patch = inkScore(syntheticFrame(background: 0, ink: (x: 105..<115, y: 62..<68), paper: (x: 100..<120, y: 55..<75)))
+    try check(!patch.passes && patch.stage == "no_paper_span" && patch.qualifyingRows == 0, "content detector on a small white patch")
+    let darkPage = inkScore(syntheticFrame(background: 255, ink: (x: 80..<210, y: 32..<138)))
+    try check(!darkPage.passes && darkPage.stage == "measured" && darkPage.paperFraction < minimumPaperFraction, "content detector on a mostly dark page")
     var tracker = Tracker()
     try check(tracker.add(time: 100, score: 0.9) == nil, "one frame")
     _ = tracker.add(time: 120, score: nil)
     _ = tracker.add(time: 140, score: 0.8)
     let ready = tracker.add(time: 160, score: 0.85)
     try check(ready?.0 == 140 && ready?.1 == 160, "readiness bounce")
+    var painting = Tracker()
+    _ = painting.add(time: 100, score: 0.088)
+    try check(painting.add(time: 120, score: 0.161) == nil, "a growing score restarts the candidate")
+    let steady = painting.add(time: 140, score: 0.165)
+    try check(steady?.0 == 120 && steady?.1 == 140, "a steady score confirms")
     let arithmetic = try metric([100, 110, 120, 130, 900])
     try check(
         arithmetic.median == 120 &&
@@ -1821,8 +2027,8 @@ func selfTest() throws {
         return App(id: id, role: role, bundle: receipt.bundlePath, executable: receipt.executablePath, executableHash: receipt.executableSha256, infoHash: receipt.infoPlistSha256, receipt: receipt)
     }
 
-    func testDocument(_ id: String) -> DocumentReceipt {
-        DocumentReceipt(documentId: id, path: "/\(id).pdf", sha256: "pdf", bytes: 1, pages: 1, generatorSchema: 1, markerSchema: 1)
+    func testDocument(_ id: String, readiness: Readiness = .marker) -> DocumentReceipt {
+        DocumentReceipt(documentId: id, path: "/\(id).pdf", sha256: "pdf", bytes: 1, pages: 1, readiness: readiness, generatorSchema: 1, markerSchema: 1)
     }
 
     func syntheticSummaryRaw(
@@ -1833,7 +2039,8 @@ func selfTest() throws {
         receiptSchema: Int = schemaVersion,
         cleanupComplete: Bool = true,
         hostStable: Bool = true,
-        declaredScheduledTrials: Int? = nil
+        declaredScheduledTrials: Int? = nil,
+        detector: Readiness? = nil
     ) throws -> Data {
         let plan = schedule(
             apps: [app],
@@ -1869,7 +2076,6 @@ func selfTest() throws {
             warmRuns: warmRuns
         )
         let scope = ScopeReceipt(
-            metric: "request_to_confirmed_visible_marker",
             freshLane: "fresh_process",
             footprintOwner: "main_process_only",
             pdfGoatScope: "read_only"
@@ -1899,6 +2105,7 @@ func selfTest() throws {
             }
             var trial = baseReceipt(session: "synthetic", item: item, kind: "synthetic")
             trial.readiness = ReadinessReceipt(
+                detector: detector ?? document.readiness,
                 framesExamined: 2,
                 tFirstPassNs: latency,
                 tConfirmNs: latency + 20,
@@ -1980,6 +2187,22 @@ func selfTest() throws {
     try check(summaryObject.schemaVersion == schemaVersion, "summary schema")
     try check(summaryObject.rawSha256 == digest(raw), "summary raw hash")
     try check(summaryObject.groups[0].latencyNs.p95 == 160, "summary p95")
+    try check(summaryObject.groups[0].metric == "request_to_confirmed_visible_marker", "summary metric")
+
+    let contentDocument = testDocument("real", readiness: .content)
+    let contentSummary = try decoder.decode(
+        SummaryReceipt.self,
+        from: summary(try syntheticSummaryRaw(app: summaryApp, document: contentDocument, freshRuns: 1, warmRuns: 1))
+    )
+    try check(contentSummary.groups.allSatisfy { $0.metric == "request_to_confirmed_visible_content" }, "content metric in summary")
+    try expectUsageError("detector unlike the declared readiness passed") {
+        let invalid = try syntheticSummaryRaw(
+            app: summaryApp,
+            document: contentDocument,
+            detector: .marker
+        )
+        _ = try summary(invalid)
+    }
 
     let shortRaw = try syntheticSummaryRaw(
         app: summaryApp,
@@ -2035,6 +2258,58 @@ func selfTest() throws {
     }
     let preservedOutput = try Data(contentsOf: protectedOutput)
     try check(preservedOutput == sentinel, "generate preserved existing fixture")
+
+    // corpus.json names no readiness, so its documents must arrive as marker documents, and an
+    // external entry must be verified on disk rather than regenerated.
+    let corpusDirectory = generateDirectory.appendingPathComponent("corpus")
+    let sessionDirectory = generateDirectory.appendingPathComponent("session")
+    for directory in [corpusDirectory, sessionDirectory] {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+    for fixture in manifest.documents {
+        try files[fixture.fileName]!.write(to: corpusDirectory.appendingPathComponent(fixture.fileName))
+    }
+    let copied = try copyDocuments(manifest: manifest, corpusPath: corpusDirectory.path, destination: sessionDirectory)
+    try check(copied.count == manifest.documents.count, "manifest documents copied")
+    try check(copied.allSatisfy { $0.readiness == .marker }, "manifest without readiness decodes as marker")
+
+    let externalBytes = files[manifest.documents[0].fileName]!
+    try externalBytes.write(to: corpusDirectory.appendingPathComponent("external.pdf"))
+    func externalManifest(sha256: String?, byteCount: Int?) -> Manifest {
+        Manifest(
+            generatorSchemaVersion: manifest.generatorSchemaVersion,
+            marker: manifest.marker,
+            documents: [Fixture(
+                documentId: "external",
+                fileName: "external.pdf",
+                path: "external.pdf",
+                sha256: sha256,
+                byteCount: byteCount,
+                pageCount: 3,
+                readiness: .content
+            )]
+        )
+    }
+    for (label, sha256, byteCount) in [
+        ("wrong digest", String(repeating: "0", count: 64), externalBytes.count),
+        ("no digest", nil, externalBytes.count),
+        ("no byte count", digest(externalBytes), nil),
+    ] as [(String, String?, Int?)] {
+        try expectBenchError("corpus_mismatch", "external entry with \(label) passed") {
+            _ = try copyDocuments(
+                manifest: externalManifest(sha256: sha256, byteCount: byteCount),
+                corpusPath: corpusDirectory.path,
+                destination: generateDirectory.appendingPathComponent("rejected-\(label)")
+            )
+        }
+    }
+    let honest = externalManifest(sha256: digest(externalBytes), byteCount: externalBytes.count)
+    _ = try checkedCorpus(honest)  // an external entry is not regenerated or digest-checked here
+    let external = try copyDocuments(manifest: honest, corpusPath: corpusDirectory.path, destination: sessionDirectory)
+    try check(
+        external.count == 1 && external[0].readiness == .content && external[0].bytes == externalBytes.count,
+        "external entry verified and copied"
+    )
 
     let aliasURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("pdf-goat-summary-alias-\(UUID().uuidString).jsonl")
