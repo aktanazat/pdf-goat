@@ -1,0 +1,487 @@
+{
+  "groups" : [
+    {
+      "app_id" : "pdf-goat",
+      "document_id" : "pst-geo",
+      "lane" : "fresh",
+      "latency_ns" : {
+        "maximum" : 883989875,
+        "median" : 532417417,
+        "median_absolute_deviation" : 6805375,
+        "minimum" : 525612042,
+        "n" : 3,
+        "p95" : 883989875
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 333481136,
+        "median" : 303416472,
+        "median_absolute_deviation" : 2129848,
+        "minimum" : 301286624,
+        "n" : 3,
+        "p95" : 333481136
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 351683784,
+        "median" : 349455440,
+        "median_absolute_deviation" : 2228344,
+        "minimum" : 316277984,
+        "n" : 3,
+        "p95" : 351683784
+      }
+    },
+    {
+      "app_id" : "pdf-goat",
+      "document_id" : "pst-geo",
+      "lane" : "warm",
+      "latency_ns" : {
+        "maximum" : 344852250,
+        "median" : 344767229,
+        "median_absolute_deviation" : 85020,
+        "minimum" : 344682209,
+        "n" : 2,
+        "p95" : 344852250
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 344605848,
+        "median" : 337134744,
+        "median_absolute_deviation" : 7471104,
+        "minimum" : 329663640,
+        "n" : 2,
+        "p95" : 344605848
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 355960008,
+        "median" : 351913160,
+        "median_absolute_deviation" : 4046848,
+        "minimum" : 347866312,
+        "n" : 2,
+        "p95" : 355960008
+      }
+    },
+    {
+      "app_id" : "pdf-goat",
+      "document_id" : "ferc",
+      "lane" : "fresh",
+      "latency_ns" : {
+        "maximum" : 495386500,
+        "median" : 479195083,
+        "median_absolute_deviation" : 16191417,
+        "minimum" : 454606250,
+        "n" : 3,
+        "p95" : 495386500
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 308757584,
+        "median" : 304940136,
+        "median_absolute_deviation" : 2605032,
+        "minimum" : 302335104,
+        "n" : 3,
+        "p95" : 308757584
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 321209496,
+        "median" : 319456360,
+        "median_absolute_deviation" : 868328,
+        "minimum" : 318588032,
+        "n" : 3,
+        "p95" : 321209496
+      }
+    },
+    {
+      "app_id" : "pdf-goat",
+      "document_id" : "ferc",
+      "lane" : "warm",
+      "latency_ns" : {
+        "maximum" : 308512125,
+        "median" : 301282916,
+        "median_absolute_deviation" : 7229208,
+        "minimum" : 294053708,
+        "n" : 2,
+        "p95" : 308512125
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 317719656,
+        "median" : 314532968,
+        "median_absolute_deviation" : 3186688,
+        "minimum" : 311346280,
+        "n" : 2,
+        "p95" : 317719656
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 337003672,
+        "median" : 332063884,
+        "median_absolute_deviation" : 4939788,
+        "minimum" : 327124096,
+        "n" : 2,
+        "p95" : 337003672
+      }
+    },
+    {
+      "app_id" : "pdf-goat",
+      "document_id" : "dive",
+      "lane" : "fresh",
+      "latency_ns" : {
+        "maximum" : 453162042,
+        "median" : 452941667,
+        "median_absolute_deviation" : 220375,
+        "minimum" : 416281875,
+        "n" : 3,
+        "p95" : 453162042
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 269059176,
+        "median" : 268239952,
+        "median_absolute_deviation" : 819224,
+        "minimum" : 258819176,
+        "n" : 3,
+        "p95" : 269059176
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 271778944,
+        "median" : 269059176,
+        "median_absolute_deviation" : 2719768,
+        "minimum" : 258819176,
+        "n" : 3,
+        "p95" : 271778944
+      }
+    },
+    {
+      "app_id" : "pdf-goat",
+      "document_id" : "dive",
+      "lane" : "warm",
+      "latency_ns" : {
+        "maximum" : 296484916,
+        "median" : 281099604,
+        "median_absolute_deviation" : 15385312,
+        "minimum" : 265714292,
+        "n" : 2,
+        "p95" : 296484916
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 273253456,
+        "median" : 263324752,
+        "median_absolute_deviation" : 9928704,
+        "minimum" : 253396048,
+        "n" : 2,
+        "p95" : 273253456
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 313885776,
+        "median" : 301818960,
+        "median_absolute_deviation" : 12066816,
+        "minimum" : 289752144,
+        "n" : 2,
+        "p95" : 313885776
+      }
+    },
+    {
+      "app_id" : "pdf-goat",
+      "document_id" : "munzner",
+      "lane" : "fresh",
+      "latency_ns" : {
+        "maximum" : 832459542,
+        "median" : 821449292,
+        "median_absolute_deviation" : 11010250,
+        "minimum" : 787483750,
+        "n" : 3,
+        "p95" : 832459542
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 533873984,
+        "median" : 471139576,
+        "median_absolute_deviation" : 6586392,
+        "minimum" : 464553184,
+        "n" : 3,
+        "p95" : 533873984
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 538199360,
+        "median" : 475481336,
+        "median_absolute_deviation" : 6619160,
+        "minimum" : 468862176,
+        "n" : 3,
+        "p95" : 538199360
+      }
+    },
+    {
+      "app_id" : "pdf-goat",
+      "document_id" : "munzner",
+      "lane" : "warm",
+      "latency_ns" : {
+        "maximum" : 611327625,
+        "median" : 601745937,
+        "median_absolute_deviation" : 9581687,
+        "minimum" : 592164250,
+        "n" : 2,
+        "p95" : 611327625
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 459588904,
+        "median" : 450299188,
+        "median_absolute_deviation" : 9289716,
+        "minimum" : 441009472,
+        "n" : 2,
+        "p95" : 459588904
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 464340264,
+        "median" : 455050548,
+        "median_absolute_deviation" : 9289716,
+        "minimum" : 445760832,
+        "n" : 2,
+        "p95" : 464340264
+      }
+    },
+    {
+      "app_id" : "preview",
+      "document_id" : "pst-geo",
+      "lane" : "fresh",
+      "latency_ns" : {
+        "maximum" : 952784667,
+        "median" : 808823375,
+        "median_absolute_deviation" : 137344459,
+        "minimum" : 671478916,
+        "n" : 3,
+        "p95" : 952784667
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 366969984,
+        "median" : 357352552,
+        "median_absolute_deviation" : 6062032,
+        "minimum" : 351290520,
+        "n" : 3,
+        "p95" : 366969984
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 385156224,
+        "median" : 369984640,
+        "median_absolute_deviation" : 2703312,
+        "minimum" : 367281328,
+        "n" : 3,
+        "p95" : 385156224
+      }
+    },
+    {
+      "app_id" : "preview",
+      "document_id" : "pst-geo",
+      "lane" : "warm",
+      "latency_ns" : {
+        "maximum" : 442475958,
+        "median" : 438981083,
+        "median_absolute_deviation" : 3494874,
+        "minimum" : 435486209,
+        "n" : 2,
+        "p95" : 442475958
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 371852392,
+        "median" : 371713128,
+        "median_absolute_deviation" : 139264,
+        "minimum" : 371573864,
+        "n" : 2,
+        "p95" : 371852392
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 397411432,
+        "median" : 394200168,
+        "median_absolute_deviation" : 3211264,
+        "minimum" : 390988904,
+        "n" : 2,
+        "p95" : 397411432
+      }
+    },
+    {
+      "app_id" : "preview",
+      "document_id" : "ferc",
+      "lane" : "fresh",
+      "latency_ns" : {
+        "maximum" : 734458541,
+        "median" : 733108209,
+        "median_absolute_deviation" : 1350332,
+        "minimum" : 708120709,
+        "n" : 3,
+        "p95" : 734458541
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 329483248,
+        "median" : 328582200,
+        "median_absolute_deviation" : 901048,
+        "minimum" : 327336968,
+        "n" : 3,
+        "p95" : 329483248
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 362120152,
+        "median" : 342000696,
+        "median_absolute_deviation" : 2572312,
+        "minimum" : 339428384,
+        "n" : 3,
+        "p95" : 362120152
+      }
+    },
+    {
+      "app_id" : "preview",
+      "document_id" : "ferc",
+      "lane" : "warm",
+      "latency_ns" : {
+        "maximum" : 488366208,
+        "median" : 485694374,
+        "median_absolute_deviation" : 2671833,
+        "minimum" : 483022541,
+        "n" : 2,
+        "p95" : 488366208
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 322208776,
+        "median" : 313459720,
+        "median_absolute_deviation" : 8749056,
+        "minimum" : 304710664,
+        "n" : 2,
+        "p95" : 322208776
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 412009480,
+        "median" : 368059400,
+        "median_absolute_deviation" : 43950080,
+        "minimum" : 324109320,
+        "n" : 2,
+        "p95" : 412009480
+      }
+    },
+    {
+      "app_id" : "preview",
+      "document_id" : "dive",
+      "lane" : "fresh",
+      "latency_ns" : {
+        "maximum" : 756557416,
+        "median" : 747535792,
+        "median_absolute_deviation" : 9021624,
+        "minimum" : 725464541,
+        "n" : 3,
+        "p95" : 756557416
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 298025968,
+        "median" : 287720456,
+        "median_absolute_deviation" : 1409048,
+        "minimum" : 286311408,
+        "n" : 3,
+        "p95" : 298025968
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 306922504,
+        "median" : 287818784,
+        "median_absolute_deviation" : 1114136,
+        "minimum" : 286704648,
+        "n" : 3,
+        "p95" : 306922504
+      }
+    },
+    {
+      "app_id" : "preview",
+      "document_id" : "dive",
+      "lane" : "warm",
+      "latency_ns" : {
+        "maximum" : 521479750,
+        "median" : 511024854,
+        "median_absolute_deviation" : 10454896,
+        "minimum" : 500569958,
+        "n" : 2,
+        "p95" : 521479750
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 302875704,
+        "median" : 280298540,
+        "median_absolute_deviation" : 22577164,
+        "minimum" : 257721376,
+        "n" : 2,
+        "p95" : 302875704
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 312165432,
+        "median" : 286737452,
+        "median_absolute_deviation" : 25427980,
+        "minimum" : 261309472,
+        "n" : 2,
+        "p95" : 312165432
+      }
+    },
+    {
+      "app_id" : "preview",
+      "document_id" : "munzner",
+      "lane" : "fresh",
+      "latency_ns" : {
+        "maximum" : 1297284292,
+        "median" : 1280991625,
+        "median_absolute_deviation" : 16292667,
+        "minimum" : 1256703916,
+        "n" : 3,
+        "p95" : 1297284292
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 513950944,
+        "median" : 511870104,
+        "median_absolute_deviation" : 2080840,
+        "minimum" : 498861232,
+        "n" : 3,
+        "p95" : 513950944
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 528565424,
+        "median" : 527615224,
+        "median_absolute_deviation" : 950200,
+        "minimum" : 509723848,
+        "n" : 3,
+        "p95" : 528565424
+      }
+    },
+    {
+      "app_id" : "preview",
+      "document_id" : "munzner",
+      "lane" : "warm",
+      "latency_ns" : {
+        "maximum" : 1031642583,
+        "median" : 1008901479,
+        "median_absolute_deviation" : 22741104,
+        "minimum" : 986160375,
+        "n" : 2,
+        "p95" : 1031642583
+      },
+      "metric" : "request_to_confirmed_visible_content",
+      "phys_footprint_bytes" : {
+        "maximum" : 409126112,
+        "median" : 362972360,
+        "median_absolute_deviation" : 46153752,
+        "minimum" : 316818608,
+        "n" : 2,
+        "p95" : 409126112
+      },
+      "startup_peak_bytes" : {
+        "maximum" : 451183816,
+        "median" : 438297812,
+        "median_absolute_deviation" : 12886004,
+        "minimum" : 425411808,
+        "n" : 2,
+        "p95" : 451183816
+      }
+    }
+  ],
+  "raw_sha256" : "75694e1a32d359fb18f47f54219583c7e1b85552bd080f5594d99d347a403b0e",
+  "schema_version" : 2,
+  "session_id" : "D11C1798-890A-40DE-9A88-383204BB14C0"
+}

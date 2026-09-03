@@ -1,0 +1,67 @@
+{
+  "generator_schema_version": 1,
+  "marker": {
+    "schema_version": 1,
+    "arrangement": "red-green/blue-yellow",
+    "red": [
+      230,
+      48,
+      48
+    ],
+    "green": [
+      38,
+      176,
+      82
+    ],
+    "blue": [
+      48,
+      96,
+      218
+    ],
+    "yellow": [
+      235,
+      190,
+      28
+    ],
+    "channel_tolerance": 45,
+    "minimum_cell_pixels": 12
+  },
+  "documents": [
+    {
+      "document_id": "pst-geo",
+      "file_name": "pst-geo.pdf",
+      "path": "/private/var/tmp/pg-perf/wave2/fixtures/pst-geo.pdf",
+      "sha256": "6268e06fc00347294d6ae35fba718094645b91afadd2394f27134238bd830009",
+      "byte_count": 137566678,
+      "page_count": 51,
+      "readiness": "content"
+    },
+    {
+      "document_id": "ferc",
+      "file_name": "ferc.pdf",
+      "path": "/private/var/tmp/pg-perf/wave2/fixtures/ferc.pdf",
+      "sha256": "4f2f15d1bd72e06b623b93c840870424af907439816d2c46dc69e465a8c55273",
+      "byte_count": 4869295,
+      "page_count": 1063,
+      "readiness": "content"
+    },
+    {
+      "document_id": "dive",
+      "file_name": "dive.pdf",
+      "path": "/private/var/tmp/pg-perf/wave2/fixtures/dive.pdf",
+      "sha256": "b3129f44c4a26b534176bb0f83d85e1ed26a6cdf93ebebacb20104eab2d6bc00",
+      "byte_count": 44685994,
+      "page_count": 1151,
+      "readiness": "content"
+    },
+    {
+      "document_id": "munzner",
+      "file_name": "munzner.pdf",
+      "path": "/private/var/tmp/pg-perf/wave2/fixtures/munzner.pdf",
+      "sha256": "70615a4087727cad01795cb6ccd41aa4c717a53e6c65edfab5829d064977a580",
+      "byte_count": 72905249,
+      "page_count": 422,
+      "readiness": "content"
+    }
+  ]
+}
