@@ -124,3 +124,7 @@ passing frames whose scores agree within a tenth, so a page still painting
 does not count as ready. `generate` copies the manifest verbatim, so a
 relative external `path` must be resolvable from the output directory too;
 point `run --corpus` at the manifest's own directory for external entries.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
