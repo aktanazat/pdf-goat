@@ -1,129 +1,119 @@
 # pdf-goat
 
-`pdf-goat` is a local command-line tool for PDF editing, conversion, inspection,
-extraction, security operations, and repair. Run `pdf-goat --help` for the
-current command list.
+Local PDF tooling for macOS and Linux. One CLI covers inspection, page edits,
+conversion, extraction, security, and repair. A native macOS app opens the same
+files in a read-only PDFKit viewer.
 
-The CLI stores bounded job metadata in SQLite. It writes JSON when piped or
-when you use `--agent`. Run `pdf-goat --agent capabilities` to list command
-families, then request one family for its argument schema.
+No account and no upload. The CLI has no networking code; only the first-run
+dependency install reaches the network.
 
-For academic transcripts,
-`pdf-goat --agent transcript read transcript.pdf --conferred YYYY-MM-DD`
-returns identity, terms, courses, printed issue dates, freshness results, and
-provenance. `pdf-goat transcript resolve --root DIR` examines only entries in
-the named directory and does not recurse. It ranks every candidate by the
-printed issue date.
-The caller must enumerate Drive files.
+## Install
+
+Requires [uv](https://docs.astral.sh/uv/).
+
+```bash
+brew install ghostscript qpdf tesseract   # PDF/A and reduce, repair and flatten, OCR
+git clone https://github.com/aktanazat/pdf-goat.git ~/Documents/projects/pdf-goat
+mkdir -p ~/.local/bin
+ln -sf ~/Documents/projects/pdf-goat/pdf-goat ~/.local/bin/pdf-goat
+pdf-goat --help
+```
+
+The launcher resolves its own location, so the clone can live anywhere. First
+run installs the Python dependencies through uv. On Linux, use the apt or dnf
+equivalents of the brew line. Three more tools cover four verbs: `from-html`
+and `from-md` need `weasyprint`, `convert` to Office formats needs
+`office2pdf-cli`, and `convert audio` needs the macOS `say` binary.
+
+## Use
+
+```bash
+pdf-goat info report.pdf
+pdf-goat merge a.pdf b.pdf -o out.pdf
+pdf-goat extract report.pdf --pages 2-5,9 -o excerpt.pdf
+pdf-goat redact statement.pdf --find "[0-9]{3}-[0-9]{2}-[0-9]{4}" -o clean.pdf
+pdf-goat security sign contract.pdf -o signed.pdf
+pdf-goat render report.pdf --pages 1 --dpi 150 -o renders
+```
+
+`pdf-goat --help` lists all 39 command families, and `pdf-goat <family> --help`
+lists their verbs. Every run is appended to a SQLite ledger at
+`~/.pdf-goat/ledger.db`; read it with `pdf-goat jobs`.
+
+For agents, the CLI writes JSON when its output is piped, and `--agent` forces
+JSON on a TTY. Start with `pdf-goat --agent capabilities` for the family list,
+then ask one family for its argument schema.
+
+```bash
+pdf-goat --agent capabilities pages
+pdf-goat --agent search report.pdf invoice --first
+pdf-goat --agent transcript read transcript.pdf --conferred 2026-06-12
+```
 
 ## Native macOS app
-
-`PDFGoat.app` currently opens local PDFs in a read-only PDFKit viewer for
-macOS. The documents below define the target native system:
-
-- [System design](docs/SYSTEM.md)
-- [Agent protocol](docs/AGENT_PROTOCOL.md)
-- [Feature ledger](docs/FEATURES.md)
-- [Implementation plan](docs/PLAN.md)
-
-The install steps below are for the current Python CLI on macOS and Linux. The
-native app runs only on macOS.
-
-### Build and run the native viewer
-
-Build the app bundle, then open a PDF:
 
 ```sh
 ./tools/build-app
 open ".build/PDF Goat.app" --args /path/to/document.pdf
 ```
 
-## Install (macOS / Linux)
+The app opens local PDF files. It does not edit them yet.
+[System design](docs/SYSTEM.md), [agent protocol](docs/AGENT_PROTOCOL.md),
+[feature ledger](docs/FEATURES.md), and [implementation plan](docs/PLAN.md)
+define the target system.
 
-Requires [uv](https://docs.astral.sh/uv/). A few verbs need system tools.
+## Benchmark: opening real files against Preview
 
-```bash
-# 1. system deps (macOS; on Linux, use apt/dnf equivalents)
-brew install ghostscript qpdf tesseract          # compress, repair, OCR
-cargo install office2pdf-cli                      # DOCX/XLSX/PPTX->PDF (optional, Rust toolchain)
+Median milliseconds from the open request to confirmed page content on screen.
+The fresh lane launches a new process for every trial. The warm lane reuses a
+running app after one unmeasured prime.
 
-# 2. clone anywhere (the launcher self-locates; no hardcoded paths)
-git clone https://github.com/aktanazat/pdf-goat.git ~/Documents/projects/pdf-goat
+| Document | Pages | Size | Fresh: pdf-goat | Fresh: Preview | Warm: pdf-goat | Warm: Preview |
+| --- | --- | --- | --- | --- | --- | --- |
+| pst-geo | 51 | 137.6 MB | **532** | 809 | **345** | 439 |
+| ferc | 1063 | 4.9 MB | **479** | 733 | **301** | 486 |
+| dive | 1151 | 44.7 MB | **453** | 748 | **281** | 511 |
+| munzner | 422 | 72.9 MB | **821** | 1281 | **602** | 1009 |
 
-# 3. put it on PATH (make sure ~/.local/bin is on your PATH)
-mkdir -p ~/.local/bin
-ln -sf ~/Documents/projects/pdf-goat/pdf-goat ~/.local/bin/pdf-goat
+pst-geo is vector map artwork at 2.7 MB per page. ferc is a long text order.
+dive and munzner are illustrated textbooks.
 
-# 4. first run installs the Python deps via uv automatically
-pdf-goat --help
-```
+Main-process physical footprint 750 ms after content appeared ran 251 to
+449 MiB for pdf-goat and 267 to 488 MiB for Preview. Preview used less on one
+group, the warm munzner lane, at 346 MiB against 429 MiB.
 
-## Usage
+Apple M4 Pro, 24 GiB, macOS 26.6.2 build 25G83, AC power, disk caches not
+purged, 2026-09-02. Fresh lane n=3 per app and document, warm lane n=2. All 48
+trials were valid and 40 were measured. Per-trial values, deviations, p95, the
+window and readiness rules, and the harness digest are in
+[`benchmarks/results/viewer-comparison-summary.json`](benchmarks/results/viewer-comparison-summary.json)
+and
+[`benchmarks/results/viewer-comparison-runs.jsonl`](benchmarks/results/viewer-comparison-runs.jsonl).
+Readiness means visible page content, not a fully painted page.
 
-```bash
-pdf-goat info report.pdf
-pdf-goat merge a.pdf b.pdf -o out.pdf
-pdf-goat convert docx report.pdf -o report.docx
-pdf-goat security sign contract.pdf -o signed.pdf
-pdf-goat redact statement.pdf --find "[0-9]{3}-[0-9]{2}-[0-9]{4}" -o clean.pdf
-pdf-goat --agent capabilities pages    # discover one command family
-pdf-goat --agent inspect report.pdf --limit 10
-pdf-goat --agent preflight report.pdf
-pdf-goat --agent search report.pdf invoice --first   # stop at the first hit
-pdf-goat render report.pdf --pages 1 --clip 72,72,540,720 -o renders
-pdf-goat --agent info report.pdf        # JSON output for scripts and agents
-```
+### Reproduce
 
-Run `pdf-goat --help` (or `pdf-goat <namespace> --help`) for the full verb list.
-
-## Reproducible benchmark
-
-The `run` command needs Accessibility and Screen Recording permission. By
-default, it records five fresh-process runs, one unmeasured warm prime, and
-three measured warm opens for each app and fixture. It does not purge disk
-caches. Raw JSONL goes only to the external path passed with `--output`.
-`summarize` derives `summary.json` from that file. The repository keeps
-selected experiment receipts under [`benchmarks/results/`](benchmarks/results/).
+`run` needs Accessibility and Screen Recording permission and writes raw
+receipts only to the path you pass.
 
 ```sh
-BENCH_ROOT="/absolute/path/to/benchmark-output"
-
-swift benchmarks/pdf_benchmark.swift generate \
-  --output "$BENCH_ROOT/corpus"
-
+OUT=/absolute/path/to/output
+swift benchmarks/pdf_benchmark.swift generate --output "$OUT/corpus"
 swift benchmarks/pdf_benchmark.swift self-test
-
 swift benchmarks/pdf_benchmark.swift run \
-  --corpus "$BENCH_ROOT/corpus" \
-  --output "$BENCH_ROOT/session.jsonl" \
-  --pdf-goat "/absolute/path/to/PDF Goat.app" \
+  --corpus "$OUT/corpus" --output "$OUT/session.jsonl" \
+  --pdf-goat ".build/PDF Goat.app" \
   --preview "/System/Applications/Preview.app"
-
-swift benchmarks/pdf_benchmark.swift summarize \
-  "$BENCH_ROOT/session.jsonl" \
-  --output "$BENCH_ROOT/summary.json"
+swift benchmarks/pdf_benchmark.swift summarize "$OUT/session.jsonl" \
+  --output "$OUT/summary.json"
 ```
 
-`--preview` is optional. Every included comparator needs an explicit app path.
-The summary reports the median, median absolute deviation, p95, minimum, and
-maximum.
-
-A corpus manifest can also time files it did not generate. A document entry
-that carries a `path`, absolute or relative to the manifest directory, is
-external: `generate` skips it, and `run` verifies the file on disk against the
-entry's `sha256` and `byte_count` before copying it into the session
-directory, so the corpus stays content addressed. An entry missing either
-field fails with `corpus_mismatch` and prints the computed digest and byte
-count to paste back. Each entry also declares how a trial decides the document
-is on screen with `readiness`: `marker` looks for the four-colour marker the
-generated fixtures carry, and `content` looks for white paper carrying dark
-ink, which is what a real file has. `marker` is the default. The detector that
-confirmed each trial is recorded in `readiness.detector`, and the summary
-names it per group in `metric`. Both detectors confirm on two consecutive
-passing frames whose scores agree within a tenth, so a page still painting
-does not count as ready. `generate` copies the manifest verbatim, so a
-relative external `path` must be resolvable from the output directory too;
-point `run --corpus` at the manifest's own directory for external entries.
+`generate` writes two synthetic fixtures. To time your own files instead, add
+entries with a `path`, a `sha256`, and a `byte_count` to the corpus manifest;
+`run` verifies each file against its digest before copying it into the session.
+[`viewer-comparison-corpus.json`](benchmarks/results/viewer-comparison-corpus.json)
+is the manifest behind the table above. Comparators are optional and each needs
+an explicit app path: `--preview`, `--skim`, `--pdfgear`.
 
 ## License
 
