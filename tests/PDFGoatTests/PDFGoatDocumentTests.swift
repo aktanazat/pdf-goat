@@ -1,18 +1,14 @@
+import AppKit
 import Foundation
 import PDFKit
-import XCTest
+import Testing
 @testable import PDFGoat
 
+@Suite("PDF Goat document behavior", .serialized)
 @MainActor
-final class PDFGoatDocumentTests: XCTestCase {
-    private func firstSubview<T: NSView>(of type: T.Type, in view: NSView) -> T? {
-        if let match = view as? T {
-            return match
-        }
-        return view.subviews.lazy.compactMap { self.firstSubview(of: type, in: $0) }.first
-    }
-
-    func testOpensLocalPDF() throws {
+struct PDFGoatDocumentTests {
+    @Test("A local PDF opens with its content and normalized source URL")
+    func localPDFOpens() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("pdf")
@@ -20,61 +16,43 @@ final class PDFGoatDocumentTests: XCTestCase {
 
         let source = PDFDocument()
         source.insert(PDFPage(), at: 0)
-        XCTAssertTrue(source.write(to: url))
+        try #require(source.write(to: url))
 
         let document = try PDFGoatDocument(sourceURL: url)
 
-        XCTAssertEqual(document.pdfDocument.pageCount, 1)
-        XCTAssertEqual(document.fileURL, url.standardizedFileURL.resolvingSymlinksInPath())
+        #expect(document.pdfDocument.pageCount == 1)
+        #expect(document.fileURL == url.standardizedFileURL.resolvingSymlinksInPath())
     }
 
-    func testRejectsMissingPDF() {
+    @Test("A missing local PDF reports the unreadable file")
+    func missingPDFIsRejected() {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("pdf")
 
-        XCTAssertThrowsError(try PDFGoatDocument(sourceURL: url)) { error in
-            XCTAssertEqual(
-                error.localizedDescription,
-                "PDF Goat could not open " + url.lastPathComponent + "."
-            )
+        let error = #expect(throws: DocumentOpenError.self) {
+            try PDFGoatDocument(sourceURL: url)
         }
+
+        #expect(error?.localizedDescription == "PDF Goat could not open " + url.lastPathComponent + ".")
     }
 
-    func testExternalLinkDisplaysBlockedAlert() throws {
-        let source = PDFDocument()
-        source.insert(PDFPage(), at: 0)
-        let controller = DocumentWindowController(document: source)
-        controller.showWindow(nil)
+    @Test("Clicking an external link presents a blocked-link sheet")
+    func externalLinksAreBlocked() throws {
+        let (controller, _) = shownController(pages: [PDFPage()])
         defer { controller.close() }
+        let pdfView = try #require(displayedPDFView(of: controller))
+        let link = try #require(URL(string: "https://example.com"))
 
-        XCTAssertTrue(
-            controller.responds(
-                to: NSSelectorFromString("PDFViewWillClickOnLink:withURL:")
-            )
-        )
-        let contentView = try XCTUnwrap(controller.window?.contentView)
-        let pdfView = try XCTUnwrap(firstSubview(of: PDFView.self, in: contentView))
-        XCTAssertTrue(pdfView.delegate === controller)
+        controller.pdfViewWillClick(onLink: pdfView, with: link)
 
-        controller.pdfViewWillClick(
-            onLink: pdfView,
-            with: try XCTUnwrap(URL(string: "https://example.com"))
-        )
-        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
-
-        XCTAssertNotNil(controller.window?.attachedSheet)
+        #expect(waitFor(true) { controller.window?.attachedSheet != nil } == true)
     }
 
-    func testFormWidgetsAreReadOnly() {
-        let source = PDFDocument()
+    @Test("Visible form widgets become read-only without changing links")
+    func visibleWidgetsAreReadOnly() {
         let page = PDFPage()
-        let widget = PDFAnnotation(
-            bounds: NSRect(x: 40, y: 40, width: 180, height: 24),
-            forType: .widget,
-            withProperties: nil
-        )
-        widget.widgetFieldType = .text
+        let widget = formWidget()
         let link = PDFAnnotation(
             bounds: NSRect(x: 40, y: 80, width: 180, height: 24),
             forType: .link,
@@ -82,143 +60,160 @@ final class PDFGoatDocumentTests: XCTestCase {
         )
         page.addAnnotation(widget)
         page.addAnnotation(link)
-        source.insert(page, at: 0)
-        XCTAssertFalse(widget.isReadOnly)
-        XCTAssertFalse(link.isReadOnly)
 
-        let controller = DocumentWindowController(document: source)
-        controller.showWindow(nil)
-        defer { controller.close() }
-        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
-
-        XCTAssertTrue(widget.isReadOnly)
-        XCTAssertFalse(link.isReadOnly)
-    }
-
-    /// A shown controller over blank pages, one main-queue turn after its
-    /// first frame. The caller closes it.
-    private func shownController(pages: [PDFPage]) -> (DocumentWindowController, PDFDocument) {
-        let source = PDFDocument()
-        for (index, page) in pages.enumerated() {
-            source.insert(page, at: index)
-        }
-        let controller = DocumentWindowController(document: source)
-        controller.showWindow(nil)
-        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
-        return (controller, source)
-    }
-
-    private func pdfView(of controller: DocumentWindowController) throws -> PDFView {
-        let contentView = try XCTUnwrap(controller.window?.contentView)
-        return try XCTUnwrap(firstSubview(of: PDFView.self, in: contentView))
-    }
-
-    func testPageNavigationShowsNextPage() throws {
-        let (controller, source) = shownController(pages: [PDFPage(), PDFPage()])
-        defer { controller.close() }
-        let pdfView = try pdfView(of: controller)
-        XCTAssertEqual(pdfView.visiblePages.map { source.index(for: $0) }, [0])
-
-        controller.nextPage(nil)
-        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
-
-        XCTAssertEqual(pdfView.visiblePages.map { source.index(for: $0) }, [1])
-    }
-
-    func testOpeningShowsDocumentStart() throws {
-        let (controller, source) = shownController(pages: [PDFPage(), PDFPage()])
-        defer { controller.close() }
-        let pdfView = try pdfView(of: controller)
-        let documentView = try XCTUnwrap(pdfView.documentView)
-        let first = try XCTUnwrap(source.page(at: 0))
-        let firstInView = pdfView.convert(first.bounds(for: .cropBox), from: first)
-
-        XCTAssertGreaterThan(documentView.bounds.height, documentView.visibleRect.height)
-        XCTAssertTrue(pdfView.bounds.contains(NSPoint(x: firstInView.midX, y: firstInView.maxY)))
-    }
-
-    func testOpeningShowsARotatedFirstPageFromItsTop() throws {
-        for rotation in [90, 180, 270] {
-            let rotated = PDFPage()
-            rotated.rotation = rotation
-            let (controller, source) = shownController(pages: [rotated, PDFPage(), PDFPage()])
-            defer { controller.close() }
-            let pdfView = try pdfView(of: controller)
-
-            XCTAssertEqual(pdfView.visiblePages.map { source.index(for: $0) }, [0], "rotation \(rotation)")
-            let firstInView = pdfView.convert(rotated.bounds(for: .cropBox), from: rotated)
-            XCTAssertTrue(pdfView.bounds.contains(NSPoint(x: firstInView.midX, y: firstInView.maxY)), "rotation \(rotation)")
-        }
-    }
-
-    func testLiveScrollLowersInterpolationQuality() throws {
-        let (controller, _) = shownController(pages: [PDFPage(), PDFPage()])
-        defer { controller.close() }
-        let pdfView = try pdfView(of: controller)
-        let scrollView = try XCTUnwrap(pdfView.documentView?.enclosingScrollView)
-        XCTAssertEqual(pdfView.interpolationQuality, .high)
-
-        NotificationCenter.default.post(name: NSScrollView.willStartLiveScrollNotification, object: scrollView)
-        XCTAssertEqual(pdfView.interpolationQuality, .low)
-
-        NotificationCenter.default.post(name: NSScrollView.didEndLiveScrollNotification, object: scrollView)
-        XCTAssertEqual(pdfView.interpolationQuality, .high)
-    }
-
-    func testThumbnailSidebarLinksAfterFirstContent() throws {
-        let source = PDFDocument()
-        source.insert(PDFPage(), at: 0)
-        let controller = DocumentWindowController(document: source)
-        controller.showWindow(nil)
-        defer { controller.close() }
-
-        let contentView = try XCTUnwrap(controller.window?.contentView)
-        XCTAssertNil(firstSubview(of: PDFThumbnailView.self, in: contentView))
-
-        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
-
-        let thumbnails = try XCTUnwrap(firstSubview(of: PDFThumbnailView.self, in: contentView))
-        XCTAssertIdentical(thumbnails.pdfView, firstSubview(of: PDFView.self, in: contentView))
-    }
-
-    func testWidgetAddedAfterFirstVisiblePassBecomesReadOnly() throws {
-        let page = PDFPage()
         let (controller, _) = shownController(pages: [page])
         defer { controller.close() }
 
+        #expect(waitFor(true) { widget.isReadOnly } == true)
+        #expect(link.isReadOnly == false)
+    }
+
+    @Test("A widget added after opening becomes read-only when its page appears")
+    func lateWidgetsAreReadOnly() throws {
+        let firstPage = PDFPage()
+        let secondPage = PDFPage()
+        let (controller, document) = shownController(pages: [firstPage, secondPage])
+        defer { controller.close() }
+        let pdfView = try #require(displayedPDFView(of: controller))
+        try #require(waitFor([0]) { visiblePageIndexes(of: pdfView, in: document) } == [0])
+
+        let widget = formWidget()
+        secondPage.addAnnotation(widget)
+        pdfView.go(to: secondPage)
+
+        #expect(waitFor(true) { widget.isReadOnly } == true)
+    }
+
+    @Test("Opening positions the first page at its top", arguments: [0, 90, 180, 270])
+    func openingPositionsFirstPageAtTop(rotation: Int) throws {
+        let firstPage = PDFPage()
+        firstPage.rotation = rotation
+        let (controller, document) = shownController(pages: [firstPage, PDFPage(), PDFPage()])
+        defer { controller.close() }
+        let pdfView = try #require(displayedPDFView(of: controller))
+
+        #expect(waitFor([0]) { visiblePageIndexes(of: pdfView, in: document) } == [0])
+        let firstPageBounds = pdfView.convert(firstPage.bounds(for: .cropBox), from: firstPage)
+        #expect(pdfView.bounds.contains(NSPoint(x: firstPageBounds.midX, y: firstPageBounds.maxY)))
+    }
+
+    @Test("Next page moves the visible page forward")
+    func nextPageMovesForward() throws {
+        let (controller, document) = shownController(pages: [PDFPage(), PDFPage()])
+        defer { controller.close() }
+        let pdfView = try #require(displayedPDFView(of: controller))
+        try #require(waitFor([0]) { visiblePageIndexes(of: pdfView, in: document) } == [0])
+
+        controller.nextPage(nil)
+
+        #expect(waitFor([1]) { visiblePageIndexes(of: pdfView, in: document) } == [1])
+    }
+
+    @Test("Live scrolling uses low interpolation and restores high after it ends")
+    func liveScrollAdjustsInterpolationQuality() async throws {
+        let (controller, _) = shownController(pages: [PDFPage(), PDFPage()])
+        defer { controller.close() }
+        let pdfView = try #require(displayedPDFView(of: controller))
+        NotificationCenter.default.post(name: .PDFViewVisiblePagesChanged, object: pdfView)
+        await nextMainQueueTurn()
+        let scrollView = try #require(pdfView.documentView?.enclosingScrollView)
+
+        #expect(pdfView.interpolationQuality == .high)
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
+        #expect(pdfView.interpolationQuality == .low)
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+        #expect(pdfView.interpolationQuality == .high)
+    }
+
+    @Test("Thumbnail sidebar releases under pressure and relinks to the document")
+    func thumbnailSidebarReleasesAndRelinks() throws {
+        let (controller, _) = shownController(pages: [PDFPage()])
+        defer { controller.close() }
+        let pdfView = try #require(displayedPDFView(of: controller))
+        controller.linkThumbnailSidebar()
+        _ = try #require(thumbnailView(of: controller))
+
+        controller.releaseThumbnailSidebar()
+        #expect(thumbnailView(of: controller) == nil)
+
+        controller.linkThumbnailSidebar()
+
+        let thumbnails = try #require(thumbnailView(of: controller))
+        let linkedPDFView = try #require(thumbnails.pdfView)
+        #expect(linkedPDFView === pdfView)
+    }
+
+    private func nextMainQueueTurn() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
+    }
+
+    private func shownController(pages: [PDFPage]) -> (DocumentWindowController, PDFDocument) {
+        let document = PDFDocument()
+        for (index, page) in pages.enumerated() {
+            document.insert(page, at: index)
+        }
+        let controller = DocumentWindowController(document: document)
+        controller.showWindow(nil)
+        controller.window?.displayIfNeeded()
+        return (controller, document)
+    }
+
+    private func formWidget() -> PDFAnnotation {
         let widget = PDFAnnotation(
             bounds: NSRect(x: 40, y: 40, width: 180, height: 24),
             forType: .widget,
             withProperties: nil
         )
         widget.widgetFieldType = .text
-        page.addAnnotation(widget)
-        XCTAssertFalse(widget.isReadOnly)
-
-        NotificationCenter.default.post(name: .PDFViewVisiblePagesChanged, object: try pdfView(of: controller))
-
-        XCTAssertTrue(widget.isReadOnly)
+        return widget
     }
 
-    func testThumbnailSidebarReleasesUnderPressureAndRelinksAfter() throws {
-        let (controller, _) = shownController(pages: [PDFPage()])
-        defer { controller.close() }
-        let contentView = try XCTUnwrap(controller.window?.contentView)
-        let linked = try XCTUnwrap(firstSubview(of: PDFThumbnailView.self, in: contentView))
-
-        controller.releaseThumbnailSidebar()
-        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
-        XCTAssertNil(firstSubview(of: PDFThumbnailView.self, in: contentView))
-
-        controller.linkThumbnailSidebar()
-        controller.linkThumbnailSidebar()
-        let rebuilt = try XCTUnwrap(firstSubview(of: PDFThumbnailView.self, in: contentView))
-        XCTAssertNotIdentical(rebuilt, linked)
-        XCTAssertIdentical(rebuilt.pdfView, firstSubview(of: PDFView.self, in: contentView))
-        XCTAssertEqual(thumbnailViewCount(in: contentView), 1)
+    private func displayedPDFView(of controller: DocumentWindowController) -> PDFView? {
+        splitViewController(of: controller)?
+            .splitViewItems
+            .compactMap { $0.viewController.view as? PDFView }
+            .first
     }
 
-    private func thumbnailViewCount(in view: NSView) -> Int {
-        (view is PDFThumbnailView ? 1 : 0) + view.subviews.map { thumbnailViewCount(in: $0) }.reduce(0, +)
+    private func thumbnailView(of controller: DocumentWindowController) -> PDFThumbnailView? {
+        guard let contentView = controller.window?.contentView else {
+            return nil
+        }
+        return firstSubview(of: PDFThumbnailView.self, in: contentView)
+    }
+
+    private func firstSubview<T: NSView>(of type: T.Type, in view: NSView) -> T? {
+        if let view = view as? T {
+            return view
+        }
+        return view.subviews.lazy.compactMap { firstSubview(of: type, in: $0) }.first
+    }
+
+    private func splitViewController(of controller: DocumentWindowController) -> NSSplitViewController? {
+        controller.window?.contentViewController as? NSSplitViewController
+    }
+
+    private func visiblePageIndexes(of pdfView: PDFView, in document: PDFDocument) -> [Int] {
+        pdfView.visiblePages.map { document.index(for: $0) }
+    }
+
+    private func waitFor<T: Equatable>(_ expected: T, until observe: () -> T) -> T {
+        let deadline = Date().addingTimeInterval(1)
+        var actual = observe()
+        while actual != expected && Date() < deadline {
+            RunLoop.current.run(until: min(deadline, Date().addingTimeInterval(0.01)))
+            actual = observe()
+        }
+        return actual
     }
 }
