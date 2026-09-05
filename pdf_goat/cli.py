@@ -864,7 +864,7 @@ def _normalize_image(path, tmpdir):
     if img.mode in ("RGBA", "LA", "P"):
         rgba = img.convert("RGBA")
         bg = Image.new("RGB", rgba.size, (255, 255, 255))
-        bg.paste(rgba, mask=rgba.split()[-1])
+        bg.paste(rgba, mask=rgba.getchannel("A"))
         out = Path(tmpdir) / (Path(path).stem + ".norm.png")
         bg.save(out)
         return str(out)
@@ -924,8 +924,7 @@ def fill_pdf_form(src, data, out, flatten):
     reader = PdfReader(src)
     writer = PdfWriter()
     writer.append(reader)
-    for page in writer.pages:
-        writer.update_page_form_field_values(page, data, auto_regenerate=False)
+    writer.update_page_form_field_values(None, data, auto_regenerate=False)
     with open(out, "wb") as fh:
         writer.write(fh)
     if flatten:
@@ -996,14 +995,18 @@ def cmd_watermark(a):
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "watermarked"))
     doc = pymupdf.open(src)
+    tl = pymupdf.get_text_length(a.text, fontsize=a.size)
+    writers = {}
     for page in doc:
         w, h = page.rect.width, page.rect.height
-        tl = pymupdf.get_text_length(a.text, fontsize=a.size)
         point = pymupdf.Point((w - tl) / 2, h / 2)
-        tw = pymupdf.TextWriter(page.rect, color=(0.5, 0.5, 0.5))
-        tw.append(point, a.text, fontsize=a.size)
+        tw = writers.get(tuple(page.rect))
+        if tw is None:
+            tw = pymupdf.TextWriter(page.rect, color=(0.5, 0.5, 0.5))
+            tw.append(point, a.text, fontsize=a.size)
+            writers[tuple(page.rect)] = tw
         tw.write_text(page, opacity=a.opacity, morph=(point, pymupdf.Matrix(a.angle)))
-    doc.save(out, garbage=4, deflate=True)
+    _save_pdf(doc, out)
     doc.close()
     return {
         "verb": "watermark",
@@ -2723,26 +2726,24 @@ def cmd_convert_xlsx(a):
 
 
 def cmd_convert_pptx(a):
+    import io
+
     import pymupdf
     from pptx import Presentation
     from pptx.util import Emu
 
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "from-pdf", "pptx"))
-    import tempfile
-
     doc = pymupdf.open(src)
     prs = Presentation()
     blank = prs.slide_layouts[6]
-    with tempfile.TemporaryDirectory() as td:
-        for i in range(doc.page_count):
-            r = doc[i].rect
-            prs.slide_width = Emu(int(r.width / 72 * 914400))
-            prs.slide_height = Emu(int(r.height / 72 * 914400))
-            png = Path(td) / f"p{i}.png"
-            doc[i].get_pixmap(dpi=a.dpi).save(png)
-            slide = prs.slides.add_slide(blank)
-            slide.shapes.add_picture(str(png), 0, 0, prs.slide_width, prs.slide_height)
+    for i in range(doc.page_count):
+        r = doc[i].rect
+        prs.slide_width = Emu(int(r.width / 72 * 914400))
+        prs.slide_height = Emu(int(r.height / 72 * 914400))
+        png = io.BytesIO(doc[i].get_pixmap(dpi=a.dpi).tobytes("png"))
+        slide = prs.slides.add_slide(blank)
+        slide.shapes.add_picture(png, 0, 0, prs.slide_width, prs.slide_height)
     doc.close()
     prs.save(out)
     return {
@@ -3192,7 +3193,8 @@ def cmd_detach(a):
     names = list(dict.fromkeys(a.names or []))
     with pymupdf.open(src) as doc:
         catalog_names = doc.embfile_names()
-        annotation_names = [name for _, _, name in _file_attachment_annotations(doc)]
+        attachments = list(_file_attachment_annotations(doc))
+        annotation_names = [name for _, _, name in attachments]
         available = list(dict.fromkeys([*catalog_names, *annotation_names]))
         targets = available if a.remove_all else names
         missing = [name for name in targets if name not in available]
@@ -3205,20 +3207,13 @@ def cmd_detach(a):
             if name in target_set:
                 doc.embfile_del(name)
                 removed_count += 1
-        for page_index in range(doc.page_count):
-            page = doc[page_index]
-            annotation = page.first_annot
-            while annotation:
-                next_annotation = annotation.next
-                if annotation.type[0] == pymupdf.PDF_ANNOT_FILE_ATTACHMENT:
-                    name = annotation.file_info.get("filename") or ""
-                    if name in target_set:
-                        page.delete_annot(annotation)
-                        removed_count += 1
-                annotation = next_annotation
+        for page, annotation, name in attachments:
+            if name in target_set:
+                page.delete_annot(annotation)
+                removed_count += 1
 
         out = ensure_parent(a.output or default_out(src, "detached"))
-        doc.save(out, garbage=3, deflate=True)
+        _save_pdf(doc, out)
     return {
         "verb": "detach",
         "inputs": [str(src)],
