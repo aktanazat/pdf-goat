@@ -744,46 +744,44 @@ def cmd_extract(a):
 
 
 def cmd_delete(a):
-    import pikepdf
+    import pymupdf
 
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "deleted"))
-    with pikepdf.open(src) as pdf:
-        n = len(pdf.pages)
-        drop = set(parse_pages(a.pages, n))
-        new = pikepdf.Pdf.new()
-        for i in range(n):
-            if i not in drop:
-                new.pages.append(pdf.pages[i])
-        new.save(out)
-        new.close()
+    with pymupdf.open(src) as doc:
+        n = doc.page_count
+        drop = sorted(set(parse_pages(a.pages, n)))
+        if len(drop) == n:
+            raise PdfGoatError("--pages would remove every page")
+        if drop:  # MuPDF prints "nothing to delete" to stdout on an empty list
+            doc.delete_pages(drop)
+        with AtomicOutput(out) as partial:
+            _save_pdf(doc, partial)
     return {
         "verb": "delete",
         "inputs": [str(src)],
         "outputs": [out],
-        "deleted_pages": sorted(i + 1 for i in drop),
+        "deleted_pages": [i + 1 for i in drop],
         "remaining_pages": n - len(drop),
     }
 
 
 def cmd_reorder(a):
-    import pikepdf
+    import pymupdf
 
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "reordered"))
-    with pikepdf.open(src) as pdf:
-        n = len(pdf.pages)
+    with pymupdf.open(src) as doc:
+        n = doc.page_count
         idxs = parse_pages(a.order, n)
         if sorted(idxs) != list(range(n)):
             raise PdfGoatError(
                 f"--order must list each of the {n} pages exactly once; "
                 f"received {len(idxs)} entries"
             )
-        new = pikepdf.Pdf.new()
-        for i in idxs:
-            new.pages.append(pdf.pages[i])
-        new.save(out)
-        new.close()
+        doc.select(idxs)
+        with AtomicOutput(out) as partial:
+            _save_pdf(doc, partial)
     return {
         "verb": "reorder",
         "inputs": [str(src)],
