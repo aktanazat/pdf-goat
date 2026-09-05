@@ -40,6 +40,14 @@ pdf-goat render report.pdf --pages 1 --dpi 150 -o renders
 lists their verbs. Every run is appended to a SQLite ledger at
 `~/.pdf-goat/ledger.db`; read it with `pdf-goat jobs`.
 
+Page-by-page verbs such as `text`, `search`, `count`, `render`, and `redact`
+spread long documents across worker processes once the first pages prove the
+job slow: eight by default, or `PDF_GOAT_WORKERS`, capped at the CPU count.
+Each worker holds its own copy of the document. Measured on a 1,063-page
+text-heavy file with eight workers, a `text` run peaked near 450 MB across all
+processes for a second or two, and a 200 DPI `render` near 800 MB.
+`PDF_GOAT_WORKERS=1` keeps every verb in one process.
+
 For agents, the CLI writes JSON when its output is piped, and `--agent` forces
 JSON on a TTY. Start with `pdf-goat --agent capabilities` for the family list,
 then ask one family for its argument schema.

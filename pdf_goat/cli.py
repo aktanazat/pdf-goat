@@ -11,7 +11,7 @@ import re
 import sys
 import time
 import unicodedata
-from itertools import islice
+from itertools import islice, pairwise, repeat
 from pathlib import Path
 
 from .layout import extract_page_layout
@@ -374,6 +374,191 @@ def _page_inventory(page, index):
     }
 
 
+# --------------------------------------------------------------------------- #
+# Page parallelism
+# --------------------------------------------------------------------------- #
+# Spawning the pool costs about 150 ms, so it starts only after the sequential
+# run has already spent more than that, and only with enough pages left for
+# each worker to earn its spawn.
+_POOL_AFTER_SECONDS = 0.2
+_POOL_MIN_PAGES = 8
+# Each worker holds its own MuPDF copy of the document, so memory grows with
+# the worker count; README.md carries the setting and the measured figures.
+_POOL_MAX_WORKERS = min(
+    int(os.environ.get("PDF_GOAT_WORKERS", "8")), os.cpu_count() or 1
+)
+
+
+def _task_text(doc, index, fmt):
+    return doc[index].get_text(fmt)
+
+
+def _task_count(doc, index, _arg):
+    text, words = _page_text_and_words(doc[index])
+    return len(text), len(words)
+
+
+def _task_search(doc, index, query):
+    return [[round(v, 1) for v in rect] for rect in doc[index].search_for(query)]
+
+
+def _task_layout(doc, index, _arg):
+    return extract_page_layout(doc[index])
+
+
+def _task_inventory(doc, index, _arg):
+    return _page_inventory(doc[index], index)
+
+
+def _task_preflight(doc, index, _arg):
+    return _page_preflight(doc[index])
+
+
+def _task_redact_hits(doc, index, pattern):
+    search = re.compile(pattern).search
+    return [
+        (x0, y0, x1, y1)
+        for x0, y0, x1, y1, word, *_ in doc[index].get_text("words")
+        if search(word)
+    ]
+
+
+def _task_render(doc, index, arg):
+    dpi, clip, outdir, stem, fmt = arg
+    page = doc[index]
+    out = f"{outdir}/{stem}_p{index + 1:03d}.{fmt}"
+    page.get_pixmap(dpi=dpi, clip=page.rect & clip if clip is not None else None).save(
+        out
+    )
+    return out
+
+
+def _task_visual_diff(doc, index, arg):
+    from PIL import ImageChops
+
+    other, dpi, outdir = arg
+    ia = doc[index].get_pixmap(dpi=dpi).pil_image().convert("RGB")
+    ib = _shared_doc(other)[index].get_pixmap(dpi=dpi).pil_image().convert("RGB")
+    if ia.size != ib.size:
+        ib = ib.resize(ia.size)
+    diff = ImageChops.difference(ia, ib)
+    pixels = ia.width * ia.height
+    ratio = (pixels - diff.convert("L").histogram()[0]) / pixels
+    out = f"{outdir}/diff_p{index + 1}.png"
+    diff.save(out)
+    return out, {
+        "page": index + 1,
+        "changed_ratio": round(ratio, 4),
+        "bbox": diff.getbbox(),
+    }
+
+
+_PAGE_TASKS = {
+    "text": _task_text,
+    "count": _task_count,
+    "search": _task_search,
+    "layout": _task_layout,
+    "inventory": _task_inventory,
+    "preflight": _task_preflight,
+    "redact": _task_redact_hits,
+    "render": _task_render,
+    "visual": _task_visual_diff,
+}
+
+_worker_doc = None
+_shared_docs = {}  # also filled by cmd_compare_visual, which lends its open handle
+
+
+def _shared_doc(path):
+    """Open a second document once per process for tasks that compare two."""
+    doc = _shared_docs.get(path)
+    if doc is None:
+        import pymupdf
+
+        doc = _shared_docs[path] = pymupdf.open(path)
+    return doc
+
+
+def _worker_open(src):
+    import pymupdf
+
+    global _worker_doc
+    _worker_doc = pymupdf.open(src)
+
+
+def _worker_run(task, indices, arg):
+    return [_PAGE_TASKS[task](_worker_doc, i, arg) for i in indices]
+
+
+def map_pages(doc, src, task, indices, arg=None):
+    """Run one page task over ``indices`` and return results in that order.
+
+    MuPDF holds the GIL while it extracts, so threads run no faster than one
+    page at a time; only separate processes overlap. Spawning them costs about
+    150 ms, so the pool starts only once the sequential run has proved the job
+    slow enough to pay for it, and short documents never pay.
+    """
+    import multiprocessing
+
+    run = _PAGE_TASKS[task]
+    started = time.perf_counter()
+    results = []
+    for position, index in enumerate(indices):
+        results.append(run(doc, index, arg))
+        if (
+            _POOL_MAX_WORKERS > 1
+            and len(indices) - position - 1 >= _POOL_MIN_PAGES
+            and time.perf_counter() - started > _POOL_AFTER_SECONDS
+            and multiprocessing.parent_process() is None
+        ):
+            return results + _map_in_pool(src, task, indices[position + 1 :], arg)
+    return results
+
+
+def _map_in_pool(src, task, indices, arg):
+    """Extract ``indices`` in worker processes, each holding its own copy."""
+    import pickle
+    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures.process import BrokenProcessPool
+
+    workers = min(_POOL_MAX_WORKERS, len(indices))
+    # Sixteen chunks per worker: page cost varies a lot for render, and coarse
+    # chunks leave the last worker alone with the image-heavy pages.
+    edges = [len(indices) * i // (workers * 16) for i in range(workers * 16 + 1)]
+    chunks = [indices[a:b] for a, b in pairwise(edges) if a < b]
+    try:
+        with ProcessPoolExecutor(
+            workers, initializer=_worker_open, initargs=(str(src),)
+        ) as pool:
+            batches = pool.map(_worker_run, repeat(task), chunks, repeat(arg))
+            try:
+                return [result for batch in batches for result in batch]
+            except BaseException:
+                # Leaving the ``with`` block drains every queued chunk first,
+                # so Ctrl-C on a long render would otherwise run to the end.
+                # Only this pool's workers: active_children() would also hit
+                # processes an importing program owns. (3.14 adds
+                # terminate_workers() for the same loop.)
+                for worker in list(pool._processes.values()):
+                    worker.terminate()
+                raise
+    except (BrokenProcessPool, pickle.PicklingError):
+        # A host whose __main__ cannot be re-imported (``python - <<EOF``) kills
+        # every spawned worker on startup, and one that re-executes this module
+        # under a runner (``-m cProfile -m pdf_goat.cli``) cannot pickle the
+        # worker entry points. Finish the pages here: slow beats an error the
+        # same call did not raise before.
+        import pymupdf
+
+        print(
+            "pdf-goat: worker pool unavailable; finishing in one process",
+            file=sys.stderr,
+        )
+        run = _PAGE_TASKS[task]
+        with pymupdf.open(src) as doc:
+            return [run(doc, index, arg) for index in indices]
+
+
 def cmd_inspect(a):
     import pymupdf
 
@@ -392,7 +577,7 @@ def cmd_inspect(a):
 
     start = a.start_page - 1
     end = min(start + a.limit, doc.page_count)
-    pages = [_page_inventory(doc[index], index) for index in range(start, end)]
+    pages = map_pages(doc, src, "inventory", list(range(start, end)))
     total_pages = doc.page_count
     doc.close()
     return {
@@ -445,7 +630,7 @@ def _page_preflight(page):
     }
 
 
-def _document_preflight(doc):
+def _document_preflight(doc, src):
     profile = {
         "annotations": 0,
         "form_fields": 0,
@@ -453,8 +638,8 @@ def _document_preflight(doc):
         "unsafe_links": 0,
         "empty_pages": [],
     }
-    for index, page in enumerate(doc):
-        page_profile = _page_preflight(page)
+    indices = list(range(doc.page_count))
+    for index, page_profile in zip(indices, map_pages(doc, src, "preflight", indices)):
         for key in ("annotations", "form_fields", "external_links", "unsafe_links"):
             profile[key] += page_profile[key]
         if page_profile["empty"]:
@@ -642,7 +827,7 @@ def cmd_preflight(a):
             ],
         }
 
-    content = _document_preflight(doc)
+    content = _document_preflight(doc, src)
     attachment_count = len(doc.embfile_names()) + sum(
         1 for _ in _file_attachment_annotations(doc)
     )
@@ -832,20 +1017,14 @@ def cmd_render(a):
         indices = list(
             parse_pages(a.pages, doc.page_count) if a.pages else range(doc.page_count)
         )
-        page_clips = []
         for index in indices:
-            page_clip = doc[index].rect & clip if clip is not None else None
-            if page_clip is not None and page_clip.is_empty:
+            if clip is not None and (doc[index].rect & clip).is_empty:
                 raise PdfGoatError(f"--clip does not overlap page {index + 1}")
-            page_clips.append(page_clip)
 
         outdir.mkdir(parents=True, exist_ok=True)
-        outputs = []
-        for index, page_clip in zip(indices, page_clips, strict=True):
-            pixmap = doc[index].get_pixmap(dpi=a.dpi, clip=page_clip)
-            out = outdir / f"{src.stem}_p{index + 1:03d}.{a.format}"
-            pixmap.save(out)
-            outputs.append(str(out))
+        outputs = map_pages(
+            doc, src, "render", indices, (a.dpi, clip, outdir, src.stem, a.format)
+        )
     return {
         "verb": "render",
         "inputs": [str(src)],
@@ -966,19 +1145,19 @@ def cmd_redact(a):
 
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "redacted"))
-    pattern = re.compile(a.find)
+    re.compile(a.find)  # reject a bad pattern before opening the document
     doc = pymupdf.open(src)
     hits = 0
-    for page in doc:
-        marked = False
-        for x0, y0, x1, y1, word, *_ in page.get_text("words"):
-            if pattern.search(word):
-                page.add_redact_annot(pymupdf.Rect(x0, y0, x1, y1), fill=(0, 0, 0))
-                hits += 1
-                marked = True
-        if marked:
-            page.apply_redactions()
-    doc.save(out, garbage=4, deflate=True)
+    indices = list(range(doc.page_count))
+    for index, rects in zip(indices, map_pages(doc, src, "redact", indices, a.find)):
+        if not rects:
+            continue
+        page = doc[index]
+        for rect in rects:
+            page.add_redact_annot(pymupdf.Rect(*rect), fill=(0, 0, 0))
+        hits += len(rects)
+        page.apply_redactions()
+    _save_pdf(doc, out)
     doc.close()
     return {
         "verb": "redact",
@@ -1094,26 +1273,32 @@ def cmd_text(a):
         "inputs": [str(src)],
         "outputs": [out] if out else [],
     }
+    indices = list(range(doc.page_count))
     if out and not a.layout:
-        # The file is the output, so stream to it and report a page count
-        # instead of holding the whole corpus twice more.
-        chars = 0
-        with Path(out).open("w") as handle:
-            for index in range(doc.page_count):
-                text = ("\n" if index else "") + doc[index].get_text("text")
-                handle.write(text)
-                chars += len(text)
-        result["char_count"] = chars
-        result["page_count"] = doc.page_count
+        texts = map_pages(doc, src, "text", indices, "text")
         doc.close()
+        # The file is the output, so write page by page instead of joining
+        # the whole corpus into a second copy.
+        with Path(out).open("w") as handle:
+            handle.writelines(
+                text if index == 0 else "\n" + text for index, text in enumerate(texts)
+            )
+        # Same number as len("\n".join(texts)) in the joined branch below.
+        result["char_count"] = sum(map(len, texts)) + max(len(texts) - 1, 0)
+        result["page_count"] = len(texts)
         return result
-    pages = []
-    for index in range(doc.page_count):
-        page = doc[index]
-        if a.layout:
-            pages.append({"page": index + 1, **extract_page_layout(page)})
-        else:
-            pages.append({"page": index + 1, "text": page.get_text("text")})
+    if a.layout:
+        pages = [
+            {"page": index + 1, **layout}
+            for index, layout in zip(indices, map_pages(doc, src, "layout", indices))
+        ]
+    else:
+        pages = [
+            {"page": index + 1, "text": text}
+            for index, text in zip(
+                indices, map_pages(doc, src, "text", indices, "text")
+            )
+        ]
     full = "\n".join(page["text"] for page in pages)
     doc.close()
     result["char_count"] = len(full)
@@ -2608,7 +2793,8 @@ def cmd_convert_html(a):
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "from-pdf", "html"))
     doc = pymupdf.open(src)
-    parts = [doc[i].get_text("html") for i in range(doc.page_count)]
+    indices = list(range(doc.page_count))
+    parts = map_pages(doc, src, "text", indices, "html")
     doc.close()
     Path(out).write_text(
         "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>"
@@ -2814,7 +3000,8 @@ def cmd_convert_audio(a):
     import pymupdf
 
     doc = pymupdf.open(src)
-    text = "\n".join(doc[i].get_text("text") for i in range(doc.page_count)).strip()
+    indices = list(range(doc.page_count))
+    text = "\n".join(map_pages(doc, src, "text", indices, "text")).strip()
     doc.close()
     if not text:
         raise PdfGoatError("no extractable text to read aloud")
@@ -3088,9 +3275,14 @@ def cmd_compare_text(a):
 
     import pymupdf
 
-    da, db = pymupdf.open(resolve(a.file)), pymupdf.open(resolve(a.other))
-    ta = "\n".join(p.get_text("text") for p in da).splitlines()
-    tb = "\n".join(p.get_text("text") for p in db).splitlines()
+    left, right = resolve(a.file), resolve(a.other)
+    da, db = pymupdf.open(left), pymupdf.open(right)
+    ta = "\n".join(
+        map_pages(da, left, "text", list(range(da.page_count)), "text")
+    ).splitlines()
+    tb = "\n".join(
+        map_pages(db, right, "text", list(range(db.page_count)), "text")
+    ).splitlines()
     da.close()
     db.close()
     diff = list(difflib.unified_diff(ta, tb, lineterm="", n=1))
@@ -3098,7 +3290,7 @@ def cmd_compare_text(a):
     removed = sum(1 for d in diff if d.startswith("-") and not d.startswith("---"))
     return {
         "verb": "compare-text",
-        "inputs": [str(resolve(a.file)), str(resolve(a.other))],
+        "inputs": [str(left), str(right)],
         "outputs": [],
         "identical": added == 0 and removed == 0,
         "added": added,
@@ -3109,33 +3301,24 @@ def cmd_compare_text(a):
 
 def cmd_compare_visual(a):
     import pymupdf
-    from PIL import ImageChops
 
     src_a, src_b = resolve(a.file), resolve(a.other)
     outdir = out_dir(a, src_a, "diff")
     da, db = pymupdf.open(src_a), pymupdf.open(src_b)
-    outputs, changed = [], []
-    for i in range(min(da.page_count, db.page_count)):
-        ia = da[i].get_pixmap(dpi=a.dpi).pil_image().convert("RGB")
-        ib = db[i].get_pixmap(dpi=a.dpi).pil_image().convert("RGB")
-        if ia.size != ib.size:
-            ib = ib.resize(ia.size)
-        diff = ImageChops.difference(ia, ib)
-        bbox = diff.getbbox()
-        ratio = sum(diff.convert("L").point(lambda x: 1 if x else 0).getdata()) / (
-            ia.width * ia.height
+    indices = list(range(min(da.page_count, db.page_count)))
+    _shared_docs[str(src_b)] = db  # the parent's pages reuse this handle
+    try:
+        diffs = map_pages(
+            da, src_a, "visual", indices, (str(src_b), a.dpi, str(outdir))
         )
-        p = outdir / f"diff_p{i + 1}.png"
-        diff.save(p)
-        outputs.append(str(p))
-        changed.append({"page": i + 1, "changed_ratio": round(ratio, 4), "bbox": bbox})
-    da.close()
-    db.close()
+    finally:
+        _shared_docs.pop(str(src_b)).close()
+        da.close()
     return {
         "verb": "compare-visual",
         "inputs": [str(src_a), str(src_b)],
-        "outputs": outputs,
-        "pages": changed,
+        "outputs": [out for out, _ in diffs],
+        "pages": [page for _, page in diffs],
     }
 
 
@@ -3236,13 +3419,21 @@ def cmd_search(a):
         indices = list(
             parse_pages(a.pages, doc.page_count) if a.pages else range(doc.page_count)
         )
-        for position, index in enumerate(indices):
-            for rect in doc[index].search_for(a.query):
-                hits.append({"page": index + 1, "rect": [round(v, 1) for v in rect]})
-            if limit and len(hits) >= limit:
-                truncated = len(hits) > limit or position + 1 < len(indices)
-                del hits[limit:]
-                break
+        if not limit:
+            for index, rects in zip(
+                indices, map_pages(doc, src, "search", indices, a.query)
+            ):
+                hits += [{"page": index + 1, "rect": rect} for rect in rects]
+        else:
+            for position, index in enumerate(indices):
+                hits += [
+                    {"page": index + 1, "rect": rect}
+                    for rect in _task_search(doc, index, a.query)
+                ]
+                if len(hits) >= limit:
+                    truncated = len(hits) > limit or position + 1 < len(indices)
+                    del hits[limit:]
+                    break
     return {
         "verb": "search",
         "inputs": [str(src)],
@@ -3276,11 +3467,10 @@ def cmd_count(a):
 
     src = resolve(a.file)
     doc = pymupdf.open(src)
-    words = chars = 0
-    for index in range(doc.page_count):
-        text, page_words = _page_text_and_words(doc[index])
-        words += len(page_words)
-        chars += len(text)
+    indices = list(range(doc.page_count))
+    counted = map_pages(doc, src, "count", indices)
+    chars = sum(page_chars for page_chars, _ in counted)
+    words = sum(page_words for _, page_words in counted)
     pages = doc.page_count
     doc.close()
     return {

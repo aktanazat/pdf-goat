@@ -206,3 +206,61 @@ class AgentToolTests(unittest.TestCase):
             (Path(compressed["outputs"][0]), compressed["compressed_bytes"]),
             (target.resolve(), target.stat().st_size),
         )
+
+    def test_page_verbs_agree_between_the_worker_pool_and_the_sequential_run(
+        self,
+    ) -> None:
+        source = self.tempdir / "twelve-pages.pdf"
+        document = pymupdf.open()
+        for number in range(12):
+            page = document.new_page()
+            page.insert_text((72, 100), f"page {number + 1} alpha bravo")
+        document.save(source)
+        document.close()
+        verbs = {
+            "count": ("count", str(source)),
+            "search": ("search", str(source), "alpha"),
+            "text": ("text", str(source)),
+            "text --layout": ("text", str(source), "--layout"),
+            "inspect": ("inspect", str(source), "--limit", "12"),
+            "render": (
+                "render",
+                str(source),
+                "--dpi",
+                "36",
+                "-o",
+                str(self.tempdir / "renders"),
+            ),
+        }
+        previous = cli._POOL_AFTER_SECONDS, cli._POOL_MIN_PAGES
+        self.addCleanup(self.set_pool_tuning, *previous)
+        self.set_pool_tuning(0.0, 1)
+        pooled = {name: self.run_agent(*args) for name, args in verbs.items()}
+        # The sequential run overwrites the same render files, so read the
+        # pooled images first; a worker that reports a path it never wrote
+        # fails here.
+        pooled_images = [Path(p).read_bytes() for p in pooled["render"]["outputs"]]
+        # Redaction lands on whichever page the pool says held the hit, so check
+        # the output document rather than the hit count.
+        redacted = self.tempdir / "redacted.pdf"
+        self.run_agent("redact", str(source), "--find", "^3$", "-o", str(redacted))
+        with pymupdf.open(redacted) as document:
+            kept_numbers = [
+                str(number + 1) in page.get_text().split()
+                for number, page in enumerate(document)
+            ]
+        self.set_pool_tuning(float("inf"), previous[1])
+        sequential = {name: self.run_agent(*args) for name, args in verbs.items()}
+        for name in verbs:
+            with self.subTest(verb=name):
+                self.assertEqual(pooled[name], sequential[name])
+        self.assertEqual(kept_numbers, [number != 2 for number in range(12)])
+        self.assertEqual(
+            pooled_images,
+            [Path(p).read_bytes() for p in sequential["render"]["outputs"]],
+        )
+
+    @staticmethod
+    def set_pool_tuning(after_seconds: float, min_pages: int) -> None:
+        cli._POOL_AFTER_SECONDS = after_seconds
+        cli._POOL_MIN_PAGES = min_pages
