@@ -11,4 +11,15 @@ while [ -h "$SOURCE" ]; do
   [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 PROJECT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-exec uv run --project "$PROJECT_DIR" --quiet pdf-goat-cli "$@"
+VENV="$PROJECT_DIR/.venv"
+STAMP="$VENV/.synced"
+# uv's environment check costs ~14 ms of a ~50 ms floor, so run it only when
+# the manifest changed since the last sync or the environment is missing.
+if [ ! -x "$VENV/bin/pdf-goat-cli" ] || [ ! -e "$STAMP" ] \
+  || [ "$PROJECT_DIR/uv.lock" -nt "$STAMP" ] \
+  || [ "$PROJECT_DIR/pyproject.toml" -nt "$STAMP" ]; then
+  uv sync --project "$PROJECT_DIR" --quiet
+  touch "$STAMP"
+fi
+export VIRTUAL_ENV="$VENV" PATH="$VENV/bin:$PATH"
+exec "$VENV/bin/pdf-goat-cli" "$@"
