@@ -120,7 +120,10 @@ def extract_page_layout(
     Single-column pages use PyMuPDF's sorted text verbatim for compatibility.
     """
 
-    raw_words = page.get_text("words", sort=False)
+    import pymupdf
+
+    textpage = page.get_textpage(flags=pymupdf.TEXTFLAGS_TEXT)
+    raw_words = page.get_text("words", sort=False, textpage=textpage)
     words: list[tuple[float, float, float, float, str]] = []
     for raw in raw_words:
         if len(raw) < 5:
@@ -170,7 +173,7 @@ def extract_page_layout(
 
     columns.sort(key=lambda column: column["x0"])
     if len(columns) <= 1:
-        sorted_text = page.get_text("text", sort=True)
+        sorted_text = page.get_text("text", sort=True, textpage=textpage)
         reading_order = [
             {**line, "column": 1} for line in _line_groups(words, line_tolerance_pt)
         ]
