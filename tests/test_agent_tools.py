@@ -159,6 +159,112 @@ class AgentToolTests(unittest.TestCase):
         result = self.run_agent("search", str(self.source), "CS", "--limit", "1")
         self.assertEqual((result["count"], result["truncated"]), (1, True))
 
+    def test_search_and_redact_share_case_insensitive_word_hits(self) -> None:
+        source = self.tempdir / "mixed-case.pdf"
+        document = pymupdf.open()
+        page = document.new_page()
+        page.insert_text(
+            (72, 72),
+            "Commission COMMISSION commission Commissioner unrelated",
+        )
+        document.save(source)
+        document.close()
+
+        before = self.run_agent("search", str(source), "Commission")
+        self.assertEqual((before["count"], before["truncated"]), (4, False))
+
+        output = self.tempdir / "mixed-case-redacted.pdf"
+        receipt = self.run_agent(
+            "redact", str(source), "--find", "Commission", "-o", str(output)
+        )
+        after = self.run_agent("search", str(output), "Commission")
+        with pymupdf.open(output) as redacted:
+            text = "\n".join(page.get_text() for page in redacted)
+        self.assertEqual((after["count"], after["truncated"]), (0, False))
+        self.assertEqual(receipt["redactions"], before["count"])
+        self.assertNotIn("commission", text.lower())
+        self.assertIn("unrelated", text)
+
+    def test_search_matches_a_phrase_across_block_lines(self) -> None:
+        source = self.tempdir / "line-break.pdf"
+        document = pymupdf.open()
+        page = document.new_page()
+        page.insert_textbox(pymupdf.Rect(72, 60, 250, 100), "New\nYork", fontsize=10)
+        document.save(source)
+        document.close()
+
+        result = self.run_agent("search", str(source), "New York")
+        rectangles = [hit["rect"] for hit in result["hits"]]
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(len({rectangle[1] for rectangle in rectangles}), 2)
+
+    def write_ligature_pdf(self) -> Path:
+        source = self.tempdir / "ligature.pdf"
+        document = pymupdf.open()
+        page = document.new_page()
+        writer = pymupdf.TextWriter(page.rect)
+        writer.append((72, 72), "De\ufb01ning the \ufb02ow", font=pymupdf.Font("helv"))
+        writer.write_text(page)
+        document.save(source)
+        document.close()
+        return source
+
+    def test_search_and_redact_read_ligature_glyphs_as_letters(self) -> None:
+        source = self.write_ligature_pdf()
+
+        found = self.run_agent("search", str(source), "Defining")
+        self.assertEqual(found["count"], 1)
+
+        output = self.tempdir / "ligature-redacted.pdf"
+        self.run_agent("redact", str(source), "--find", "flow", "-o", str(output))
+        with pymupdf.open(output) as redacted:
+            words = [word[4] for word in redacted[0].get_text("words")]
+        self.assertEqual(words, ["De\ufb01ning", "the"])
+
+    def test_search_and_redact_fold_ligature_glyphs_typed_in_the_query(self) -> None:
+        source = self.write_ligature_pdf()
+
+        found = self.run_agent("search", str(source), "De\ufb01ning")
+        self.assertEqual(found["count"], 1)
+
+        output = self.tempdir / "ligature-query-redacted.pdf"
+        self.run_agent("redact", str(source), "--find", "\ufb02ow", "-o", str(output))
+        with pymupdf.open(output) as redacted:
+            words = [word[4] for word in redacted[0].get_text("words")]
+        self.assertEqual(words, ["De\ufb01ning", "the"])
+
+    def test_redact_counts_a_word_once_however_often_the_pattern_matches(self) -> None:
+        source = self.tempdir / "repeat.pdf"
+        document = pymupdf.open()
+        page = document.new_page()
+        page.insert_text((72, 72), "Mississippi river")
+        document.save(source)
+        document.close()
+
+        output = self.tempdir / "repeat-redacted.pdf"
+        receipt = self.run_agent(
+            "redact", str(source), "--find", "s", "-o", str(output)
+        )
+        with pymupdf.open(output) as redacted:
+            words = [word[4] for word in redacted[0].get_text("words")]
+        self.assertEqual((receipt["redactions"], words), (1, ["river"]))
+
+    def test_redact_match_on_a_join_keeps_the_word_before_it(self) -> None:
+        source = self.tempdir / "join.pdf"
+        document = pymupdf.open()
+        page = document.new_page()
+        page.insert_text((72, 72), "keep New York tail")
+        document.save(source)
+        document.close()
+
+        output = self.tempdir / "join-redacted.pdf"
+        receipt = self.run_agent(
+            "redact", str(source), "--find", r"\s+New\s+York", "-o", str(output)
+        )
+        with pymupdf.open(output) as redacted:
+            words = [word[4] for word in redacted[0].get_text("words")]
+        self.assertEqual((receipt["redactions"], words), (1, ["keep", "tail"]))
+
     def test_count_matches_mupdf_text_and_word_boxes(self) -> None:
         with pymupdf.open(self.source) as document:
             expected = (
