@@ -387,6 +387,7 @@ _POOL_MIN_PAGES = 8
 _POOL_MAX_WORKERS = min(
     int(os.environ.get("PDF_GOAT_WORKERS", "8")), os.cpu_count() or 1
 )
+_CACHE_PAGE_BATCH = 64
 
 
 def _task_text(doc, index, fmt):
@@ -398,29 +399,52 @@ def _task_count(doc, index, _arg):
     return len(text), len(words)
 
 
-def _page_hits(page, pattern):
-    """Rectangles of every ``pattern`` match on one page, one per line segment.
-
-    The page's words are joined with newlines. With the default flags, ``^`` and
-    ``$`` bind to one word, ``.`` never crosses a word, and ``\\s+`` crosses the
-    join, also across lines and blocks. Ligature glyphs read as their letters,
-    so ``final`` finds ``ﬁnal``. An empty match selects the word at its position,
-    and a word is reported once however often the pattern matches inside it.
-    """
-    from bisect import bisect_left, bisect_right
-    from itertools import groupby
-
-    import pymupdf
-
-    words = page.get_text(
-        "words", flags=pymupdf.TEXTFLAGS_WORDS & ~pymupdf.TEXT_PRESERVE_LIGATURES
-    )
+def _word_columns(words):
+    texts = []
     starts = []
+    rects = []
+    lines = []
     position = 0
     for word in words:
         starts.append(position)
+        texts.append(word[4])
+        rects.extend(word[:4])
+        lines.extend(word[5:7])
         position += len(word[4]) + 1
-    text = "\n".join(word[4] for word in words)
+    return "\n".join(texts), starts, rects, lines
+
+
+def _page_words(page):
+    import pymupdf
+
+    return _word_columns(
+        page.get_text(
+            "words", flags=pymupdf.TEXTFLAGS_WORDS & ~pymupdf.TEXT_PRESERVE_LIGATURES
+        )
+    )
+
+
+def _cached_word_columns(value):
+    text, rects, lines = value
+    if not text:
+        return text, [], rects, lines
+    starts = [0]
+    starts.extend(index + 1 for index, char in enumerate(text) if char == "\n")
+    return text, starts, rects, lines
+
+
+def _page_hits(words, pattern):
+    """Return rectangles for pattern matches, split at PDF text lines."""
+    from bisect import bisect_left, bisect_right
+    from itertools import groupby
+
+    text, starts, rects, lines = words
+    if not starts:
+        return []
+
+    def word_end(index):
+        return starts[index + 1] - 1 if index + 1 < len(starts) else len(text)
+
     hits = []
     previous = None
     for match in pattern.finditer(text):
@@ -429,20 +453,22 @@ def _page_hits(page, pattern):
         if start == end:
             last = first + 1
         else:
-            if start == starts[first] + len(words[first][4]):
+            if start == word_end(first):
                 first += 1  # the match begins on the join, not in a word
             last = bisect_left(starts, end)
         if (first, last) == previous:
             continue  # a second match inside the same words, or an empty match one position on
         previous = (first, last)
-        for _, line in groupby(words[first:last], key=lambda word: word[5:7]):
+        for _, line in groupby(
+            range(first, last), key=lambda index: lines[index * 2 : index * 2 + 2]
+        ):
             line = list(line)
             hits.append(
                 (
-                    min(word[0] for word in line),
-                    min(word[1] for word in line),
-                    max(word[2] for word in line),
-                    max(word[3] for word in line),
+                    min(rects[index * 4] for index in line),
+                    min(rects[index * 4 + 1] for index in line),
+                    max(rects[index * 4 + 2] for index in line),
+                    max(rects[index * 4 + 3] for index in line),
                 )
             )
     return hits
@@ -464,18 +490,21 @@ _LIGATURES = str.maketrans(
 
 
 def _hit_pattern(source):
-    """Compile ``source`` for ``_page_hits``: case-insensitive, one word per line."""
+    """Compile source for case-insensitive matching over word joins."""
     return re.compile(source.translate(_LIGATURES), re.IGNORECASE | re.MULTILINE)
 
 
-def _task_search(doc, index, query):
+def _search_columns(words, query):
     tokens = query.split()
     if not tokens:
         return []
     pattern = _hit_pattern(r"\s+".join(re.escape(token) for token in tokens))
-    return [
-        [round(value, 1) for value in rect] for rect in _page_hits(doc[index], pattern)
-    ]
+    return [[round(value, 1) for value in rect] for rect in _page_hits(words, pattern)]
+
+
+def _task_search(doc, index, query):
+    words = _page_words(doc[index])
+    return _search_columns(words, query), words
 
 
 def _task_layout(doc, index, _arg):
@@ -491,7 +520,7 @@ def _task_preflight(doc, index, _arg):
 
 
 def _task_redact_hits(doc, index, pattern):
-    return _page_hits(doc[index], _hit_pattern(pattern))
+    return _page_hits(_page_words(doc[index]), _hit_pattern(pattern))
 
 
 def _task_render(doc, index, arg):
@@ -537,6 +566,8 @@ _PAGE_TASKS = {
 }
 
 _worker_doc = None
+_worker_cache = None
+_worker_cache_context = None
 _shared_docs = {}  # also filled by cmd_compare_visual, which lends its open handle
 
 
@@ -550,84 +581,251 @@ def _shared_doc(path):
     return doc
 
 
-def _worker_open(src):
+def _cache_form(task, arg):
+    if task == "text" and arg == "text":
+        return "text"
+    if task == "count":
+        return "count"
+    if task == "search":
+        return "words"
+    return None
+
+
+def _extract_page(task, doc, index, arg, collect_cache=False):
+    value = _PAGE_TASKS[task](doc, index, arg)
+    if task == "search":
+        result, words = value
+        cache_value = (words[0], words[2], words[3]) if collect_cache else None
+        return result, cache_value
+    return value, value if collect_cache and _cache_form(task, arg) else None
+
+
+def _write_worker_entries(entries):
+    if not entries or _worker_cache is None or _worker_cache_context is None:
+        return
+    context = _worker_cache_context
+    _worker_cache.write(
+        context["key"],
+        Path(context["source"]),
+        context["page_count"],
+        context["form"],
+        entries,
+    )
+
+
+def _worker_open(src, cache_context=None):
     import pymupdf
 
-    global _worker_doc
+    global _worker_cache, _worker_cache_context, _worker_doc
     _worker_doc = pymupdf.open(src)
+    _worker_cache_context = cache_context
+    _worker_cache = None
+    if cache_context is not None:
+        from .textcache import Cache
+
+        _worker_cache = Cache(cache_context["path"])
 
 
 def _worker_run(task, indices, arg):
-    return [_PAGE_TASKS[task](_worker_doc, i, arg) for i in indices]
+    results = []
+    entries = {}
+    for index in indices:
+        value, cache_value = _extract_page(
+            task, _worker_doc, index, arg, _worker_cache_context is not None
+        )
+        results.append(value)
+        if cache_value is not None:
+            entries[index] = cache_value
+    _write_worker_entries(entries)
+    return results
 
 
-def map_pages(doc, src, task, indices, arg=None):
-    """Run one page task over ``indices`` and return results in that order.
-
-    MuPDF holds the GIL while it extracts, so threads run no faster than one
-    page at a time; only separate processes overlap. Spawning them costs about
-    150 ms, so the pool starts only once the sequential run has proved the job
-    slow enough to pay for it, and short documents never pay.
-    """
+def map_pages(doc, src, task, indices, arg=None, cache=None, cache_context=None):
+    """Run one page task over indices and return results in that order."""
     import multiprocessing
 
-    run = _PAGE_TASKS[task]
     started = time.perf_counter()
     results = []
+    parent_entries = {}
+
+    def flush_parent_entries():
+        if cache is not None and cache_context is not None and parent_entries:
+            cache.write(
+                cache_context["key"],
+                Path(cache_context["source"]),
+                cache_context["page_count"],
+                cache_context["form"],
+                parent_entries,
+            )
+            parent_entries.clear()
+
     for position, index in enumerate(indices):
-        results.append(run(doc, index, arg))
+        value, cache_value = _extract_page(
+            task, doc, index, arg, cache_context is not None
+        )
+        results.append(value)
+        if cache_value is not None:
+            parent_entries[index] = cache_value
         if (
             _POOL_MAX_WORKERS > 1
             and len(indices) - position - 1 >= _POOL_MIN_PAGES
             and time.perf_counter() - started > _POOL_AFTER_SECONDS
             and multiprocessing.parent_process() is None
         ):
-            return results + _map_in_pool(src, task, indices[position + 1 :], arg)
+            flush_parent_entries()
+            return results + _map_in_pool(
+                src, task, indices[position + 1 :], arg, cache_context
+            )
+    flush_parent_entries()
     return results
 
 
-def _map_in_pool(src, task, indices, arg):
-    """Extract ``indices`` in worker processes, each holding its own copy."""
+def _map_in_pool(src, task, indices, arg, cache_context=None):
+    """Extract indices in worker processes, each holding its own copy."""
     import pickle
     from concurrent.futures import ProcessPoolExecutor
     from concurrent.futures.process import BrokenProcessPool
 
     workers = min(_POOL_MAX_WORKERS, len(indices))
     # Sixteen chunks per worker: page cost varies a lot for render, and coarse
-    # chunks leave the last worker alone with the image-heavy pages.
+    # chunks leave the last worker alone with image-heavy pages.
     edges = [len(indices) * i // (workers * 16) for i in range(workers * 16 + 1)]
     chunks = [indices[a:b] for a, b in pairwise(edges) if a < b]
     try:
         with ProcessPoolExecutor(
-            workers, initializer=_worker_open, initargs=(str(src),)
+            workers, initializer=_worker_open, initargs=(str(src), cache_context)
         ) as pool:
             batches = pool.map(_worker_run, repeat(task), chunks, repeat(arg))
             try:
                 return [result for batch in batches for result in batch]
             except BaseException:
-                # Leaving the ``with`` block drains every queued chunk first,
-                # so Ctrl-C on a long render would otherwise run to the end.
-                # Only this pool's workers: active_children() would also hit
-                # processes an importing program owns. (3.14 adds
-                # terminate_workers() for the same loop.)
+                # Stop only this pool when a queued task fails or is cancelled.
                 for worker in list(pool._processes.values()):
                     worker.terminate()
                 raise
     except (BrokenProcessPool, pickle.PicklingError):
-        # A host whose __main__ cannot be re-imported (``python - <<EOF``) kills
-        # every spawned worker on startup, and one that re-executes this module
-        # under a runner (``-m cProfile -m pdf_goat.cli``) cannot pickle the
-        # worker entry points. Finish the pages here: slow beats an error the
-        # same call did not raise before.
+        # Finish in one process when the host cannot re-import the worker.
         import pymupdf
 
         print(
             "pdf-goat: worker pool unavailable; finishing in one process",
             file=sys.stderr,
         )
-        run = _PAGE_TASKS[task]
+        results = []
+        entries = {}
         with pymupdf.open(src) as doc:
-            return [run(doc, index, arg) for index in indices]
+            for index in indices:
+                value, cache_value = _extract_page(
+                    task, doc, index, arg, cache_context is not None
+                )
+                results.append(value)
+                if cache_value is not None:
+                    entries[index] = cache_value
+        if entries and cache_context is not None:
+            from .textcache import Cache
+
+            cache = Cache(cache_context["path"])
+            cache.write(
+                cache_context["key"],
+                Path(cache_context["source"]),
+                cache_context["page_count"],
+                cache_context["form"],
+                entries,
+            )
+            cache.close()
+        return results
+
+
+def _live_page_values(src, task, arg, page_spec=None):
+    import pymupdf
+
+    with pymupdf.open(src) as doc:
+        page_count = doc.page_count
+        selected = (
+            parse_pages(page_spec, page_count) if page_spec else list(range(page_count))
+        )
+        return page_count, map_pages(doc, src, task, selected, arg)
+
+
+def _cache_value(form, value, arg):
+    if form == "words":
+        return _search_columns(_cached_word_columns(value), arg)
+    return value
+
+
+def _cache_page_values(src, task, arg, form, no_cache, page_spec=None):
+    if no_cache:
+        return _live_page_values(src, task, arg, page_spec)
+
+    from . import textcache
+
+    key = textcache.document_key(src)
+    cache = textcache.Cache(HOME / "cache.sqlite")
+    if key is None or not cache.enabled:
+        cache.close()
+        return _live_page_values(src, task, arg, page_spec)
+
+    try:
+        info = cache.document(key)
+        if info is not None:
+            cached_page_count = info[1]
+            selected = (
+                parse_pages(page_spec, cached_page_count)
+                if page_spec
+                else list(range(cached_page_count))
+            )
+            cached = cache.lookup(key, form, selected)
+            values = {
+                index: _cache_value(form, value, arg) for index, value in cached.items()
+            }
+            missing = [
+                index for index in dict.fromkeys(selected) if index not in values
+            ]
+            if not missing:
+                return cached_page_count, [values[index] for index in selected]
+        else:
+            selected = None
+            values = {}
+            missing = []
+
+        import pymupdf
+
+        with pymupdf.open(src) as doc:
+            page_count = doc.page_count
+            if info is not None and page_count != cached_page_count:
+                cache.discard_document(key)
+                info = None
+                selected = None
+                values = {}
+            selected = (
+                parse_pages(page_spec, page_count)
+                if page_spec
+                else selected
+                if selected is not None
+                else list(range(page_count))
+            )
+            if info is None:
+                missing = list(dict.fromkeys(selected))
+            context = {
+                "path": str(cache.path),
+                "source": str(src),
+                "key": key,
+                "page_count": page_count,
+                "form": form,
+            }
+            extracted = map_pages(
+                doc,
+                src,
+                task,
+                missing,
+                arg,
+                cache=cache,
+                cache_context=context,
+            )
+            values.update(zip(missing, extracted))
+        return page_count, [values[index] for index in selected]
+    finally:
+        cache.close()
 
 
 def cmd_inspect(a):
@@ -1334,50 +1532,45 @@ def cmd_compress(a):
 
 
 def cmd_text(a):
-    import pymupdf
-
     src = resolve(a.file)
     out = ensure_parent(a.output) if a.output else None
-    doc = pymupdf.open(src)
     result = {
         "verb": "text",
         "inputs": [str(src)],
         "outputs": [out] if out else [],
     }
-    indices = list(range(doc.page_count))
-    if out and not a.layout:
-        texts = map_pages(doc, src, "text", indices, "text")
-        doc.close()
+    if a.layout:
+        import pymupdf
+
+        with pymupdf.open(src) as doc:
+            indices = list(range(doc.page_count))
+            layouts = map_pages(doc, src, "layout", indices)
+        pages = [
+            {"page": index + 1, **layout} for index, layout in zip(indices, layouts)
+        ]
+        full = "\n".join(page["text"] for page in pages)
+        result["char_count"] = len(full)
+        result["pages"] = pages
+        result["mode"] = "layout"
+        if out:
+            Path(out).write_text(full)
+        return result
+
+    page_count, texts = _cache_page_values(src, "text", "text", "text", a.no_cache)
+    if out:
         # The file is the output, so write page by page instead of joining
         # the whole corpus into a second copy.
         with Path(out).open("w") as handle:
             handle.writelines(
                 text if index == 0 else "\n" + text for index, text in enumerate(texts)
             )
-        # Same number as len("\n".join(texts)) in the joined branch below.
         result["char_count"] = sum(map(len, texts)) + max(len(texts) - 1, 0)
-        result["page_count"] = len(texts)
+        result["page_count"] = page_count
         return result
-    if a.layout:
-        pages = [
-            {"page": index + 1, **layout}
-            for index, layout in zip(indices, map_pages(doc, src, "layout", indices))
-        ]
-    else:
-        pages = [
-            {"page": index + 1, "text": text}
-            for index, text in zip(
-                indices, map_pages(doc, src, "text", indices, "text")
-            )
-        ]
+    pages = [{"page": index + 1, "text": text} for index, text in enumerate(texts)]
     full = "\n".join(page["text"] for page in pages)
-    doc.close()
     result["char_count"] = len(full)
     result["pages"] = pages
-    if a.layout:
-        result["mode"] = "layout"
-    if out:  # layout mode only; plain text with -o returned above
-        Path(out).write_text(full)
     return result
 
 
@@ -3344,18 +3537,14 @@ def cmd_pages_flatten(a):
 def cmd_compare_text(a):
     import difflib
 
-    import pymupdf
-
     left, right = resolve(a.file), resolve(a.other)
-    da, db = pymupdf.open(left), pymupdf.open(right)
-    ta = "\n".join(
-        map_pages(da, left, "text", list(range(da.page_count)), "text")
-    ).splitlines()
-    tb = "\n".join(
-        map_pages(db, right, "text", list(range(db.page_count)), "text")
-    ).splitlines()
-    da.close()
-    db.close()
+    _, left_text = _cache_page_values(left, "text", "text", "text", a.no_cache)
+    if left == right:
+        right_text = left_text
+    else:
+        _, right_text = _cache_page_values(right, "text", "text", "text", a.no_cache)
+    ta = "\n".join(left_text).splitlines()
+    tb = "\n".join(right_text).splitlines()
     diff = list(difflib.unified_diff(ta, tb, lineterm="", n=1))
     added = sum(1 for d in diff if d.startswith("+") and not d.startswith("+++"))
     removed = sum(1 for d in diff if d.startswith("-") and not d.startswith("---"))
@@ -3477,34 +3666,126 @@ def cmd_detach(a):
     }
 
 
-def cmd_search(a):
+def _search_live_limited(src, page_spec, query, limit):
     import pymupdf
 
-    src = resolve(a.file)
-    limit = a.limit
-    if limit is not None and limit < 1:
-        raise PdfGoatError("--limit must be 1 or more")
     hits = []
     truncated = False
     with pymupdf.open(src) as doc:
         indices = list(
-            parse_pages(a.pages, doc.page_count) if a.pages else range(doc.page_count)
+            parse_pages(page_spec, doc.page_count)
+            if page_spec
+            else range(doc.page_count)
         )
-        if not limit:
-            for index, rects in zip(
-                indices, map_pages(doc, src, "search", indices, a.query)
-            ):
-                hits += [{"page": index + 1, "rect": rect} for rect in rects]
+        for position, index in enumerate(indices):
+            rects, _ = _task_search(doc, index, query)
+            hits.extend({"page": index + 1, "rect": rect} for rect in rects)
+            if len(hits) >= limit:
+                truncated = len(hits) > limit or position + 1 < len(indices)
+                del hits[limit:]
+                break
+    return hits, truncated
+
+
+def cmd_search(a):
+    src = resolve(a.file)
+    limit = a.limit
+    if limit is not None and limit < 1:
+        raise PdfGoatError("--limit must be 1 or more")
+
+    if limit is None:
+        page_count, rect_pages = _cache_page_values(
+            src, "search", a.query, "words", a.no_cache, a.pages
+        )
+        indices = list(
+            parse_pages(a.pages, page_count) if a.pages else range(page_count)
+        )
+        hits = [
+            {"page": index + 1, "rect": rect}
+            for index, rects in zip(indices, rect_pages)
+            for rect in rects
+        ]
+        truncated = False
+    elif a.no_cache:
+        hits, truncated = _search_live_limited(src, a.pages, a.query, limit)
+    else:
+        from . import textcache
+
+        key = textcache.document_key(src)
+        cache = textcache.Cache(HOME / "cache.sqlite")
+        if key is None or not cache.enabled:
+            cache.close()
+            hits, truncated = _search_live_limited(src, a.pages, a.query, limit)
         else:
-            for position, index in enumerate(indices):
-                hits += [
-                    {"page": index + 1, "rect": rect}
-                    for rect in _task_search(doc, index, a.query)
-                ]
-                if len(hits) >= limit:
-                    truncated = len(hits) > limit or position + 1 < len(indices)
-                    del hits[limit:]
+            doc = None
+            pending = {}
+
+            def flush_pending():
+                if pending:
+                    cache.write(key, src, page_count, "words", pending)
+                    pending.clear()
+
+            try:
+                info = cache.document(key)
+                if info is None:
+                    import pymupdf
+
+                    doc = pymupdf.open(src)
+                    page_count = doc.page_count
+                else:
+                    page_count = info[1]
+                while True:
+                    indices = list(
+                        parse_pages(a.pages, page_count)
+                        if a.pages
+                        else range(page_count)
+                    )
+                    hits = []
+                    truncated = False
+                    restart = False
+                    for offset in range(0, len(indices), _CACHE_PAGE_BATCH):
+                        batch = indices[offset : offset + _CACHE_PAGE_BATCH]
+                        cached = cache.lookup(key, "words", batch)
+                        for position, index in enumerate(batch, start=offset):
+                            if index in cached:
+                                rects = _cache_value("words", cached[index], a.query)
+                            else:
+                                if doc is None:
+                                    import pymupdf
+
+                                    doc = pymupdf.open(src)
+                                    actual_page_count = doc.page_count
+                                    if actual_page_count != page_count:
+                                        cache.discard_document(key)
+                                        page_count = actual_page_count
+                                        pending.clear()
+                                        restart = True
+                                        break
+                                rects, words = _task_search(doc, index, a.query)
+                                pending[index] = (words[0], words[2], words[3])
+                                if len(pending) >= _CACHE_PAGE_BATCH:
+                                    flush_pending()
+                            if rects:
+                                hits.extend(
+                                    {"page": index + 1, "rect": rect} for rect in rects
+                                )
+                                if len(hits) >= limit:
+                                    truncated = len(hits) > limit or position + 1 < len(
+                                        indices
+                                    )
+                                    del hits[limit:]
+                                    break
+                        if restart or len(hits) >= limit:
+                            break
+                    if restart:
+                        continue
                     break
+            finally:
+                flush_pending()
+                if doc is not None:
+                    doc.close()
+                cache.close()
+
     return {
         "verb": "search",
         "inputs": [str(src)],
@@ -3534,28 +3815,20 @@ def cmd_overlay(a):
 
 
 def cmd_count(a):
-    import pymupdf
-
     src = resolve(a.file)
-    doc = pymupdf.open(src)
-    indices = list(range(doc.page_count))
-    counted = map_pages(doc, src, "count", indices)
+    page_count, counted = _cache_page_values(src, "count", None, "count", a.no_cache)
     chars = sum(page_chars for page_chars, _ in counted)
     words = sum(page_words for _, page_words in counted)
-    pages = doc.page_count
-    doc.close()
     return {
         "verb": "count",
         "inputs": [str(src)],
         "outputs": [],
-        "pages": pages,
+        "pages": page_count,
         "words": words,
         "chars": chars,
     }
 
 
-# --------------------------------------------------------------------------- #
-# Human formatting
 # --------------------------------------------------------------------------- #
 def render_human(result):
     verb = result.get("verb", "")
@@ -4068,6 +4341,7 @@ def _add_compare(sub):
     p = ns.add_parser("text", help="compare extracted text")
     p.add_argument("file")
     p.add_argument("other")
+    p.add_argument("--no-cache", action="store_true", help="skip the text cache")
     p.set_defaults(func=cmd_compare_text)
     p = ns.add_parser("visual", help="write one visual-difference PNG per page")
     p.add_argument("file")
@@ -4106,6 +4380,7 @@ def _add_misc(sub):
     )
     p.add_argument("--limit", type=int, help="stop after this many hits")
     p.add_argument("--pages", help="default: all pages")
+    p.add_argument("--no-cache", action="store_true", help="skip the text cache")
     p.set_defaults(func=cmd_search)
     p = sub.add_parser("overlay", help="stamp one PDF over another")
     p.add_argument("file")
@@ -4114,6 +4389,7 @@ def _add_misc(sub):
     p.set_defaults(func=cmd_overlay)
     p = sub.add_parser("count", help="count pages, words, and characters")
     p.add_argument("file")
+    p.add_argument("--no-cache", action="store_true", help="skip the text cache")
     p.set_defaults(func=cmd_count)
 
 
@@ -4304,6 +4580,7 @@ def build_parser():
     s.add_argument(
         "--layout", action="store_true", help="preserve positioned columns and lines"
     )
+    s.add_argument("--no-cache", action="store_true", help="skip the text cache")
     s.set_defaults(func=cmd_text)
 
     s = sub.add_parser("from-html", help="render an HTML file to PDF (weasyprint)")

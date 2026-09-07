@@ -49,6 +49,30 @@ text-heavy file with eight workers, a `text` run peaked near 450 MB across all
 processes for a second or two, and a 200 DPI `render` near 800 MB.
 `PDF_GOAT_WORKERS=1` keeps every verb in one process.
 
+The CLI stores a derived text cache at `PDF_GOAT_HOME/cache.sqlite`. The
+`PDF_GOAT_CACHE_MB` setting limits cached row payloads to 256 MiB by default.
+SQLite bookkeeping can make the file larger, and any budget under one byte,
+including zero and negative numbers, turns the cache off. A value the CLI
+cannot turn into a byte count, `inf` among them, uses the default.
+`--no-cache` bypasses the cache, and the file can be deleted at any time.
+
+Cache identity uses the file size, nanosecond modification time, and a
+digest of the first and last MiB. Use `--no-cache` after a tool preserves
+all three while changing bytes in between. A warm answer also trusts the
+page count the cache recorded. A count the stored pages contradict, or one
+too large for the file to hold, is dropped and the document is read again; a
+damaged count that stays consistent with the pages stored beside it cannot
+be detected from the store alone, so `text`, `count`, and `search` answer
+from the cached pages whenever every page they select is already stored. A
+verb that has to read a page the cache lacks sees the real count, drops the
+row, and answers over the whole file. A confined answer is short rather than
+wrong, and a `search --pages` request above the damaged count fails with an
+explicit range error instead of a partial result. `--no-cache` reads the
+file instead, and deleting the cache file has the same effect. A cache file
+another process holds locked costs a verb about two seconds before
+extraction runs live; a damaged or unreadable file costs about as much as an
+uncached run.
+
 For agents, the CLI writes JSON when its output is piped, and `--agent` forces
 JSON on a TTY. Start with `pdf-goat --agent capabilities` for the family list,
 then ask one family for its argument schema.

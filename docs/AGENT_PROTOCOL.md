@@ -76,7 +76,21 @@ A capability record reports:
 
 Every standalone verb returns one JSON object per run. Five of them bound or reshape that object.
 
+On unchanged files, `text`, `count`, `search`, and `compare text` read and fill a
+disposable per-page cache. `text --layout` always runs live. `--no-cache` bypasses
+both reads and writes.
+`redact` never reads or writes the text cache; its hit finding always runs live.
+
 `search` returns every hit on every page by default. `--first` stops at the first hit, `--limit N` stops after N hits, and `--pages RANGE` restricts the scan to a page range. `--first` is `--limit 1`; when both are given the last one wins. The result carries `truncated`, which is true only when a limit stopped the scan before the selected pages ran out. A caller that needs the full count runs the same query without a limit. Search and `redact --find` share one matcher: case-insensitive over the page's words, with ligature glyphs read as their letters, so `final` finds `ﬁnal`. Search escapes each whitespace-separated query token and joins them with whitespace, so a literal phrase can cross a line or block break. Each hit is the box of the words the match touches on one line, not the matched glyphs: a phrase that wraps gives one hit per line, and a word the pattern matches twice gives one hit.
+
+A search reads the page count from the text cache, so a damaged count shortens
+the hit list, and a limit moves `truncated` in either direction. A count above
+the real one reports `truncated` true where a full read reports false. A count
+below it, left consistent with the pages a `--pages` run primed, reports
+`truncated` false on a limited search a full read would call incomplete, and
+an unlimited search over the same store also reports false with a short hit
+list. Hits and their page numbers come from real pages either way.
+`--no-cache` reads the file.
 
 `preflight` reports a page in its `empty_pages` finding when the page declares no font and no image. It does not extract page text, so a page that declares a font but draws no glyphs is not reported empty, and neither is a blank page whose font resources are inherited from the page tree.
 

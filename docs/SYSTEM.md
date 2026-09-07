@@ -177,6 +177,16 @@ A finding is not silently rewritten when the PDF changes. It becomes `stale` if 
 
 Each document index stores extracted text, OCR text, block geometry, thumbnails, and full-text search data keyed by document revision. Deleting an index must not delete a note, receipt, annotation, or PDF change.
 
+The CLI's disposable per-page text cache is `~/.pdf-goat/cache.sqlite`.
+Deleting it is safe. The cache owns the identity of what it stores: file size,
+nanosecond modification time, a digest of the first and last MiB, and a page
+count it refuses when the stored pages or the file size contradict it. It
+cannot own the part of that identity the file alone can settle, so a damaged
+count consistent with the stored pages changes the page range a verb answers
+over while every page it needs is cached, and a limited search can then report
+`truncated` in either direction. A verb that must read a missing page sees the
+real count and drops the row. `--no-cache` is the escape.
+
 Automatic accumulation stops at derived data and operation receipts. Durable
 findings require an explicit `remember` action. This keeps derived caches
 separate from durable findings.
