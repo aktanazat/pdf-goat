@@ -100,6 +100,8 @@ list. Hits and their page numbers come from real pages either way.
 
 `split`, `extract`, `compress`, and `convert from-office` write through a sibling `.part` file and rename it over the destination. A failed run leaves neither file. An existing read-only destination is replaced, because the rename needs write access to the directory, not the file.
 
+`reorder --order` accepts a full permutation or a partial, ordered subset of a document's pages. Named pages come first, in the requested order; every page the caller does not name follows once, in its original relative order. A full permutation keeps its existing result: the output page order is exactly `--order`. `--order` may not name a page outside the range 1 to the document's page count, may not name the same page twice, and must name at least one page: an empty list is an error rather than a copy of the input. The empty list is an error in `reorder` alone. `delete --pages ""` writes a resaved file with every page kept, and `extract --pages ""` writes a page-less file that most readers refuse. A repeated page also means something different in those two verbs, and neither rejects it: `delete --pages 2,2` drops page 2 once, and `extract --pages 1,1` writes page 1 twice. A page list part whose number cannot be read, such as `x` or `2-`, fails with that part quoted.
+
 ## Request envelope
 
 Every live document request has this outer shape:

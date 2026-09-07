@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -646,6 +647,114 @@ class AgentToolTests(unittest.TestCase):
             pooled_images,
             [Path(p).read_bytes() for p in sequential["render"]["outputs"]],
         )
+
+    def test_delete_removes_named_pages_and_preserves_order_and_source(
+        self,
+    ) -> None:
+        source = self.write_cache_document(
+            "delete-source.pdf",
+            ["page one", "page two", "page three", "page four"],
+        )
+        original = source.read_bytes()
+        output = self.tempdir / "deleted.pdf"
+        receipt = self.run_agent(
+            "delete", str(source), "--pages", "2", "-o", str(output)
+        )
+        self.assertEqual(
+            (receipt["deleted_pages"], receipt["remaining_pages"]), ([2], 3)
+        )
+        with pymupdf.open(output) as document:
+            texts = [page.get_text().strip() for page in document]
+        self.assertEqual(texts, ["page one", "page three", "page four"])
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_reorder_partial_order_moves_named_pages_first(self) -> None:
+        source = self.write_cache_document(
+            "reorder-partial.pdf",
+            ["page one", "page two", "page three", "page four"],
+        )
+        original = source.read_bytes()
+        output = self.tempdir / "reordered-partial.pdf"
+        receipt = self.run_agent(
+            "reorder", str(source), "--order", "3,1", "-o", str(output)
+        )
+        self.assertEqual(receipt["order"], [3, 1, 2, 4])
+        with pymupdf.open(output) as document:
+            texts = [page.get_text().strip() for page in document]
+        self.assertEqual(texts, ["page three", "page one", "page two", "page four"])
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_reorder_rejects_a_repeated_page(self) -> None:
+        source = self.write_cache_document("reorder-dup.pdf", ["page one", "page two"])
+        error = self.run_agent_error("reorder", str(source), "--order", "1,1")
+        self.assertEqual(error["error"], "--order must not name the same page twice")
+
+    def test_reorder_rejects_an_order_that_names_no_page(self) -> None:
+        source = self.write_cache_document("reorder-empty.pdf", ["page one"])
+        for spec in ("", " ", ","):
+            with self.subTest(order=spec):
+                output = self.tempdir / f"empty-{spec!r}.pdf"
+                error = self.run_agent_error(
+                    "reorder", str(source), "--order", spec, "-o", str(output)
+                )
+                self.assertEqual(
+                    (error["error"], output.exists()),
+                    ("--order must name at least one page", False),
+                )
+
+    def test_page_list_rejects_a_part_that_is_not_a_number_or_a_range(self) -> None:
+        source = self.write_cache_document("page-part.pdf", ["page one", "page two"])
+        for verb, flag, spec in (
+            ("reorder", "--order", "2-"),
+            ("delete", "--pages", "x"),
+            ("extract", "--pages", "-2"),
+            ("reorder", "--order", "1-2-3"),
+        ):
+            with self.subTest(verb=verb, spec=spec):
+                error = self.run_agent_error(verb, str(source), flag, spec)
+                self.assertEqual(
+                    error["error"], f"{spec!r} is not a page number or range"
+                )
+
+    def test_compare_text_reports_diff_between_distinct_documents(self) -> None:
+        left = self.write_cache_document(
+            "compare-left.pdf", ["shared line", "left only"]
+        )
+        right = self.write_cache_document(
+            "compare-right.pdf", ["shared line", "right only"]
+        )
+        result = self.run_agent("compare", "text", str(left), str(right))
+        self.assertEqual(
+            (result["identical"], result["added"], result["removed"]),
+            (False, 1, 1),
+        )
+        added_lines = {
+            line[1:]
+            for line in result["diff"]
+            if line.startswith("+") and not line.startswith("+++")
+        }
+        removed_lines = {
+            line[1:]
+            for line in result["diff"]
+            if line.startswith("-") and not line.startswith("---")
+        }
+        self.assertEqual((added_lines, removed_lines), ({"right only"}, {"left only"}))
+
+    def test_save_pdf_writes_output_that_qpdf_accepts(self) -> None:
+        qpdf = shutil.which("qpdf")
+        if not qpdf:
+            self.skipTest("qpdf not on PATH")
+        output = self.tempdir / "save-pdf-check.pdf"
+        with pymupdf.open(self.source) as document:
+            cli._save_pdf(document, str(output))
+        self.assertTrue(output.exists())
+        proc = subprocess.run(
+            [qpdf, "--check", str(output)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     @staticmethod
     def set_pool_tuning(after_seconds: float, min_pages: int) -> None:
