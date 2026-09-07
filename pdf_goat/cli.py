@@ -398,8 +398,84 @@ def _task_count(doc, index, _arg):
     return len(text), len(words)
 
 
+def _page_hits(page, pattern):
+    """Rectangles of every ``pattern`` match on one page, one per line segment.
+
+    The page's words are joined with newlines. With the default flags, ``^`` and
+    ``$`` bind to one word, ``.`` never crosses a word, and ``\\s+`` crosses the
+    join, also across lines and blocks. Ligature glyphs read as their letters,
+    so ``final`` finds ``ﬁnal``. An empty match selects the word at its position,
+    and a word is reported once however often the pattern matches inside it.
+    """
+    from bisect import bisect_left, bisect_right
+    from itertools import groupby
+
+    import pymupdf
+
+    words = page.get_text(
+        "words", flags=pymupdf.TEXTFLAGS_WORDS & ~pymupdf.TEXT_PRESERVE_LIGATURES
+    )
+    starts = []
+    position = 0
+    for word in words:
+        starts.append(position)
+        position += len(word[4]) + 1
+    text = "\n".join(word[4] for word in words)
+    hits = []
+    previous = None
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        first = bisect_right(starts, start) - 1
+        if start == end:
+            last = first + 1
+        else:
+            if start == starts[first] + len(words[first][4]):
+                first += 1  # the match begins on the join, not in a word
+            last = bisect_left(starts, end)
+        if (first, last) == previous:
+            continue  # a second match inside the same words, or an empty match one position on
+        previous = (first, last)
+        for _, line in groupby(words[first:last], key=lambda word: word[5:7]):
+            line = list(line)
+            hits.append(
+                (
+                    min(word[0] for word in line),
+                    min(word[1] for word in line),
+                    max(word[2] for word in line),
+                    max(word[3] for word in line),
+                )
+            )
+    return hits
+
+
+# MuPDF expands these glyphs into letters when it extracts words, so a query or
+# pattern typed with one must fold the same way to match.
+_LIGATURES = str.maketrans(
+    {
+        "\ufb00": "ff",
+        "\ufb01": "fi",
+        "\ufb02": "fl",
+        "\ufb03": "ffi",
+        "\ufb04": "ffl",
+        "\ufb05": "st",
+        "\ufb06": "st",
+    }
+)
+
+
+def _hit_pattern(source):
+    """Compile ``source`` for ``_page_hits``: case-insensitive, one word per line."""
+    return re.compile(source.translate(_LIGATURES), re.IGNORECASE | re.MULTILINE)
+
+
 def _task_search(doc, index, query):
-    return [[round(v, 1) for v in rect] for rect in doc[index].search_for(query)]
+    tokens = query.split()
+    if not tokens:
+        return []
+    pattern = _hit_pattern(r"\s+".join(re.escape(token) for token in tokens))
+    return [
+        [round(value, 1) for value in rect] for rect in _page_hits(doc[index], pattern)
+    ]
 
 
 def _task_layout(doc, index, _arg):
@@ -415,12 +491,7 @@ def _task_preflight(doc, index, _arg):
 
 
 def _task_redact_hits(doc, index, pattern):
-    search = re.compile(pattern).search
-    return [
-        (x0, y0, x1, y1)
-        for x0, y0, x1, y1, word, *_ in doc[index].get_text("words")
-        if search(word)
-    ]
+    return _page_hits(doc[index], _hit_pattern(pattern))
 
 
 def _task_render(doc, index, arg):
@@ -1145,7 +1216,7 @@ def cmd_redact(a):
 
     src = resolve(a.file)
     out = ensure_parent(a.output or default_out(src, "redacted"))
-    re.compile(a.find)  # reject a bad pattern before opening the document
+    _hit_pattern(a.find)  # reject a bad pattern before opening the document
     doc = pymupdf.open(src)
     hits = 0
     indices = list(range(doc.page_count))
@@ -4197,7 +4268,11 @@ def build_parser():
 
     s = sub.add_parser("redact", help="redact words matching a regular expression")
     s.add_argument("file")
-    s.add_argument("--find", required=True, help="regex matched per word")
+    s.add_argument(
+        "--find",
+        required=True,
+        help="case-insensitive regex over the page's words; the same matcher as search",
+    )
     s.add_argument("-o", "--output")
     s.set_defaults(func=cmd_redact)
 
