@@ -97,16 +97,26 @@ struct PDFGoatDocumentTests {
         #expect(pdfView.bounds.contains(NSPoint(x: firstPageBounds.midX, y: firstPageBounds.maxY)))
     }
 
-    @Test("Next page moves the visible page forward")
-    func nextPageMovesForward() throws {
-        let (controller, document) = shownController(pages: [PDFPage(), PDFPage()])
+    @Test("Page navigation moves forward, backward, and chains repeated next commands")
+    func pageNavigationMovesAndChains() throws {
+        let (controller, document) = shownController(pages: [PDFPage(), PDFPage(), PDFPage()])
         defer { controller.close() }
         let pdfView = try #require(displayedPDFView(of: controller))
         try #require(waitFor([0]) { visiblePageIndexes(of: pdfView, in: document) } == [0])
+        let currentPageIndex: () -> Int = {
+            guard let page = pdfView.currentPage else { return -1 }
+            return document.index(for: page)
+        }
 
         controller.nextPage(nil)
+        #expect(waitFor(1, until: currentPageIndex) == 1)
 
-        #expect(waitFor([1]) { visiblePageIndexes(of: pdfView, in: document) } == [1])
+        controller.previousPage(nil)
+        #expect(waitFor(0, until: currentPageIndex) == 0)
+
+        controller.nextPage(nil)
+        controller.nextPage(nil)
+        #expect(waitFor(2, until: currentPageIndex) == 2)
     }
 
     @Test("Live scrolling uses low interpolation and restores high after it ends")

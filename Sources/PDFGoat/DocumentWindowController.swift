@@ -16,7 +16,6 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
     private let splitViewController = NSSplitViewController()
     private var thumbnailView: PDFThumbnailView?
     private var pageStatus: NSTextField?
-    private var pageTargetIndex: Int?
     private var zoomTarget: CGFloat?
     private var firstVisibleInterval: OSSignpostIntervalState?
 
@@ -87,35 +86,12 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         guard let document = pdfView.document, let currentPage = pdfView.currentPage else {
             return
         }
-        let current = pageTargetIndex ?? document.index(for: currentPage)
+        let current = document.index(for: currentPage)
         let target = min(max(current + offset, 0), document.pageCount - 1)
         guard target != current, let page = document.page(at: target) else {
             return
         }
-
-        pageTargetIndex = target
-        guard
-            let documentView = pdfView.documentView,
-            let scrollView = documentView.enclosingScrollView
-        else {
-            pdfView.go(to: page)
-            pageTargetIndex = nil
-            return
-        }
-
-        let pageBounds = pdfView.convert(page.bounds(for: .cropBox), from: page)
-        let pageFrame = documentView.convert(pageBounds, from: pdfView)
-        var destination = scrollView.contentView.bounds
-        destination.origin.y = pageFrame.maxY - destination.height + pdfView.pageBreakMargins.top
-        let destinationOrigin = scrollView.contentView.constrainBoundsRect(destination).origin
-        performSmoothly {
-            scrollView.contentView.animator().setBoundsOrigin(destinationOrigin)
-        } completion: { [weak self] in
-            guard let self, pageTargetIndex == target else {
-                return
-            }
-            pageTargetIndex = nil
-        }
+        pdfView.go(to: page)
     }
 
     @objc func zoomInPage(_: NSObject?) {
@@ -152,7 +128,7 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         }
     }
 
-    private func performSmoothly(_ changes: () -> Void, completion: (() -> Void)? = nil) {
+    private func performSmoothly(_ changes: () -> Void, completion: @escaping () -> Void) {
         NSAnimationContext.runAnimationGroup { context in
             context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
                 ? 0
