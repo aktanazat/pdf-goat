@@ -33,11 +33,24 @@ def cases(pdf: Path, small: Path, scratch: Path) -> list[tuple[str, list[str]]]:
         ("inspect", ["inspect", str(pdf)]),
         ("preflight", ["preflight", str(pdf)]),
         ("count", ["count", str(pdf)]),
+        ("count-warm", ["count", str(pdf)]),
         ("text-file", ["text", str(pdf), "-o", str(scratch / f"{pdf.stem}.txt")]),
+        ("text-file-warm", ["text", str(pdf), "-o", str(scratch / f"{pdf.stem}.txt")]),
         ("text-json", ["text", str(pdf)]),
+        ("text-json-warm", ["text", str(pdf)]),
         ("text-layout", ["text", str(pdf), "--layout"]),
         ("search-first", ["search", str(pdf), "the", "--first"]),
+        ("search-first-warm", ["search", str(pdf), "the", "--first"]),
+        (
+            "search-nohit-first",
+            ["search", str(pdf), "pdf-goat-cache-miss-7Qx", "--first"],
+        ),
+        (
+            "search-nohit-first-warm",
+            ["search", str(pdf), "pdf-goat-cache-miss-7Qx", "--first"],
+        ),
         ("search-all", ["search", str(pdf), "the"]),
+        ("search-all-warm", ["search", str(pdf), "the"]),
         ("text-blocks", ["get", "text-blocks", str(pdf)]),
         ("links", ["get", "links", str(pdf)]),
         ("fonts", ["get", "fonts", str(pdf)]),
@@ -46,6 +59,7 @@ def cases(pdf: Path, small: Path, scratch: Path) -> list[tuple[str, list[str]]]:
         ("meta-get", ["meta", "get", str(pdf)]),
         ("access-check", ["accessibility", "check", str(pdf)]),
         ("compare-text", ["compare", "text", str(pdf), str(pdf)]),
+        ("compare-text-warm", ["compare", "text", str(pdf), str(pdf)]),
         (
             "compare-visual-10p",
             ["compare", "visual", str(small), str(small), "-o", str(scratch / "diff")],
@@ -118,13 +132,19 @@ def run_trial(
     return stats
 
 
+def _clear_cache(home: Path) -> None:
+    for path in home.glob("cache.sqlite*"):
+        path.unlink(missing_ok=True)
+
+
 def bench(
     files: list[Path], trials: int, timeout: float, only: set[str] | None
 ) -> dict:
     results = []
     with tempfile.TemporaryDirectory(dir="/private/var/tmp") as tmp:
         scratch = Path(tmp)
-        env = {**os.environ, "PDF_GOAT_HOME": str(scratch / "home")}
+        home = scratch / "home"
+        env = {**os.environ, "PDF_GOAT_HOME": str(home)}
         for pdf in files:
             small = scratch / f"{pdf.stem}.small.pdf"
             subprocess.run(
@@ -136,15 +156,31 @@ def bench(
             for name, argv in cases(pdf, small, scratch):
                 if only and name not in only:
                     continue
-                samples = []
-                for _ in range(trials):
-                    for stale in ("diff", "render"):
-                        shutil.rmtree(scratch / stale, ignore_errors=True)
+                warm = name.endswith("-warm")
+                prime_failure = None
+                if warm:
+                    _clear_cache(home)
                     try:
-                        samples.append(run_trial(argv, env, timeout))
+                        prime = run_trial(argv, env, timeout)
                     except subprocess.TimeoutExpired:
-                        samples.append({"exit": -1, "timeout": True})
-                        break
+                        prime = {"exit": -1, "timeout": True}
+                    if prime.get("exit") != 0:
+                        prime_failure = prime
+                        _clear_cache(home)
+                samples = []
+                if prime_failure is not None:
+                    samples.append(prime_failure)
+                else:
+                    for _ in range(trials):
+                        if not warm:
+                            _clear_cache(home)
+                        for stale in ("diff", "render"):
+                            shutil.rmtree(scratch / stale, ignore_errors=True)
+                        try:
+                            samples.append(run_trial(argv, env, timeout))
+                        except subprocess.TimeoutExpired:
+                            samples.append({"exit": -1, "timeout": True})
+                            break
                 ok = [s for s in samples if s.get("exit") == 0]
                 row = {
                     "document": pdf.stem,
@@ -173,15 +209,17 @@ def bench(
 
 
 def compare(before: dict, after: dict) -> None:
-    index = {(r["document"], r["case"]): r for r in before["results"]}
+    before_index = {(r["document"], r["case"]): r for r in before["results"]}
+    after_index = {(r["document"], r["case"]): r for r in after["results"]}
     print(
         "| document | case | before ms | after ms | speedup | before MiB | after MiB |"
     )
     print("| --- | --- | --- | --- | --- | --- | --- |")
     ratios = []
-    for row in after["results"]:
-        old = index.get((row["document"], row["case"]))
-        if not old or "wall_ms" not in old or "wall_ms" not in row:
+    for key in sorted(before_index.keys() | after_index.keys()):
+        old = before_index.get(key)
+        row = after_index.get(key)
+        if not old or not row or "wall_ms" not in old or "wall_ms" not in row:
             continue
         ratio = old["wall_ms"] / row["wall_ms"]
         ratios.append(ratio)
