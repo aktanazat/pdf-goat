@@ -19,11 +19,12 @@ ln -sf ~/Documents/projects/pdf-goat/pdf-goat ~/.local/bin/pdf-goat
 pdf-goat --help
 ```
 
-The launcher resolves its own location, so the clone can live anywhere. First
-run installs the Python dependencies through uv. On Linux, use the apt or dnf
-equivalents of the brew line. Three more tools cover four verbs: `from-html`
-and `from-md` need `weasyprint`, `convert` to Office formats needs
-`office2pdf-cli`, and `convert audio` needs the macOS `say` binary.
+The launcher resolves its own location with `readlink -f` (macOS 12.3 or later,
+any Linux), so the clone can live anywhere. First run installs the Python
+dependencies through uv. On Linux, use the apt or dnf equivalents of the brew
+line. Three more tools cover four verbs: `from-html` and `from-md` need
+`weasyprint`, `convert` to Office formats needs `office2pdf-cli`, and `convert
+audio` needs the macOS `say` binary.
 
 ## Use
 
