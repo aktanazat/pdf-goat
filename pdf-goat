@@ -1,25 +1,20 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Launcher for pdf-goat. Runs the CLI inside its uv-managed environment,
 # syncing dependencies on first use.
-set -euo pipefail
-# Self-locating: resolve the symlink in ~/.local/bin back to this launcher so the
-# project works no matter where it's cloned (no hardcoded home path).
-SOURCE="${BASH_SOURCE[0]}"
-while [ -h "$SOURCE" ]; do
-  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-  SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
-done
-PROJECT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-VENV="$PROJECT_DIR/.venv"
-STAMP="$VENV/.synced"
+set -eu
+# Self-locating: resolve the symlink in ~/.local/bin back to this launcher with
+# one readlink call so the project works no matter where it's cloned.
+self="$(readlink -f -- "$0")"
+dir="${self%/*}"
+venv="$dir/.venv"
+stamp="$venv/.synced"
 # uv's environment check costs ~14 ms of a ~50 ms floor, so run it only when
 # the manifest changed since the last sync or the environment is missing.
-if [ ! -x "$VENV/bin/pdf-goat-cli" ] || [ ! -e "$STAMP" ] \
-  || [ "$PROJECT_DIR/uv.lock" -nt "$STAMP" ] \
-  || [ "$PROJECT_DIR/pyproject.toml" -nt "$STAMP" ]; then
-  uv sync --project "$PROJECT_DIR" --quiet
-  touch "$STAMP"
+if [ ! -x "$venv/bin/pdf-goat-cli" ] || [ ! -e "$stamp" ] \
+  || [ "$dir/uv.lock" -nt "$stamp" ] \
+  || [ "$dir/pyproject.toml" -nt "$stamp" ]; then
+  uv sync --project "$dir" --quiet
+  touch "$stamp"
 fi
-export VIRTUAL_ENV="$VENV" PATH="$VENV/bin:$PATH"
-exec "$VENV/bin/pdf-goat-cli" "$@"
+export VIRTUAL_ENV="$venv" PATH="$venv/bin:$PATH"
+exec "$venv/bin/pdf-goat-cli" "$@"
