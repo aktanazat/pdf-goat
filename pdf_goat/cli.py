@@ -144,6 +144,13 @@ def _save_pdf(doc, out, **options):
     doc.save(out, garbage=2, deflate=True, use_objstms=1, **options)
 
 
+def _page_number(text, part):
+    try:
+        return int(text)
+    except ValueError:
+        raise PdfGoatError(f"{part!r} is not a page number or range") from None
+
+
 def parse_pages(spec, n):
     """Parse '2-5,9' (1-based, inclusive) into ordered 0-based indices."""
     out = []
@@ -153,11 +160,11 @@ def parse_pages(spec, n):
             continue
         if "-" in part:
             a, b = part.split("-", 1)
-            a, b = int(a), int(b)
+            a, b = _page_number(a, part), _page_number(b, part)
             step = 1 if b >= a else -1
             out.extend(range(a, b + step, step))
         else:
-            out.append(int(part))
+            out.append(_page_number(part, part))
     for p in out:
         if p < 1 or p > n:
             raise PdfGoatError(f"page {p} is outside the range 1 to {n}")
@@ -1234,19 +1241,20 @@ def cmd_reorder(a):
     with pymupdf.open(src) as doc:
         n = doc.page_count
         idxs = parse_pages(a.order, n)
-        if sorted(idxs) != list(range(n)):
-            raise PdfGoatError(
-                f"--order must list each of the {n} pages exactly once; "
-                f"received {len(idxs)} entries"
-            )
-        doc.select(idxs)
+        if not idxs:
+            raise PdfGoatError("--order must name at least one page")
+        if len(set(idxs)) != len(idxs):
+            raise PdfGoatError("--order must not name the same page twice")
+        named = set(idxs)
+        full_order = idxs + [i for i in range(n) if i not in named]
+        doc.select(full_order)
         with AtomicOutput(out) as partial:
             _save_pdf(doc, partial)
     return {
         "verb": "reorder",
         "inputs": [str(src)],
         "outputs": [out],
-        "order": [i + 1 for i in idxs],
+        "order": [i + 1 for i in full_order],
     }
 
 
@@ -4515,9 +4523,19 @@ def build_parser():
     s.add_argument("-o", "--output")
     s.set_defaults(func=cmd_delete)
 
-    s = sub.add_parser("reorder", help="reorder pages, e.g. --order 3,1,2")
+    s = sub.add_parser(
+        "reorder",
+        help="reorder pages, e.g. --order 3,1,2; a partial list moves those "
+        "pages first and the rest follow in their original order",
+    )
     s.add_argument("file")
-    s.add_argument("--order", required=True)
+    s.add_argument(
+        "--order",
+        required=True,
+        help="pages in the wanted order, e.g. 3,1,2; a partial list moves the "
+        "named pages first and every unnamed page follows once, in its "
+        "original relative order",
+    )
     s.add_argument("-o", "--output")
     s.set_defaults(func=cmd_reorder)
 
