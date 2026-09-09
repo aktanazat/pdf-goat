@@ -78,6 +78,8 @@ The document window uses:
 
 `PDFView`, `PDFThumbnailView`, and form controls must not create an observable edit outside `DocumentEngine`. Keep a direct-editing path read-only, capture its complete edit as one engine transaction before any observer can read it, or replace that path.
 
+The app derives its logical current page from live visible-page geometry measured directly against the current scroll position, seeded from `PDFView.visiblePages` and a window around `PDFView.currentPage` sized to how many pages fit the viewport at the current scale, so ordinary scrolling, rapid successive navigation, a zoomed-out layout with several fully visible pages, and history replay all use the same page-resolution rule. The PDFView scroll-view clip view refreshes the page field and action enablement on bounds changes, not only on PDFKit page notifications. `currentPage` still seeds the search and is the fallback before any page has measurable geometry, but it never decides which visible page is current; heights within one window backing pixel of the maximum are a visual tie, where the destination of an explicit navigation wins while it stays inside the tie and otherwise the lowest document index wins, so one scroll position always resolves to one page.
+
 Agent activity appears in the same operation history and selection model as
 human activity.
 
