@@ -4,7 +4,20 @@ import PDFKit
 import QuartzCore
 
 @MainActor
-final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @MainActor PDFViewDelegate {
+private final class PageField: NSTextField {
+    var onBecomeFirstResponder: (() -> Void)?
+
+    override func becomeFirstResponder() -> Bool {
+        guard super.becomeFirstResponder() else {
+            return false
+        }
+        onBecomeFirstResponder?()
+        return true
+    }
+}
+
+@MainActor
+final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @MainActor PDFViewDelegate, NSTextFieldDelegate, NSMenuItemValidation, NSToolbarItemValidation {
     private static let defaultContentSize = NSSize(width: 1120, height: 780)
     private static let motionDuration: TimeInterval = 0.3
     private static let motionTimingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -15,9 +28,13 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
     private let sidebar = NSVisualEffectView()
     private let splitViewController = NSSplitViewController()
     private var thumbnailView: PDFThumbnailView?
-    private var pageStatus: NSTextField?
+    private var pageField: NSTextField?
+    private var pageSuffixField: NSTextField?
+    private var pageFieldRequest: String?
+    private var preferredNavigationPageIndex: Int?
     private var zoomTarget: CGFloat?
     private var firstVisibleInterval: OSSignpostIntervalState?
+    private weak var observedClipView: NSClipView?
 
     init(document: PDFDocument) {
         let window = NSWindow(
@@ -53,6 +70,7 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         let firstShow = window.map { !$0.isVisible && !$0.isMiniaturized } ?? true
         super.showWindow(sender)
         window?.displayIfNeeded()
+        pageField?.nextKeyView = pdfView
         if firstShow {
             LaunchTrace.signposter.emitEvent("window.shown")
         }
@@ -83,15 +101,99 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
     }
 
     private func navigate(by offset: Int) {
-        guard let document = pdfView.document, let currentPage = pdfView.currentPage else {
+        guard let page = page(offsetBy: offset) else {
             return
         }
-        let current = document.index(for: currentPage)
-        let target = min(max(current + offset, 0), document.pageCount - 1)
-        guard target != current, let page = document.page(at: target) else {
+        navigate(to: page)
+    }
+
+    private func navigate(to page: PDFPage) {
+        guard let document = pdfView.document else {
             return
         }
+        preferredNavigationPageIndex = document.index(for: page)
         pdfView.go(to: page)
+    }
+
+    private func page(at index: Int) -> PDFPage? {
+        guard let document = pdfView.document, index >= 0, index < document.pageCount else {
+            return nil
+        }
+        return document.page(at: index)
+    }
+
+    /// The page with the most visible height is the current page. Candidates
+    /// are measured against the live scroll geometry. Heights within one
+    /// backing pixel of the maximum are a visual tie: an explicit navigation
+    /// destination wins while it stays inside the tie, otherwise the lowest
+    /// document index wins, so one scroll position always resolves to one
+    /// page. `visiblePages` is a debounced snapshot that can still name the
+    /// pre-navigation page, or omit a page that just became visible after a
+    /// scale change, so it only seeds the candidate set: `currentPage`'s
+    /// neighbours join it, as many as fit the viewport at this scale. Before
+    /// PDFKit lays out a fresh document or scroll position every height is
+    /// zero, and `currentPage` is the only answer that exists for that
+    /// instant.
+    private func logicalPage(in document: PDFDocument) -> PDFPage? {
+        var candidates = Set(pdfView.visiblePages.map { document.index(for: $0) })
+        if let anchorPage = pdfView.currentPage {
+            let anchor = document.index(for: anchorPage)
+            let anchorHeight = pdfView.convert(anchorPage.bounds(for: pdfView.displayBox), from: anchorPage).height
+            let radius = anchorHeight > 0 ? max(1, Int((pdfView.bounds.height / anchorHeight).rounded(.up)) + 1) : 1
+            candidates.formUnion((anchor - radius)...(anchor + radius))
+        }
+
+        let candidatePages = candidates.sorted().compactMap { page(at: $0) }
+        let maximumHeight = candidatePages.reduce(0) { max($0, visibleHeight(of: $1)) }
+        guard maximumHeight > 0 else {
+            return pdfView.currentPage
+        }
+
+        let tieTolerance = 1 / max(window?.backingScaleFactor ?? 1, 1)
+        if let preferredIndex = preferredNavigationPageIndex {
+            if candidates.contains(preferredIndex), let preferredPage = page(at: preferredIndex) {
+                let preferredHeight = visibleHeight(of: preferredPage)
+                if preferredHeight > 0, maximumHeight - preferredHeight <= tieTolerance {
+                    return preferredPage
+                }
+            }
+            preferredNavigationPageIndex = nil
+        }
+        return candidatePages.first { maximumHeight - visibleHeight(of: $0) <= tieTolerance }
+    }
+
+    /// How much of `page` the viewport shows right now, in view points.
+    private func visibleHeight(of page: PDFPage) -> CGFloat {
+        let pageBounds = pdfView.convert(page.bounds(for: pdfView.displayBox), from: page)
+        return pdfView.bounds.intersection(pageBounds).height
+    }
+
+    private func page(offsetBy offset: Int) -> PDFPage? {
+        guard let document = pdfView.document, let logical = logicalPage(in: document) else {
+            return nil
+        }
+        return page(at: document.index(for: logical) + offset)
+    }
+
+    private func canNavigate(by offset: Int) -> Bool {
+        page(offsetBy: offset) != nil
+    }
+
+    // `PDFView` implements `goBack:`, `goForward:`, and `goToPage:`, so target-less menu forwards use distinct names.
+    @objc func historyGoBack(_ sender: NSObject?) {
+        pdfView.goBack(sender)
+    }
+
+    @objc func historyGoForward(_ sender: NSObject?) {
+        pdfView.goForward(sender)
+    }
+
+    @objc func focusPageField(_ sender: NSObject?) {
+        guard let window, let pageField else {
+            return
+        }
+        window.makeFirstResponder(pageField)
+        pageField.currentEditor()?.selectAll(sender)
     }
 
     @objc func zoomInPage(_: NSObject?) {
@@ -145,11 +247,13 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
 
     @objc private func pageChanged(_: Notification) {
         makeVisibleAnnotationsReadOnly()
-        updatePageStatus()
+        pageFieldRequest = nil
+        refreshPageStatus(updatesEditor: true)
     }
 
     @objc private func visiblePagesChanged(_: Notification) {
         makeVisibleAnnotationsReadOnly()
+        refreshPageStatus()
         // PDFKit posts the first notification before `visiblePages` is
         // populated, so the first layout finishes one turn later.
         guard let interval = firstVisibleInterval else {
@@ -168,6 +272,10 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
 
     @objc private func liveScrollEnded(_: Notification) {
         pdfView.interpolationQuality = .high
+    }
+
+    @objc private func scrollBoundsChanged(_: Notification) {
+        refreshPageStatus()
     }
 
     func pdfViewWillClick(onLink _: PDFView, with _: URL) {
@@ -218,8 +326,9 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         LaunchTrace.signposter.withIntervalSignpost("attach.document") {
             pdfView.document = document
         }
+        observeLiveScroll()
         showDocumentStart(document)
-        updatePageStatus()
+        refreshPageStatus()
         firstVisibleInterval = LaunchTrace.signposter.beginInterval("first.visible")
     }
 
@@ -227,7 +336,7 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         guard let first = document.page(at: 0) else {
             return
         }
-        pdfView.go(to: first)
+        navigate(to: first)
     }
 
     private func finishFirstLayout() {
@@ -286,10 +395,41 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         )
     }
 
+    /// PDFKit builds the scroll view while the document is attached and keeps
+    /// it, so the wiring runs there and re-asserts itself by clip-view
+    /// identity. Waiting for the first-layout notification instead leaves the
+    /// first scroll of a session unobserved.
     private func observeLiveScroll() {
-        guard let scrollView = pdfView.documentView?.enclosingScrollView else {
+        guard let scrollView = pdfView.documentView?.enclosingScrollView,
+              scrollView.contentView !== observedClipView else {
             return
         }
+        let clipView = scrollView.contentView
+        observedClipView = clipView
+        clipView.postsBoundsChangedNotifications = true
+        // A replaced clip view leaves the earlier registrations in place, and
+        // the scroll view keeps its own, so drop all three before re-adding.
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSView.boundsDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: nil
+        )
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(scrollBoundsChanged(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: clipView
+        )
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(liveScrollStarted(_:)),
@@ -313,17 +453,112 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         }
     }
 
-    private func updatePageStatus() {
-        guard let pageStatus, let document = pdfView.document else {
+    private func pageStatusStrings(for document: PDFDocument) -> (number: String, suffix: String) {
+        guard let page = logicalPage(in: document) else {
+            return ("", "of \(document.pageCount)")
+        }
+        let number = document.index(for: page) + 1
+        let label = page.label?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix = if let label, !label.isEmpty, label != String(number) {
+            "of \(document.pageCount) · \(label)"
+        } else {
+            "of \(document.pageCount)"
+        }
+        return (String(number), suffix)
+    }
+
+    private func writePageStatus(updatesEditor: Bool) {
+        guard let document = pdfView.document, let pageField, let pageSuffixField else {
             return
         }
-        guard let page = pdfView.currentPage else {
-            pageStatus.stringValue = "0 of \(document.pageCount)"
+        let (number, suffix) = pageStatusStrings(for: document)
+        pageField.stringValue = number
+        if updatesEditor {
+            pageField.currentEditor()?.string = number
+        }
+        pageSuffixField.stringValue = suffix
+    }
+
+    private func refreshPageStatus(updatesEditor: Bool = false) {
+        writePageStatus(updatesEditor: updatesEditor)
+        window?.toolbar?.validateVisibleItems()
+    }
+
+    private func pageFieldDidBecomeFirstResponder() {
+        pageFieldRequest = nil
+        refreshPageStatus()
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard (obj.object as? NSTextField) === pageField else {
+            return
+        }
+        let movement = obj.userInfo?[NSText.movementUserInfoKey] as? Int
+        if movement == NSTextMovement.cancel.rawValue {
+            pageFieldRequest = nil
+            refreshPageStatus(updatesEditor: true)
+            return
+        }
+        commitPageField(moveFocusToPDFView: movement == NSTextMovement.return.rawValue)
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let pageField, (obj.object as? NSTextField) === pageField else {
+            return
+        }
+        pageFieldRequest = pageField.currentEditor()?.string
+    }
+
+    private func commitPageField(moveFocusToPDFView: Bool) {
+        if moveFocusToPDFView {
+            window?.makeFirstResponder(pdfView)
+        }
+        guard pdfView.document != nil else {
+            pageFieldRequest = nil
             return
         }
 
-        pageStatus.stringValue = "\(document.index(for: page) + 1) of \(document.pageCount)"
+        let request = pageFieldRequest
+        pageFieldRequest = nil
+        if
+            let request,
+            let requested = Int(request.trimmingCharacters(in: .whitespacesAndNewlines)),
+            // `Int.min` parses, and `Int.min - 1` traps, so reject non-positive input
+            // before converting to a 0-based index.
+            requested > 0,
+            let target = page(at: requested - 1)
+        {
+            navigate(to: target)
+        }
+
+        refreshPageStatus()
     }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        canPerform(menuItem.action)
+    }
+
+    func validateToolbarItem(_ toolbarItem: NSToolbarItem) -> Bool {
+        canPerform(toolbarItem.action)
+    }
+
+    private func canPerform(_ action: Selector?) -> Bool {
+        switch action {
+        case #selector(previousPage(_:)):
+            return canNavigate(by: -1)
+        case #selector(nextPage(_:)):
+            return canNavigate(by: 1)
+        case #selector(historyGoBack(_:)):
+            return pdfView.canGoBack
+        case #selector(historyGoForward(_:)):
+            return pdfView.canGoForward
+        case #selector(focusPageField(_:)):
+            return pageField?.window != nil
+        default:
+            return true
+        }
+    }
+
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         [.toggleNavigator, .openDocument, .previousPage, .pageStatus, .nextPage, .zoomOut, .zoomIn, .fitPage, .flexibleSpace]
@@ -377,19 +612,39 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
     }
 
     private func statusItem(_ identifier: NSToolbarItem.Identifier, inserted: Bool) -> NSToolbarItem {
-        let status = NSTextField(labelWithString: "")
-        status.alignment = .center
-        status.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        status.textColor = .secondaryLabelColor
+        let field = PageField()
+        field.alignment = .right
+        field.bezelStyle = .roundedBezel
+        field.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        field.placeholderString = "Page"
+        field.toolTip = "Go to Page"
+        field.setAccessibilityLabel("Page number")
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.widthAnchor.constraint(equalToConstant: 48).isActive = true
+
+        let suffix = NSTextField(labelWithString: "")
+        suffix.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        suffix.textColor = .secondaryLabelColor
+        suffix.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView(views: [field, suffix])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 4
 
         let item = NSToolbarItem(itemIdentifier: identifier)
         item.label = "Page"
         item.paletteLabel = "Page"
-        item.view = status
+        item.view = stack
 
         if inserted {
-            pageStatus = status
-            updatePageStatus()
+            pageField = field
+            pageSuffixField = suffix
+            refreshPageStatus()
+            field.delegate = self
+            field.onBecomeFirstResponder = { [weak self] in
+                self?.pageFieldDidBecomeFirstResponder()
+            }
         }
 
         return item

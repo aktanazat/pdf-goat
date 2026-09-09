@@ -96,6 +96,7 @@ Build the proof before committing to a renderer, transport, storage layout, or f
 5. Add form creation only for widget cases that passed the proof gate.
 6. Add dry-run previews for whole-document replacement and signed-document edits.
 7. Add operation history to the native inspector with source-versus-working-copy state.
+8. Add page-label editing without changing page indexes.
 
 ### Exit gate
 

@@ -194,6 +194,25 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Zoom In", action: #selector(DocumentWindowController.zoomInPage(_:)), keyEquivalent: "+")
         menu.addItem(withTitle: "Zoom Out", action: #selector(DocumentWindowController.zoomOutPage(_:)), keyEquivalent: "-")
         menu.addItem(withTitle: "Fit Page", action: #selector(DocumentWindowController.fitPage(_:)), keyEquivalent: "0")
+        menu.addItem(.separator())
+        menu.addItem(
+            withTitle: "Previous Page",
+            action: #selector(DocumentWindowController.previousPage(_:)),
+            keyEquivalent: String(UnicodeScalar(NSUpArrowFunctionKey)!)
+        ).keyEquivalentModifierMask = [.option]
+        menu.addItem(
+            withTitle: "Next Page",
+            action: #selector(DocumentWindowController.nextPage(_:)),
+            keyEquivalent: String(UnicodeScalar(NSDownArrowFunctionKey)!)
+        ).keyEquivalentModifierMask = [.option]
+        menu.addItem(
+            withTitle: "Go to Page…",
+            action: #selector(DocumentWindowController.focusPageField(_:)),
+            keyEquivalent: "n"
+        ).keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Back", action: #selector(DocumentWindowController.historyGoBack(_:)), keyEquivalent: "[")
+        menu.addItem(withTitle: "Forward", action: #selector(DocumentWindowController.historyGoForward(_:)), keyEquivalent: "]")
         return item
     }
 

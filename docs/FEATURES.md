@@ -54,7 +54,8 @@ feature can change a user file.
 | Continuous, single-page, and two-up modes | Native | 1 | Mode changes preserve current page and selection |
 | Fit width, fit page, actual size, zoom, and view rotation | Native | 1 | Menu, toolbar, gesture, and keyboard paths agree |
 | Full screen and presentation | Native | 1 | Hides editing chrome and keeps navigation accessible |
-| Thumbnails and page labels | Native | 1 | Loads visible thumbnails first and updates after page transactions |
+| Thumbnails and page labels | Native | 1 | Loads visible thumbnails first, updates after page transactions, and shows a page label that differs from the page number |
+| Page navigation by number, previous, and next | Native | 1 | Menu, toolbar, and keyboard paths agree and disable at document ends |
 | Document outline and bookmarks | Native | 1 | Navigate, add, rename, reorder, and remove without changing page identity |
 | Search results sidebar | Native | 2 | Shows bounded excerpts, page IDs, and geometry with keyboard navigation |
 | Text selection and copy | Native | 1 | Preserves Unicode text where the PDF exposes it |
@@ -87,7 +88,7 @@ feature can change a user file.
 | Overlay and stamp one PDF over another | Extended | 5 | Normalizes page boxes and produces a preview |
 | N-up and booklet imposition | Extended | 5 | Verifies order, orientation, creep assumptions, and printable boxes |
 | Page box editor | Extended | 5 | Reads and writes media, crop, trim, bleed, and art boxes without silent coercion |
-| Page labels | Native | 3 | Separates display labels from page indexes |
+| Page-label editing | Native | 3 | Changes labels without changing page indexes |
 | Metadata read, set, and strip | Native | 3 | Handles standard and custom keys and makes each removed or changed key observable |
 | Add, edit, and remove links | Native | 3 | Supports internal destinations and inspected external URLs |
 | Add, extract, and remove attachments | Extended | 5 | Never executes an attachment and preserves file names safely |
