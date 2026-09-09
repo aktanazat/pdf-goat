@@ -126,8 +126,8 @@ Readiness means visible page content, not a fully painted page.
 
 ### Reproduce
 
-`run` needs Accessibility and Screen Recording permission and writes raw
-receipts only to the path you pass.
+`run` and `search` need Accessibility and Screen Recording permission and
+write raw receipts only to the paths you pass.
 
 ```sh
 OUT=/absolute/path/to/output
@@ -137,6 +137,11 @@ swift benchmarks/pdf_benchmark.swift run \
   --corpus "$OUT/corpus" --output "$OUT/session.jsonl" \
   --pdf-goat ".build/PDF Goat.app" \
   --preview "/System/Applications/Preview.app"
+
+swift benchmarks/pdf_benchmark.swift search \
+  --corpus benchmarks/results/find-ferc-corpus --output "$OUT/search.jsonl" \
+  --pdf-goat ".build/PDF Goat.app" \
+  --documents pst-geo,ferc,dive,munzner
 swift benchmarks/pdf_benchmark.swift summarize "$OUT/session.jsonl" \
   --output "$OUT/summary.json"
 ```

@@ -2,10 +2,13 @@ import AppKit
 import OSLog
 import PDFKit
 
-/// Launch signposts, read with
-/// `log show --last 2m --signpost --predicate 'subsystem == "dev.aktan.pdfgoat"'`.
+/// Signposts for document launch.
 enum LaunchTrace {
     static let signposter = OSSignposter(subsystem: "dev.aktan.pdfgoat", category: "launch")
+}
+
+enum FindTrace {
+    static let signposter = OSSignposter(subsystem: "dev.aktan.pdfgoat", category: "find")
 }
 
 @MainActor

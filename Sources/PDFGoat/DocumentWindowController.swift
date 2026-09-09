@@ -18,6 +18,43 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
     private var pageStatus: NSTextField?
     private var zoomTarget: CGFloat?
     private var firstVisibleInterval: OSSignpostIntervalState?
+    private struct MatchSet {
+        private(set) var selections: [PDFSelection] = []
+        private(set) var activeIndex: Int?
+
+        var isEmpty: Bool { selections.isEmpty }
+
+        mutating func append(_ selection: PDFSelection) {
+            selections.append(selection)
+            activeIndex = activeIndex ?? 0
+        }
+
+        mutating func clear() {
+            selections.removeAll()
+            activeIndex = nil
+        }
+
+        mutating func advance(by offset: Int) {
+            guard !selections.isEmpty else {
+                return
+            }
+            let current = activeIndex ?? 0
+            activeIndex = ((current + offset) % selections.count + selections.count) % selections.count
+        }
+    }
+
+    @MainActor
+    private final class FindSession {
+        var matches = MatchSet()
+        var observers: [NSObjectProtocol] = []
+        var interval: OSSignpostIntervalState?
+        var inFlight = true
+        var refreshScheduled = false
+    }
+
+    private var findSession: FindSession?
+    private var findToolbarItem: NSSearchToolbarItem?
+    private var findStatus: NSTextField?
 
     init(document: PDFDocument) {
         let window = NSWindow(
@@ -39,6 +76,7 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         window.initialFirstResponder = pdfView
         configureToolbar()
         observePageChanges()
+        observeWindowClosing()
         window.setContentSize(Self.defaultContentSize)
         window.center()
         attach(document)
@@ -104,6 +142,28 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
 
     @objc func fitPage(_: NSObject?) {
         setScaleFactor(pdfView.scaleFactorForSizeToFit, restoresAutoScale: true)
+    }
+
+    @objc func revealFind(_: NSObject?) {
+        findToolbarItem?.beginSearchInteraction()
+    }
+
+    @objc func findNext(_: NSObject?) {
+        advanceMatch(by: 1)
+    }
+
+    @objc func findPrevious(_: NSObject?) {
+        advanceMatch(by: -1)
+    }
+
+    @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(revealFind(_:)) {
+            return findToolbarItem != nil
+        }
+        if menuItem.action == #selector(findNext(_:)) || menuItem.action == #selector(findPrevious(_:)) {
+            return !(findSession?.matches.isEmpty ?? true)
+        }
+        return true
     }
 
     private func zoom(by multiplier: CGFloat) {
@@ -304,6 +364,191 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         )
     }
 
+    private func observeWindowClosing() {
+        guard let window else {
+            return
+        }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowWillClose(_:)),
+            name: NSWindow.willCloseNotification,
+            object: window
+        )
+    }
+
+    @objc private func windowWillClose(_: Notification) {
+        cancelActiveFind()
+        NotificationCenter.default.removeObserver(self, name: .PDFViewPageChanged, object: pdfView)
+        NotificationCenter.default.removeObserver(self, name: .PDFViewVisiblePagesChanged, object: pdfView)
+        releaseThumbnailSidebar()
+        // Observed on macOS 26.6.2 (25G83): canceling this pending perform before teardown avoids a PDFKit close lock.
+        // Retest with: swift test --no-parallel --filter PDFGoatDocumentTests/closingDuringSearchCancelsCleanly
+        NSObject.cancelPreviousPerformRequests(withTarget: pdfView)
+        window?.contentViewController = nil
+    }
+
+    @objc private func findFieldAction(_ sender: NSSearchField) {
+        startFind(for: sender.stringValue)
+    }
+
+    func startFind(for term: String) {
+        let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
+        cancelActiveFind()
+        guard !trimmed.isEmpty, let document = pdfView.document else {
+            return
+        }
+
+        let session = FindSession()
+        findSession = session
+        session.interval = FindTrace.signposter.beginInterval("find.query")
+
+        let matchObserver = NotificationCenter.default.addObserver(
+            forName: .PDFDocumentDidFindMatch,
+            object: document,
+            queue: .main // Main-queue delivery makes assumeIsolated and nonisolated(unsafe) sound below.
+        ) { [weak self, weak session] notification in
+            nonisolated(unsafe) let notification = notification
+            MainActor.assumeIsolated {
+                guard let session else {
+                    return
+                }
+                self?.handleFindMatch(notification, session: session)
+            }
+        }
+        let endObserver = NotificationCenter.default.addObserver(
+            forName: .PDFDocumentDidEndFind,
+            object: document,
+            queue: .main
+        ) { [weak self, weak session] _ in
+            MainActor.assumeIsolated {
+                guard let session else {
+                    return
+                }
+                self?.handleFindEnd(session: session)
+            }
+        }
+        session.observers = [matchObserver, endObserver]
+        document.beginFindString(trimmed, withOptions: [.caseInsensitive])
+        updateFindStatus()
+    }
+
+    private func cancelActiveFind() {
+        if let session = findSession {
+            tearDownFind(session, discardSession: true, cancelled: session.inFlight)
+        }
+        pdfView.document?.cancelFindString()
+        pdfView.highlightedSelections = nil
+        pdfView.clearSelection()
+        updateFindStatus()
+    }
+
+    private func tearDownFind(_ session: FindSession, discardSession: Bool, cancelled: Bool) {
+        session.observers.forEach(NotificationCenter.default.removeObserver)
+        session.observers.removeAll()
+        if let interval = session.interval {
+            if cancelled {
+                FindTrace.signposter.emitEvent("find.cancelled")
+            }
+            FindTrace.signposter.endInterval("find.query", interval)
+        }
+        session.interval = nil
+        session.inFlight = false
+        session.refreshScheduled = false
+        if discardSession {
+            session.matches.clear()
+            if findSession === session {
+                findSession = nil
+            }
+        }
+    }
+
+    private func handleFindMatch(_ notification: Notification, session: FindSession) {
+        guard session === findSession,
+              session.inFlight,
+              let selection = notification.userInfo?[PDFDocumentFoundSelectionKey] as? PDFSelection
+        else {
+            return
+        }
+        let firstMatch = session.matches.isEmpty
+        if firstMatch {
+            FindTrace.signposter.emitEvent("find.first-hit")
+        }
+        session.matches.append(selection)
+        if firstMatch {
+            showActiveMatch(session)
+            updateFindStatus()
+        }
+        scheduleFindRefresh(session)
+    }
+
+    private func scheduleFindRefresh(_ session: FindSession) {
+        guard !session.refreshScheduled else {
+            return
+        }
+        session.refreshScheduled = true
+        DispatchQueue.main.async { [weak self, weak session] in
+            MainActor.assumeIsolated {
+                guard let self, let session, session === self.findSession, session.inFlight else {
+                    return
+                }
+                session.refreshScheduled = false
+                self.pdfView.highlightedSelections = session.matches.selections
+                self.updateFindStatus()
+            }
+        }
+    }
+
+    private func handleFindEnd(session: FindSession) {
+        guard session === findSession, session.inFlight else {
+            return
+        }
+        pdfView.highlightedSelections = session.matches.selections
+        tearDownFind(session, discardSession: false, cancelled: false)
+        updateFindStatus()
+    }
+
+    private func showActiveMatch(_ session: FindSession) {
+        guard let activeIndex = session.matches.activeIndex,
+              session.matches.selections.indices.contains(activeIndex)
+        else {
+            return
+        }
+        let selection = session.matches.selections[activeIndex]
+        pdfView.setCurrentSelection(selection, animate: true)
+        pdfView.go(to: selection)
+    }
+
+    private func advanceMatch(by offset: Int) {
+        guard let session = findSession, !session.matches.isEmpty else {
+            return
+        }
+        session.matches.advance(by: offset)
+        showActiveMatch(session)
+        updateFindStatus()
+    }
+
+    var findStatusText: String? {
+        findStatus?.stringValue
+    }
+
+
+    private func updateFindStatus() {
+        guard let findStatus else {
+            return
+        }
+        guard let session = findSession else {
+            findStatus.stringValue = ""
+            return
+        }
+        guard !session.matches.isEmpty else {
+            findStatus.stringValue = session.inFlight ? "Searching…" : "No Results"
+            return
+        }
+        let marker = session.inFlight ? "…" : ""
+        let activeIndex = session.matches.activeIndex ?? 0
+        findStatus.stringValue = "\(activeIndex + 1) of \(session.matches.selections.count)\(marker)"
+    }
+
     private func makeVisibleAnnotationsReadOnly() {
         for page in pdfView.visiblePages {
             for annotation in page.annotations
@@ -326,11 +571,25 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.toggleNavigator, .openDocument, .previousPage, .pageStatus, .nextPage, .zoomOut, .zoomIn, .fitPage, .flexibleSpace]
+        [.toggleNavigator, .openDocument, .previousPage, .pageStatus, .nextPage, .zoomOut, .zoomIn, .fitPage, .find, .findStatus, .flexibleSpace]
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.toggleNavigator, .openDocument, .flexibleSpace, .previousPage, .pageStatus, .nextPage, .flexibleSpace, .zoomOut, .zoomIn, .fitPage]
+        [.toggleNavigator, .openDocument, .flexibleSpace, .previousPage, .pageStatus, .nextPage, .flexibleSpace, .zoomOut, .zoomIn, .fitPage, .flexibleSpace, .find, .findStatus]
+    }
+
+    func toolbarDidRemoveItem(_ notification: Notification) {
+        guard let item = notification.userInfo?[NSToolbarUserInfoKey.itemKey] as? NSToolbarItem else {
+            return
+        }
+        switch item.itemIdentifier {
+        case .find:
+            findToolbarItem = nil
+        case .findStatus:
+            findStatus = nil
+        default:
+            break
+        }
     }
 
     func toolbar(
@@ -355,6 +614,10 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
             actionItem(itemIdentifier, label: "Zoom In", symbol: "plus.magnifyingglass", action: #selector(zoomInPage(_:)))
         case .fitPage:
             actionItem(itemIdentifier, label: "Fit Page", symbol: "arrow.up.left.and.arrow.down.right", action: #selector(fitPage(_:)))
+        case .find:
+            findItem(itemIdentifier, inserted: flag)
+        case .findStatus:
+            findStatusItem(itemIdentifier, inserted: flag)
         default:
             nil
         }
@@ -381,6 +644,7 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         status.alignment = .center
         status.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         status.textColor = .secondaryLabelColor
+        status.setAccessibilityIdentifier("PDFGoat.pageStatus")
 
         let item = NSToolbarItem(itemIdentifier: identifier)
         item.label = "Page"
@@ -390,6 +654,52 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         if inserted {
             pageStatus = status
             updatePageStatus()
+        }
+
+        return item
+    }
+
+    private func findItem(_ identifier: NSToolbarItem.Identifier, inserted: Bool) -> NSToolbarItem {
+        let search = NSSearchField()
+        search.placeholderString = "Find in Document"
+        search.target = self
+        search.action = #selector(findFieldAction(_:))
+        search.recentsAutosaveName = nil
+        // Send the action only on Return or the search button, never on the
+        // built-in incremental-search delay timer. Without this, setting the
+        // field's text (by typing or by Accessibility) already submits a
+        // query, and the following Return submits a second, separate one.
+        search.sendsWholeSearchString = true
+        search.setAccessibilityIdentifier("PDFGoat.findField")
+
+        let item = NSSearchToolbarItem(itemIdentifier: identifier)
+        item.searchField = search
+        item.label = "Find"
+        item.paletteLabel = "Find"
+        item.toolTip = "Find in Document"
+
+        if inserted {
+            findToolbarItem = item
+        }
+
+        return item
+    }
+
+    private func findStatusItem(_ identifier: NSToolbarItem.Identifier, inserted: Bool) -> NSToolbarItem {
+        let status = NSTextField(labelWithString: "")
+        status.alignment = .center
+        status.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        status.textColor = .secondaryLabelColor
+        status.setAccessibilityIdentifier("PDFGoat.findStatus")
+
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        item.label = "Matches"
+        item.paletteLabel = "Matches"
+        item.view = status
+
+        if inserted {
+            findStatus = status
+            updateFindStatus()
         }
 
         return item
@@ -405,4 +715,6 @@ private extension NSToolbarItem.Identifier {
     static let zoomOut = Self("PDFGoat.zoomOut")
     static let zoomIn = Self("PDFGoat.zoomIn")
     static let fitPage = Self("PDFGoat.fitPage")
+    static let find = Self("PDFGoat.find")
+    static let findStatus = Self("PDFGoat.findStatus")
 }

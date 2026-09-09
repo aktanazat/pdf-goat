@@ -6,6 +6,7 @@ import CoreGraphics
 import CryptoKit
 import Darwin
 import Foundation
+import PDFKit
 import ScreenCaptureKit
 
 let pollNS: UInt64 = 20_000_000
@@ -13,7 +14,7 @@ let footprintDelayNS: UInt64 = 750_000_000
 let footprintToleranceNS: UInt64 = 25_000_000
 let windowSize = CGSize(width: 1_200, height: 800)
 let timeoutNS: UInt64 = 15_000_000_000
-let schemaVersion = 3
+let schemaVersion = 5
 
 struct BenchError: Error, CustomStringConvertible {
     let code: String
@@ -1040,17 +1041,21 @@ struct CloseReceipt: Codable {
     let windowGone: Bool
 }
 
-func close(_ window: BoundWindow, process: ProcessID) throws -> CloseReceipt {
+func close(_ window: BoundWindow, process: ProcessID, viaShortcut: Bool = false) throws -> CloseReceipt {
     let requested = nowNS()
-    var closeButton: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(window.ax, kAXCloseButtonAttribute as CFString, &closeButton) == .success,
-          let closeButton,
-          CFGetTypeID(closeButton) == AXUIElementGetTypeID() else {
-        throw BenchError(code: "close_timeout", detail: "AX close button is unavailable")
-    }
-    let button = unsafeBitCast(closeButton, to: AXUIElement.self)
-    guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
-        throw BenchError(code: "close_timeout", detail: "AX close action failed")
+    if viaShortcut {
+        try postKeystroke(kVKANSI_W, flags: .maskCommand, waitAfter: 0.005)
+    } else {
+        var closeButton: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window.ax, kAXCloseButtonAttribute as CFString, &closeButton) == .success,
+              let closeButton,
+              CFGetTypeID(closeButton) == AXUIElementGetTypeID() else {
+            throw BenchError(code: "close_timeout", detail: "AX close button is unavailable")
+        }
+        let button = unsafeBitCast(closeButton, to: AXUIElement.self)
+        guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
+            throw BenchError(code: "close_timeout", detail: "AX close action failed")
+        }
     }
     while nowNS() < requested + 3_000_000_000 {
         try requireProcess(process)
@@ -1680,6 +1685,640 @@ func runMode(arguments: [String]) throws {
     print("complete session \(session): \(counts.measured) measured receipts")
 }
 
+// MARK: Search lane
+
+// HID drives shortcuts; Accessibility sets the search field value.
+let kVKANSI_F: CGKeyCode = 0x03
+let kVKANSI_G: CGKeyCode = 0x05
+let kVKANSI_W: CGKeyCode = 0x0d
+let interactiveThresholdNS: UInt64 = 250_000_000
+let searchStableNS: UInt64 = 30_000_000_000
+let kVKReturn: CGKeyCode = 0x24
+
+func postKeystroke(_ keyCode: CGKeyCode, flags: CGEventFlags = [], waitAfter: TimeInterval = 0.03) throws {
+    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
+          let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) else {
+        throw BenchError(code: "request_failed", detail: "could not create keyboard event for key \(keyCode)")
+    }
+    down.flags = flags
+    up.flags = flags
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: waitAfter)
+}
+
+// Accessibility sets the query text; Return submits it on this build. The
+// find field's action fires only on Return or the search button
+// (`sendsWholeSearchString = true`), so setting the AXValue alone no longer
+// starts a search; only the explicit Return keystroke does.
+func setFindQuery(_ text: String, fieldElement: AXUIElement, waitAfter: TimeInterval = 0.03) throws {
+    let result = AXUIElementSetAttributeValue(fieldElement, kAXValueAttribute as CFString, text as CFTypeRef)
+    guard result == .success else {
+        throw BenchError(code: "request_failed", detail: "could not set the find field value via Accessibility (AXError \(result.rawValue))")
+    }
+    try postKeystroke(kVKReturn, waitAfter: waitAfter)
+}
+
+// Restore focus before each synthetic key event.
+func ensureFrontmost(_ application: NSRunningApplication, budgetNs: UInt64 = 1_000_000_000) throws {
+    let deadline = nowNS() + budgetNs
+    while nowNS() < deadline {
+        try checkInterruption()
+        if application.isActive { return }
+        application.activate(options: [])
+        sleep(until: nowNS() + 30_000_000)
+    }
+    throw BenchError(code: "focus_lost", detail: "could not bring the target window to the foreground before sending input")
+}
+
+func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+    var raw: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &raw) == .success,
+          let children = raw as? [AXUIElement] else { return [] }
+    return children
+}
+
+func findDescendant(identifier: String, in root: AXUIElement, depth: Int = 10) -> AXUIElement? {
+    guard depth > 0 else { return nil }
+    if axString(root, kAXIdentifierAttribute as CFString) == identifier { return root }
+    for child in axChildren(root) {
+        if let found = findDescendant(identifier: identifier, in: child, depth: depth - 1) { return found }
+    }
+    return nil
+}
+
+// Provisional counts end in an ellipsis; "No Results" is terminal.
+func parseMatchStatus(_ status: String) -> (index: Int, count: Int)? {
+    let parts = status.split(separator: " ")
+    guard parts.count == 3, parts[1] == "of", let index = Int(parts[0]), let count = Int(parts[2]) else { return nil }
+    return (index, count)
+}
+
+func isTransientFindStatus(_ status: String) -> Bool {
+    status.isEmpty || status == "Searching…" || status.hasSuffix("…")
+}
+
+struct StatusPoll {
+    let value: String
+    let observedNS: UInt64
+    let interactive: Bool
+    let maxRoundTripNs: UInt64
+    let sampleCount: Int
+}
+
+func stableStatusPredicate(from baseline: String) -> (String) -> Bool {
+    var previous: String?
+    var observedChange = false
+    return { value in
+        if isTransientFindStatus(value) {
+            observedChange = true
+            previous = nil
+            return false
+        }
+        if value != baseline {
+            observedChange = true
+        }
+        guard observedChange else {
+            previous = value
+            return false
+        }
+        let stable = previous == value
+        previous = value
+        return stable
+    }
+}
+
+func matchIndexChangedPredicate(from baseline: String) throws -> (String) -> Bool {
+    guard let baselineMatch = parseMatchStatus(baseline) else {
+        throw BenchError(code: "corpus_mismatch", detail: "cannot parse baseline find status \(baseline)")
+    }
+    return { value in
+        guard let match = parseMatchStatus(value) else {
+            return false
+        }
+        return match.index != baselineMatch.index
+    }
+}
+
+func pollStatus(_ element: AXUIElement, until settle: (String) -> Bool) throws -> StatusPoll {
+    var samples = 0
+    var maxRoundTrip: UInt64 = 0
+    var interactive = true
+    let deadline = nowNS() + searchStableNS
+    while nowNS() < deadline {
+        try checkInterruption()
+        let before = nowNS()
+        let value = axString(element, kAXValueAttribute as CFString) ?? ""
+        let roundTrip = nowNS() - before
+        maxRoundTrip = max(maxRoundTrip, roundTrip)
+        if roundTrip > interactiveThresholdNS { interactive = false }
+        samples += 1
+        if settle(value) {
+            return StatusPoll(value: value, observedNS: nowNS(), interactive: interactive, maxRoundTripNs: maxRoundTrip, sampleCount: samples)
+        }
+        sleep(until: nowNS() + pollNS)
+    }
+    throw BenchError(code: "window_timeout", detail: "find status did not meet its settle condition within budget")
+}
+
+struct SearchInteractionReceipt: Codable {
+    let kind: String
+    let query: String
+    let tSentNs: UInt64
+    let tObservedNs: UInt64
+    let latencyNs: UInt64
+    let finalStatus: String
+    let windowInteractiveDuringWait: Bool
+    let statusPollCount: Int
+    let maxStatusRoundTripNs: UInt64
+}
+struct FindSubmission {
+    let kind: String
+    let query: String
+    let sentNs: UInt64
+    let requiresCancellation: Bool
+}
+
+struct FindTraceEvent: Decodable {
+    let signpostType: String
+    let signpostName: String
+    let processID: pid_t
+    let machTimestamp: UInt64
+}
+
+struct CapturedFindTrace {
+    let data: Data
+    let events: [FindTraceEvent]
+}
+
+func findTracePath(for output: String) -> String {
+    canonical(output).deletingPathExtension().appendingPathExtension("signposts.jsonl").path
+}
+
+func traceTimestampNs(_ event: FindTraceEvent) -> UInt64 {
+    event.machTimestamp * UInt64(timebase.numer) / UInt64(timebase.denom)
+}
+
+func captureFindTrace(processIDs: Set<pid_t>) throws -> CapturedFindTrace {
+    guard !processIDs.isEmpty else {
+        throw BenchError(code: "measurement_invalid", detail: "no measured process identity for find signposts")
+    }
+    let processPredicate = processIDs.sorted().map { "processID == \($0)" }.joined(separator: " OR ")
+    let predicate = "subsystem == \"dev.aktan.pdfgoat\" AND category == \"find\" AND (\(processPredicate))"
+    let result = try command("/usr/bin/log", ["show", "--style", "json", "--signpost", "--last", "10m", "--predicate", predicate])
+    guard result.status == 0 else {
+        let detail = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        throw BenchError(code: "measurement_invalid", detail: "could not capture find signposts\(detail.isEmpty ? "" : ": \(detail)")")
+    }
+    guard let data = result.stdout.data(using: .utf8) else {
+        throw BenchError(code: "measurement_invalid", detail: "find signpost output was not UTF-8")
+    }
+    do {
+        return CapturedFindTrace(data: data, events: try decoder.decode([FindTraceEvent].self, from: data))
+    } catch {
+        throw BenchError(code: "measurement_invalid", detail: "could not decode find signposts: \(error)")
+    }
+}
+
+func validateFindTrace(_ events: [FindTraceEvent], submissions: [FindSubmission], observedAtNs: UInt64) throws {
+    guard !submissions.isEmpty else {
+        throw BenchError(code: "measurement_invalid", detail: "find run submitted no queries")
+    }
+    let begins = events
+        .filter { $0.signpostName == "find.query" && $0.signpostType == "begin" }
+        .sorted { $0.machTimestamp < $1.machTimestamp }
+    guard begins.count == submissions.count else {
+        throw BenchError(code: "measurement_invalid", detail: "find trace has \(begins.count) query begins for \(submissions.count) submitted queries")
+    }
+    let ends = events
+        .filter { $0.signpostName == "find.query" && $0.signpostType == "end" }
+        .sorted { $0.machTimestamp < $1.machTimestamp }
+    guard ends.count == begins.count else {
+        throw BenchError(code: "measurement_invalid", detail: "find trace has \(ends.count) query ends for \(begins.count) query begins")
+    }
+    var intervals: [(begin: UInt64, end: UInt64)] = []
+    for index in begins.indices {
+        let begin = traceTimestampNs(begins[index])
+        let end = traceTimestampNs(ends[index])
+        guard begin < end, end <= observedAtNs else {
+            throw BenchError(code: "measurement_invalid", detail: "find trace query interval is invalid at index \(index + 1)")
+        }
+        if index + 1 < begins.count {
+            let nextBegin = traceTimestampNs(begins[index + 1])
+            guard end <= nextBegin else {
+                throw BenchError(code: "measurement_invalid", detail: "find trace query intervals overlap at index \(index + 1)")
+            }
+        }
+        intervals.append((begin: begin, end: end))
+    }
+    for (index, submission) in submissions.enumerated() {
+        let upper = index + 1 < submissions.count ? submissions[index + 1].sentNs : observedAtNs
+        let matching = begins.filter {
+            let timestamp = traceTimestampNs($0)
+            return timestamp >= submission.sentNs && timestamp < upper
+        }
+        guard matching.count == 1 else {
+            throw BenchError(code: "measurement_invalid", detail: "find trace has \(matching.count) query begins for submitted query \(index + 1) (\(submission.kind))")
+        }
+    }
+    let cancellations = events.filter {
+        $0.signpostName == "find.cancelled" && $0.signpostType == "event"
+    }
+    for index in submissions.indices where submissions[index].requiresCancellation {
+        let submission = submissions[index]
+        if index + 1 < submissions.count {
+            guard submission.query != submissions[index + 1].query else {
+                throw BenchError(code: "measurement_invalid", detail: "cancellation case \(submission.kind) did not replace a different query")
+            }
+        }
+        let interval = intervals[index]
+        let matching = cancellations.filter {
+            let timestamp = traceTimestampNs($0)
+            return timestamp >= interval.begin && timestamp < interval.end
+        }
+        guard !matching.isEmpty else {
+            throw BenchError(code: "measurement_invalid", detail: "find trace has no in-flight cancellation for \(submission.kind)")
+        }
+    }
+}
+
+func writeFindTrace(_ data: Data, to path: String) throws {
+    let url = canonical(path)
+    guard !FileManager.default.fileExists(atPath: url.path) else {
+        throw UsageError(description: "find signpost output exists: \(url.path)")
+    }
+    try data.write(to: url, options: .atomic)
+}
+
+
+func completeSearch(
+    restored: SearchInteractionReceipt,
+    matchCount: Int,
+    navigation: () throws -> [SearchInteractionReceipt],
+    close: () throws -> CloseReceipt
+) throws -> (interactions: [SearchInteractionReceipt], close: CloseReceipt) {
+    var interactions = [restored]
+    if matchCount > 1 {
+        interactions.append(contentsOf: try navigation())
+    }
+    return (interactions: interactions, close: try close())
+}
+
+struct SearchTrialReceipt: Codable {
+    let record: String
+    let schemaVersion: Int
+    let sessionId: String
+    let sequence: Int
+    let appId: String
+    let documentId: String
+    var status: String
+    var failureCode: String?
+    var failureDetail: String?
+    var process: ProcessReceipt?
+    var presentTerm: String?
+    var absentTerm: String
+    var interactions: [SearchInteractionReceipt]
+    var close: CloseReceipt?
+    var cleanup: CleanupReceipt?
+}
+
+struct SearchSessionReceipt: Codable {
+    let record: String
+    let schemaVersion: Int
+    let sessionId: String
+    let startedAtUtc: String
+    let scriptSha256: String
+    let argv: [String]
+    let host: HostReceipt
+    let appId: String
+    let app: AppReceipt
+    let documentIds: [String]
+    let absentTerm: String
+}
+
+struct SearchSessionEndReceipt: Codable {
+    let record: String
+    let schemaVersion: Int
+    let sessionId: String
+    let finishedAtUtc: String
+    let outcome: String
+    let trialCount: Int
+    let failedTrials: Int
+    let powerSourceUnchanged: Bool
+    let displayUnchanged: Bool
+    let lowPowerModeUnchanged: Bool
+    let thermalStateUnchanged: Bool
+    let cleanupComplete: Bool
+}
+
+func topCountTerm(_ counts: [String: Int]) -> String? {
+    counts.max {
+        if $0.value == $1.value {
+            return $0.key > $1.key
+        }
+        return $0.value < $1.value
+    }?.key
+}
+
+// Derive a present term from PDFKit text in the fixture.
+func derivePresentTerm(url: URL) throws -> String {
+    guard let document = PDFDocument(url: url) else {
+        throw BenchError(code: "corpus_mismatch", detail: "PDFKit could not open \(url.path) to derive a search term")
+    }
+    var counts: [String: Int] = [:]
+    let pageLimit = min(document.pageCount, 40)
+    for index in 0..<pageLimit {
+        guard let page = document.page(at: index), let text = page.string else { continue }
+        for token in text.split(whereSeparator: { !$0.isLetter }) where token.count >= 5 {
+            counts[token.lowercased(), default: 0] += 1
+        }
+    }
+    guard let term = topCountTerm(counts) else {
+        throw BenchError(code: "corpus_mismatch", detail: "no eligible search term found in the first \(pageLimit) pages of \(url.lastPathComponent)")
+    }
+    return term
+}
+
+// Exercises the complete interactive find sequence against one ready window.
+func searchInteractions(
+    window: BoundWindow,
+    process: ProcessID,
+    presentTerm: String,
+    absentTerm: String
+) throws -> (interactions: [SearchInteractionReceipt], close: CloseReceipt, submissions: [FindSubmission]) {
+    guard let application = NSRunningApplication(processIdentifier: process.pid) else {
+        throw BenchError(code: "request_failed", detail: "could not resolve the running application for keystroke delivery")
+    }
+    try ensureFrontmost(application)
+
+    let applicationElement = AXUIElementCreateApplication(process.pid)
+    AXUIElementSetMessagingTimeout(applicationElement, 2)
+    guard let statusElement = findDescendant(identifier: "PDFGoat.findStatus", in: window.ax) else {
+        throw BenchError(code: "geometry_mismatch", detail: "the find status control was not found in the accessibility tree")
+    }
+    guard let fieldElement = findDescendant(identifier: "PDFGoat.findField", in: window.ax) else {
+        throw BenchError(code: "geometry_mismatch", detail: "the find field control was not found in the accessibility tree")
+    }
+    var submissions: [FindSubmission] = []
+
+    func submit(_ kind: String, query: String, requiresCancellation: Bool = false, waitAfter: TimeInterval = 0.03) throws -> UInt64 {
+        let sent = nowNS()
+        submissions.append(FindSubmission(kind: kind, query: query, sentNs: sent, requiresCancellation: requiresCancellation))
+        try setFindQuery(query, fieldElement: fieldElement, waitAfter: waitAfter)
+        return sent
+    }
+
+
+    func typeAndWait(_ kind: String, query: String) throws -> SearchInteractionReceipt {
+        try ensureFrontmost(application)
+        let baseline = axString(statusElement, kAXValueAttribute as CFString) ?? ""
+        let sent = try submit(kind, query: query)
+        let poll = try pollStatus(statusElement, until: stableStatusPredicate(from: baseline))
+        return SearchInteractionReceipt(
+            kind: kind, query: query, tSentNs: sent, tObservedNs: poll.observedNS, latencyNs: poll.observedNS - sent,
+            finalStatus: poll.value, windowInteractiveDuringWait: poll.interactive,
+            statusPollCount: poll.sampleCount, maxStatusRoundTripNs: poll.maxRoundTripNs
+        )
+    }
+
+    var receipts: [SearchInteractionReceipt] = []
+
+    try requireProcess(process)
+    try ensureFrontmost(application)
+    try postKeystroke(kVKANSI_F, flags: .maskCommand)
+    sleep(until: nowNS() + 50_000_000)
+
+    let present = try typeAndWait("present_term", query: presentTerm)
+    receipts.append(present)
+    guard let presentMatch = parseMatchStatus(present.finalStatus), presentMatch.count > 0 else {
+        throw BenchError(code: "corpus_mismatch", detail: "present term \(presentTerm) produced status \(present.finalStatus)")
+    }
+
+    let absent = try typeAndWait("absent_term", query: absentTerm)
+    receipts.append(absent)
+    guard absent.finalStatus == "No Results" else {
+        throw BenchError(code: "corpus_mismatch", detail: "absent term \(absentTerm) produced status \(absent.finalStatus)")
+    }
+
+    try ensureFrontmost(application)
+    _ = try submit("rapid_replacement_source", query: presentTerm, requiresCancellation: true, waitAfter: 0.005)
+    let rapidBaseline = axString(statusElement, kAXValueAttribute as CFString) ?? ""
+    let rapidSent = try submit("rapid_replacement", query: absentTerm, waitAfter: 0.005)
+    let rapidPoll = try pollStatus(statusElement, until: stableStatusPredicate(from: rapidBaseline))
+    let rapid = SearchInteractionReceipt(
+        kind: "rapid_replacement", query: absentTerm, tSentNs: rapidSent, tObservedNs: rapidPoll.observedNS,
+        latencyNs: rapidPoll.observedNS - rapidSent, finalStatus: rapidPoll.value,
+        windowInteractiveDuringWait: rapidPoll.interactive, statusPollCount: rapidPoll.sampleCount,
+        maxStatusRoundTripNs: rapidPoll.maxRoundTripNs
+    )
+    receipts.append(rapid)
+    guard rapid.finalStatus == "No Results" else {
+        throw BenchError(code: "corpus_mismatch", detail: "rapid query replacement left a stale status \(rapid.finalStatus)")
+    }
+
+    let restored = try typeAndWait("restore_present_term", query: presentTerm)
+    guard let restoredMatch = parseMatchStatus(restored.finalStatus), restoredMatch.count == presentMatch.count else {
+        throw BenchError(code: "corpus_mismatch", detail: "restored present term produced status \(restored.finalStatus)")
+    }
+
+    try requireProcess(process)
+    let completed = try completeSearch(
+        restored: restored,
+        matchCount: restoredMatch.count,
+        navigation: {
+            var navigationReceipts: [SearchInteractionReceipt] = []
+            try ensureFrontmost(application)
+            let nextSent = nowNS()
+            try postKeystroke(kVKANSI_G, flags: .maskCommand)
+            let nextPoll = try pollStatus(statusElement, until: try matchIndexChangedPredicate(from: restored.finalStatus))
+            let afterNext = nextPoll.value
+            navigationReceipts.append(SearchInteractionReceipt(
+                kind: "find_next", query: presentTerm, tSentNs: nextSent, tObservedNs: nextPoll.observedNS,
+                latencyNs: nextPoll.observedNS - nextSent, finalStatus: afterNext,
+                windowInteractiveDuringWait: nextPoll.interactive, statusPollCount: nextPoll.sampleCount,
+                maxStatusRoundTripNs: nextPoll.maxRoundTripNs
+            ))
+            guard let nextMatch = parseMatchStatus(afterNext), nextMatch.count == restoredMatch.count else {
+                throw BenchError(code: "corpus_mismatch", detail: "find next produced status \(afterNext)")
+            }
+            let expectedNext = restoredMatch.index % restoredMatch.count + 1
+            guard nextMatch.index == expectedNext else {
+                throw BenchError(code: "corpus_mismatch", detail: "find next advanced from \(restored.finalStatus) to \(afterNext), expected index \(expectedNext)")
+            }
+
+            try ensureFrontmost(application)
+            let previousSent = nowNS()
+            try postKeystroke(kVKANSI_G, flags: [.maskCommand, .maskShift])
+            let previousPoll = try pollStatus(statusElement, until: try matchIndexChangedPredicate(from: afterNext))
+            let afterPrevious = previousPoll.value
+            navigationReceipts.append(SearchInteractionReceipt(
+                kind: "find_previous", query: presentTerm, tSentNs: previousSent, tObservedNs: previousPoll.observedNS,
+                latencyNs: previousPoll.observedNS - previousSent, finalStatus: afterPrevious,
+                windowInteractiveDuringWait: previousPoll.interactive, statusPollCount: previousPoll.sampleCount,
+                maxStatusRoundTripNs: previousPoll.maxRoundTripNs
+            ))
+            guard let previousMatch = parseMatchStatus(afterPrevious), previousMatch.count == restoredMatch.count,
+                  previousMatch.index == restoredMatch.index else {
+                throw BenchError(code: "corpus_mismatch", detail: "find next then find previous did not return to \(restored.finalStatus), got \(afterPrevious)")
+            }
+            return navigationReceipts
+        },
+        close: {
+            try ensureFrontmost(application)
+            _ = try submit("close_during_search", query: presentTerm, requiresCancellation: true, waitAfter: 0.005)
+            try requireProcess(process)
+            let closeReceipt = try close(window, process: process, viaShortcut: true)
+            guard closeReceipt.windowGone else {
+                throw BenchError(code: "close_timeout", detail: "the window did not close while a find was in flight")
+            }
+            try requireProcess(process)
+            return closeReceipt
+        }
+    )
+    receipts.append(contentsOf: completed.interactions)
+    return (interactions: receipts, close: completed.close, submissions: submissions)
+}
+
+func searchTrial(session: String, sequence: Int, app: App, pdf: DocumentReceipt, marker: Marker, absentTerm: String) -> SearchTrialReceipt {
+    var receipt = SearchTrialReceipt(
+        record: "search_trial", schemaVersion: schemaVersion, sessionId: session, sequence: sequence,
+        appId: app.id, documentId: pdf.documentId, status: "failed", failureCode: nil, failureDetail: nil,
+        process: nil, presentTerm: nil, absentTerm: absentTerm, interactions: [], close: nil, cleanup: nil
+    )
+    var bound: ProcessID?
+    do {
+        try checkInterruption()
+        try verify(app, pdf: pdf)
+        guard exactProcesses(app.executable).isEmpty else {
+            throw BenchError(code: "preexisting_process", detail: "exact executable is already running")
+        }
+        let presentTerm = try derivePresentTerm(url: URL(fileURLWithPath: pdf.path))
+        receipt.presentTerm = presentTerm
+        let requested = nowNS()
+        let identity = try launchFresh(app: app, pdf: pdf)
+        bound = identity
+        try verify(app, pdf: pdf)
+        receipt.process = identity.receipt
+        let result = try observe(process: identity, pdf: pdf, requestNS: requested, marker: marker)
+        let search = try searchInteractions(window: result.window, process: identity, presentTerm: presentTerm, absentTerm: absentTerm)
+        receipt.interactions = search.interactions
+        receipt.close = search.close
+        let cleanup = terminate(identity)
+        receipt.cleanup = cleanup
+        if cleanup.killSent || !cleanup.pidExited {
+            throw BenchError(code: "cleanup_failed", detail: "search process did not terminate normally")
+        }
+        let trace = try captureFindTrace(processIDs: Set([identity.pid]))
+        try validateFindTrace(trace.events, submissions: search.submissions, observedAtNs: nowNS())
+        receipt.status = "valid"
+    } catch {
+        receipt.cleanup = cleanupFailedFresh(bound: bound)
+        let failure = error as? BenchError ?? BenchError(code: "request_failed", detail: String(describing: error))
+        receipt.status = "failed"
+        receipt.failureCode = failure.code
+        receipt.failureDetail = failure.detail
+    }
+    return receipt
+}
+func searchSessionFailure(
+    failedTrials: Int,
+    hostStable: Bool,
+    cleanupComplete: Bool,
+    output: String
+) -> BenchError? {
+    if !cleanupComplete {
+        return BenchError(
+            code: "cleanup_failed",
+            detail: "search session cleanup was incomplete; raw receipts remain at \(output)"
+        )
+    }
+    if failedTrials > 0 {
+        let hostDetail = hostStable ? "" : " and host state changed"
+        return BenchError(
+            code: "measurement_invalid",
+            detail: "\(failedTrials) search trials failed\(hostDetail); raw receipts remain at \(output)"
+        )
+    }
+    guard hostStable else {
+        return BenchError(
+            code: "measurement_invalid",
+            detail: "host state changed during the search session; raw receipts remain at \(output)"
+        )
+    }
+    return nil
+}
+
+func searchMode(arguments: [String]) throws {
+    guard AXIsProcessTrusted() else { throw BenchError(code: "geometry_mismatch", detail: "Accessibility permission is required") }
+    guard CGPreflightScreenCaptureAccess() else { throw BenchError(code: "capture_denied", detail: "Screen Recording permission is required") }
+    installSignalHandlers()
+    let corpusPath = try required("--corpus", arguments)
+    let output = canonical(try required("--output", arguments)).path
+    let appPath = try required("--pdf-goat", arguments)
+    let documentIds = try required("--documents", arguments).split(separator: ",").map { String($0) }
+    let absentTerm = try option("--absent-term", arguments) ?? "pdfgoatxyznotpresentqqzz"
+    let traceOutput = findTracePath(for: output)
+    guard !FileManager.default.fileExists(atPath: traceOutput) else {
+        throw UsageError(description: "find signpost output exists: \(traceOutput)")
+    }
+    let app = try identifyApp(id: "pdf-goat", role: "subject", path: appPath)
+    let manifest = try loadManifest(canonical(corpusPath).appendingPathComponent("corpus.json").path)
+    let requested = try documentIds.map { id -> Fixture in
+        guard let fixture = manifest.documents.first(where: { $0.documentId == id }) else {
+            throw BenchError(code: "corpus_mismatch", detail: "unknown document id \(id)")
+        }
+        return fixture
+    }
+    let session = UUID().uuidString
+    let temporary = URL(fileURLWithPath: output).deletingLastPathComponent().appendingPathComponent("search-session-\(session)")
+    try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let filtered = Manifest(generatorSchemaVersion: manifest.generatorSchemaVersion, marker: manifest.marker, documents: requested)
+    let documents = try copyDocuments(manifest: filtered, corpusPath: corpusPath, destination: temporary)
+    let startHost = try host()
+    let writer = try RawWriter(output)
+    try writer.append(SearchSessionReceipt(
+        record: "search_session", schemaVersion: schemaVersion, sessionId: session,
+        startedAtUtc: ISO8601DateFormatter().string(from: Date()), scriptSha256: try digestFile(#filePath),
+        argv: CommandLine.arguments, host: startHost, appId: app.id, app: app.receipt,
+        documentIds: documents.map(\.documentId), absentTerm: absentTerm
+    ))
+    var sequence = 0
+    var failures = 0
+    var processIDs: Set<pid_t> = []
+    for pdf in documents {
+        sequence += 1
+        let receipt = searchTrial(session: session, sequence: sequence, app: app, pdf: pdf, marker: manifest.marker, absentTerm: absentTerm)
+        if receipt.status != "valid" { failures += 1 }
+        if let pid = receipt.process?.pid { processIDs.insert(pid) }
+        try writer.append(receipt)
+    }
+    let endHost = try host()
+    if !processIDs.isEmpty {
+        let trace = try captureFindTrace(processIDs: processIDs)
+        try writeFindTrace(trace.data, to: traceOutput)
+    }
+    let stability = hostStateMatches(startHost, endHost)
+    let cleanupComplete = removeSessionDirectory(temporary)
+    let failure = searchSessionFailure(
+        failedTrials: failures,
+        hostStable: stability.stable,
+        cleanupComplete: cleanupComplete,
+        output: output
+    )
+    let complete = failure == nil
+    try writer.append(SearchSessionEndReceipt(
+        record: "search_session_end", schemaVersion: schemaVersion, sessionId: session,
+        finishedAtUtc: ISO8601DateFormatter().string(from: Date()), outcome: complete ? "complete" : "aborted",
+        trialCount: documents.count, failedTrials: failures, powerSourceUnchanged: stability.power,
+        displayUnchanged: stability.display, lowPowerModeUnchanged: stability.lowPowerMode,
+        thermalStateUnchanged: stability.thermalState, cleanupComplete: cleanupComplete
+    ))
+    try writer.close()
+    if let failure { throw failure }
+    print("complete search session \(session): \(documents.count) trials, \(failures) failed")
+}
+
 // MARK: Summary and self-test
 
 struct SummaryMetric: Codable {
@@ -1961,6 +2600,75 @@ func selfTest() throws {
         print("fixture \(fixture.fileName) sha256=\(digest(data)) bytes=\(data.count)")
     }
     _ = try checkedCorpus(manifest)
+    let realMatchStatus = parseMatchStatus("1 of 5628")
+    try check(realMatchStatus?.index == 1 && realMatchStatus?.count == 5628, "real match status")
+    try check(parseMatchStatus("1 of 5628…") == nil, "transient match status")
+    try check(parseMatchStatus("garbage") == nil, "garbage match status")
+    try check(
+        isTransientFindStatus("") &&
+            isTransientFindStatus("Searching…") &&
+            isTransientFindStatus("1 of 5628…") &&
+            !isTransientFindStatus("No Results"),
+        "transient find status detection"
+    )
+    let stableStatus = stableStatusPredicate(from: "No Results")
+    try check(
+        !stableStatus("No Results") &&
+            !stableStatus("No Results") &&
+            !stableStatus("Searching…") &&
+            !stableStatus("1 of 2") &&
+            stableStatus("1 of 2"),
+        "baseline-aware stable status predicate"
+    )
+    let changedTerminalStatus = stableStatusPredicate(from: "1 of 2")
+    try check(
+        !changedTerminalStatus("2 of 2") && changedTerminalStatus("2 of 2"),
+        "stable status accepts a changed terminal value"
+    )
+    try check(
+        topCountTerm(["apple": 2, "middle": 5, "zebra": 1]) == "middle",
+        "search term chooses the highest count"
+    )
+
+    let interactionReceipt = SearchInteractionReceipt(
+        kind: "restore_present_term", query: "apple", tSentNs: 100, tObservedNs: 200, latencyNs: 100,
+        finalStatus: "1 of 1", windowInteractiveDuringWait: true, statusPollCount: 2, maxStatusRoundTripNs: 3
+    )
+    let interactionData = try jsonData(interactionReceipt)
+    let expectedInteractionData = Data(#"{"final_status":"1 of 1","kind":"restore_present_term","latency_ns":100,"max_status_round_trip_ns":3,"query":"apple","status_poll_count":2,"t_observed_ns":200,"t_sent_ns":100,"window_interactive_during_wait":true}"#.utf8)
+    try check(interactionData == expectedInteractionData, "search interaction receipt shape")
+    let missingInteractiveData = Data(#"{"final_status":"1 of 1","kind":"restore_present_term","latency_ns":100,"max_status_round_trip_ns":3,"query":"apple","status_poll_count":2,"t_observed_ns":200,"t_sent_ns":100}"#.utf8)
+    let missingPollCountData = Data(#"{"final_status":"1 of 1","kind":"restore_present_term","latency_ns":100,"max_status_round_trip_ns":3,"query":"apple","t_observed_ns":200,"t_sent_ns":100,"window_interactive_during_wait":true}"#.utf8)
+    let missingRoundTripData = Data(#"{"final_status":"1 of 1","kind":"restore_present_term","latency_ns":100,"query":"apple","status_poll_count":2,"t_observed_ns":200,"t_sent_ns":100,"window_interactive_during_wait":true}"#.utf8)
+    try check((try? decoder.decode(SearchInteractionReceipt.self, from: missingInteractiveData)) == nil, "interactive status is required in search receipts")
+    try check((try? decoder.decode(SearchInteractionReceipt.self, from: missingPollCountData)) == nil, "status poll count is required in search receipts")
+    try check((try? decoder.decode(SearchInteractionReceipt.self, from: missingRoundTripData)) == nil, "status round trip is required in search receipts")
+
+    let closeReceipt = CloseReceipt(requestCount: 1, tRequestNs: 300, tConfirmNs: 400, windowGone: true)
+    var navigationCalls = 0
+    var closeCalls = 0
+    let oneMatchCompletion = try completeSearch(
+        restored: interactionReceipt,
+        matchCount: 1,
+        navigation: {
+            navigationCalls += 1
+            return []
+        },
+        close: {
+            closeCalls += 1
+            return closeReceipt
+        }
+    )
+    try check(
+        oneMatchCompletion.interactions.count == 1 &&
+            oneMatchCompletion.interactions[0].kind == "restore_present_term" &&
+            oneMatchCompletion.interactions[0].finalStatus == "1 of 1" &&
+            navigationCalls == 0 && closeCalls == 1 && oneMatchCompletion.close.windowGone,
+        "one-match search skips navigation and completes close"
+    )
+    try check(topCountTerm(["report": 2, "figure": 2, "section": 2]) == "figure", "deterministic search term tie-break")
+    let changedStatus = try matchIndexChangedPredicate(from: "1 of 2")
+    try check(!changedStatus("1 of 2") && changedStatus("2 of 2"), "match index predicate")
     try check(markerScore(synthetic(marker: manifest.marker, correct: true), marker: manifest.marker) != nil, "valid marker")
     try check(markerScore(synthetic(marker: manifest.marker, correct: false), marker: manifest.marker) == nil, "wrong adjacency")
     guard let oriented = orientedImage(synthetic(marker: manifest.marker, correct: true)),
@@ -2167,6 +2875,93 @@ func selfTest() throws {
         throw UsageError(description: "self-test failed: \(message)")
     }
 
+    func traceEvent(_ type: String, _ name: String, atNs: UInt64) -> FindTraceEvent {
+        FindTraceEvent(
+            signpostType: type,
+            signpostName: name,
+            processID: 42,
+            machTimestamp: atNs * UInt64(timebase.denom) / UInt64(timebase.numer)
+        )
+    }
+    let submissions = [
+        FindSubmission(kind: "present_term", query: "apple", sentNs: 100_000_000_000, requiresCancellation: false),
+        FindSubmission(kind: "absent_term", query: "missing", sentNs: 200_000_000_000, requiresCancellation: false),
+        FindSubmission(kind: "rapid_replacement_source", query: "apple", sentNs: 300_000_000_000, requiresCancellation: true),
+        FindSubmission(kind: "rapid_replacement", query: "missing", sentNs: 400_000_000_000, requiresCancellation: false),
+        FindSubmission(kind: "restore_present_term", query: "apple", sentNs: 500_000_000_000, requiresCancellation: false),
+        FindSubmission(kind: "close_during_search", query: "apple", sentNs: 600_000_000_000, requiresCancellation: true),
+    ]
+    let trace = [
+        traceEvent("begin", "find.query", atNs: 110_000_000_000),
+        traceEvent("end", "find.query", atNs: 120_000_000_000),
+        traceEvent("begin", "find.query", atNs: 210_000_000_000),
+        traceEvent("end", "find.query", atNs: 220_000_000_000),
+        traceEvent("begin", "find.query", atNs: 310_000_000_000),
+        traceEvent("event", "find.cancelled", atNs: 315_000_000_000),
+        traceEvent("end", "find.query", atNs: 320_000_000_000),
+        traceEvent("begin", "find.query", atNs: 410_000_000_000),
+        traceEvent("end", "find.query", atNs: 420_000_000_000),
+        traceEvent("begin", "find.query", atNs: 510_000_000_000),
+        traceEvent("end", "find.query", atNs: 520_000_000_000),
+        traceEvent("begin", "find.query", atNs: 610_000_000_000),
+        traceEvent("event", "find.cancelled", atNs: 615_000_000_000),
+        traceEvent("end", "find.query", atNs: 620_000_000_000),
+    ]
+    try validateFindTrace(trace, submissions: submissions, observedAtNs: 700_000_000_000)
+    var duplicateTrace = trace
+    duplicateTrace.append(contentsOf: [
+        traceEvent("begin", "find.query", atNs: 650_000_000_000),
+        traceEvent("end", "find.query", atNs: 660_000_000_000),
+    ])
+    try expectBenchError("measurement_invalid", "duplicate query submission passed the multiplicity gate") {
+        try validateFindTrace(duplicateTrace, submissions: submissions, observedAtNs: 700_000_000_000)
+    }
+    let missingReplacementCancellation = trace.filter {
+        !($0.signpostName == "find.cancelled" && traceTimestampNs($0) >= 315_000_000_000 && traceTimestampNs($0) < 320_000_000_000)
+    }
+    try expectBenchError("measurement_invalid", "missing replacement cancellation passed the trace gate") {
+        try validateFindTrace(missingReplacementCancellation, submissions: submissions, observedAtNs: 700_000_000_000)
+    }
+    try expectBenchError("measurement_invalid", "failed search trial was reported as cleanup failure") {
+        if let failure = searchSessionFailure(
+            failedTrials: 1,
+            hostStable: true,
+            cleanupComplete: true,
+            output: "/raw.jsonl"
+        ) {
+            throw failure
+        }
+    }
+    try expectBenchError("measurement_invalid", "unstable search host was reported as cleanup failure") {
+        if let failure = searchSessionFailure(
+            failedTrials: 0,
+            hostStable: false,
+            cleanupComplete: true,
+            output: "/raw.jsonl"
+        ) {
+            throw failure
+        }
+    }
+    try expectBenchError("cleanup_failed", "incomplete search cleanup lost its failure code") {
+        if let failure = searchSessionFailure(
+            failedTrials: 0,
+            hostStable: true,
+            cleanupComplete: false,
+            output: "/raw.jsonl"
+        ) {
+            throw failure
+        }
+    }
+    try check(
+        searchSessionFailure(
+            failedTrials: 0,
+            hostStable: true,
+            cleanupComplete: true,
+            output: "/raw.jsonl"
+        ) == nil,
+        "valid search session reported a failure"
+    )
+
     let fake = (0..<4).map { testApp("a\($0)") }
     let docs = [testDocument("tiny"), testDocument("mixed")]
     let plan = schedule(apps: fake, documents: docs, freshRuns: 5, warmRuns: 3)
@@ -2330,6 +3125,7 @@ usage:
   swift benchmarks/pdf_benchmark.swift generate --output DIR
   swift benchmarks/pdf_benchmark.swift self-test
   swift benchmarks/pdf_benchmark.swift run --corpus DIR --output RAW.jsonl --pdf-goat APP [--preview APP] [--pdfgear APP] [--skim APP] [--fresh-runs 5] [--warm-runs 3]
+  swift benchmarks/pdf_benchmark.swift search --corpus DIR --output SEARCH.jsonl --pdf-goat APP --documents ferc,pst-geo [--absent-term TEXT]
   swift benchmarks/pdf_benchmark.swift summarize RAW.jsonl --output SUMMARY.json
 """
 
@@ -2374,6 +3170,9 @@ func main() throws {
     case "run":
         try rejectUnknown(rest, allowed: ["--corpus", "--output", "--pdf-goat", "--preview", "--pdfgear", "--skim", "--fresh-runs", "--warm-runs"])
         try runMode(arguments: rest)
+    case "search":
+        try rejectUnknown(rest, allowed: ["--corpus", "--output", "--pdf-goat", "--documents", "--absent-term"])
+        try searchMode(arguments: rest)
     case "summarize":
         guard let input = rest.first, !input.hasPrefix("--") else { throw UsageError(description: usage) }
         let options = Array(rest.dropFirst())

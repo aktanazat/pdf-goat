@@ -251,7 +251,23 @@ The thumbnail view is the only memory PDF Goat can hand back: PDFKit exposes no
 API for its tile cache or decoded pages. A memory-pressure warning removes the
 thumbnail view from every document window; the return to normal rebuilds it,
 which emits `sidebar.ready` again. Read one launch with
-`log show --last 2m --signpost --predicate 'subsystem == "dev.aktan.pdfgoat"'`.
+`log show --last 2m --signpost --predicate 'subsystem == "dev.aktan.pdfgoat" AND category == "launch"'`.
+
+### Find signposts
+
+The interactive find lane signposts on subsystem `dev.aktan.pdfgoat`, category
+`find`. These events describe a user-driven PDFKit scan rather than document
+launch.
+
+| Name | Kind | What it bounds |
+| --- | --- | --- |
+| `find.query` | interval | From a find query starting until PDFKit reports that the scan ended or the query is cancelled. |
+| `find.first-hit` | point | The first match delivered for the active query. |
+| `find.cancelled` | point | A find query cancelled before its scan completed. |
+
+A cancelled query still ends its interval and is marked by `find.cancelled`. A
+`begin find.query` with no `end` means the scan is still running or the
+process went away.
 
 ## Failure model and recovery
 
