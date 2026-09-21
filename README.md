@@ -4,8 +4,8 @@ Local PDF tooling for macOS and Linux. One CLI covers inspection, page edits,
 conversion, extraction, security, and repair. A native macOS app opens the same
 files in a read-only PDFKit viewer.
 
-No account and no upload. The CLI has no networking code; only the first-run
-dependency install reaches the network.
+No account and no document upload. Dependency installation and the explicit
+`setup meaning` model download use the network. Searching stays local.
 
 ## Install
 
@@ -37,7 +37,7 @@ pdf-goat security sign contract.pdf -o signed.pdf
 pdf-goat render report.pdf --pages 1 --dpi 150 -o renders
 ```
 
-`pdf-goat --help` lists all 39 command families, and `pdf-goat <family> --help`
+`pdf-goat --help` lists the command families, and `pdf-goat <family> --help`
 lists their verbs. Every run is appended to a SQLite ledger at
 `~/.pdf-goat/ledger.db`; read it with `pdf-goat jobs`.
 
@@ -90,7 +90,24 @@ pdf-goat --agent transcript read transcript.pdf --conferred 2026-06-12
 open ".build/PDF Goat.app" --args /path/to/document.pdf
 ```
 
-The app opens local PDF files. It does not edit them yet.
+The app opens local PDF files without editing them. Cmd-F opens word search
+below the toolbar. Cmd-Shift-F selects meaning search. Press Return to search,
+Cmd-G or Cmd-Shift-G to move between results, and Escape to close the bar.
+Search uses the CLI installed at `~/.local/bin/pdf-goat`.
+
+Meaning search needs a one-time setup:
+
+```sh
+uv sync --project ~/Documents/projects/pdf-goat --extra meaning
+pdf-goat setup meaning
+pdf-goat search report.pdf "spending plan" --meaning --limit 5
+```
+
+The pinned local model ranks extracted passages, including ones that do not
+contain the query words. A high rank is not proof of a match. The app highlights
+each result in the original PDF so you can read it in context. Scanned pages
+need OCR before they can be searched.
+
 [System design](docs/SYSTEM.md), [agent protocol](docs/AGENT_PROTOCOL.md),
 [feature ledger](docs/FEATURES.md), and [implementation plan](docs/PLAN.md)
 define the target system.

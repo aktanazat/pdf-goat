@@ -184,6 +184,11 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         let (item, menu) = submenu(named: "Edit")
         menu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         menu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Find…", action: #selector(DocumentWindowController.findWords(_:)), keyEquivalent: "f")
+        menu.addItem(withTitle: "Find by Meaning…", action: #selector(DocumentWindowController.findMeaning(_:)), keyEquivalent: "f").keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(withTitle: "Find Next", action: #selector(DocumentWindowController.nextFindResult(_:)), keyEquivalent: "g")
+        menu.addItem(withTitle: "Find Previous", action: #selector(DocumentWindowController.previousFindResult(_:)), keyEquivalent: "g").keyEquivalentModifierMask = [.command, .shift]
         return item
     }
 

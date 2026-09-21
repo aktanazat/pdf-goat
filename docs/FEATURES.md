@@ -60,6 +60,7 @@ feature can change a user file.
 | Search results sidebar | Native | 2 | Shows bounded excerpts, page IDs, and geometry with keyboard navigation |
 | Text selection and copy | Native | 1 | Preserves Unicode text where the PDF exposes it |
 | Exact, case, whole-word, and regular-expression search | Native | 2 | Results are revision-bound and reusable by later commands |
+| Opt-in meaning search over extracted passages | Extended | 4 | Stays off until `--meaning` asks for it, needs an explicit setup step to place a pinned local model on disk, ranks every passage with no score cutoff, and returns the page and rectangle geometry literal search returns |
 | Back and forward navigation history | Native | 1 | Link and search navigation can return to the prior view |
 | Internal and external links | Native | 2 | Inspects destinations before opening external URLs |
 | Attachments and portfolios as a list | Native | 3 | Lists and extracts attachments without executing content |
@@ -209,7 +210,8 @@ These stay out unless the user supplies a new concrete workflow that changes the
 - Template stores and generic document CRM features.
 - Embedded JavaScript execution.
 - XFA, 3D, multimedia, and geospatial PDF authoring.
-- Automatic summaries, inferred user preferences, embeddings, and a general memory store unless a concrete workflow shows that explicit findings and full-text search are insufficient.
+- Automatic summaries, inferred user preferences, and a general memory store.
+- Embeddings as a default, as a background index, or as a stored derived corpus. The one admitted case is the opt-in meaning search above. Its concrete workflow: a reader remembers the idea and not the wording, asks a long report for its spending plan, and literal search returns nothing because the page says budget. The command ranks the passages already extracted for that page, stores no passage vectors, and leaves literal search unchanged.
 - Custom themes, custom title bars, decorative motion, and nonstandard controls.
 
 ## Sources

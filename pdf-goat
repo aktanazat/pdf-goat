@@ -13,7 +13,7 @@ stamp="$venv/.synced"
 if [ ! -x "$venv/bin/pdf-goat-cli" ] || [ ! -e "$stamp" ] \
   || [ "$dir/uv.lock" -nt "$stamp" ] \
   || [ "$dir/pyproject.toml" -nt "$stamp" ]; then
-  uv sync --project "$dir" --quiet
+  uv sync --project "$dir" --inexact --quiet
   touch "$stamp"
 fi
 export VIRTUAL_ENV="$venv" PATH="$venv/bin:$PATH"

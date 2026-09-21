@@ -20,6 +20,14 @@ dependencies = [
     "python-docx>=1.1",
 ]
 
+[project.optional-dependencies]
+# Only `pdf-goat search --meaning` needs these. The model itself is not a
+# package: install it with `pdf-goat setup meaning`.
+meaning = [
+    "tokenizers>=0.15",
+    "numpy>=1.24",
+]
+
 [project.scripts]
 pdf-goat-cli = "pdf_goat.cli:main"
 
