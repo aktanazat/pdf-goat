@@ -440,6 +440,49 @@ def _cached_word_columns(value):
     return text, starts, rects, lines
 
 
+def _word_passages(words):
+    """Group extracted words into their PDF text blocks, in reading order.
+
+    One entry per block: the block number, the rectangle covering every word
+    in it, and its text with a newline between PDF lines. Meaning search ranks
+    these, so a ranked passage carries the same geometry a literal hit does.
+    """
+    from itertools import groupby
+
+    text, starts, rects, lines = words
+    if not starts:
+        return []
+    count = len(starts)
+
+    def word_text(index):
+        end = starts[index + 1] - 1 if index + 1 < count else len(text)
+        return text[starts[index] : end]
+
+    passages = []
+    for block, block_indices in groupby(
+        range(count), key=lambda index: lines[index * 2]
+    ):
+        indices = list(block_indices)
+        passages.append(
+            {
+                "block": block,
+                "rect": [
+                    round(min(rects[index * 4] for index in indices), 1),
+                    round(min(rects[index * 4 + 1] for index in indices), 1),
+                    round(max(rects[index * 4 + 2] for index in indices), 1),
+                    round(max(rects[index * 4 + 3] for index in indices), 1),
+                ],
+                "text": "\n".join(
+                    " ".join(word_text(index) for index in line)
+                    for _, line in groupby(
+                        indices, key=lambda index: lines[index * 2 + 1]
+                    )
+                ),
+            }
+        )
+    return passages
+
+
 def _page_hits(words, pattern):
     """Return rectangles for pattern matches, split at PDF text lines."""
     from bisect import bisect_left, bisect_right
@@ -514,6 +557,11 @@ def _task_search(doc, index, query):
     return _search_columns(words, query), words
 
 
+def _task_passages(doc, index, _arg):
+    words = _page_words(doc[index])
+    return _word_passages(words), words
+
+
 def _task_layout(doc, index, _arg):
     return extract_page_layout(doc[index])
 
@@ -564,6 +612,7 @@ _PAGE_TASKS = {
     "text": _task_text,
     "count": _task_count,
     "search": _task_search,
+    "passages": _task_passages,
     "layout": _task_layout,
     "inventory": _task_inventory,
     "preflight": _task_preflight,
@@ -571,6 +620,10 @@ _PAGE_TASKS = {
     "render": _task_render,
     "visual": _task_visual_diff,
 }
+
+# Tasks that read a page's words: they return their own result plus the word
+# columns, and share one cached form.
+_WORD_TASKS = frozenset({"search", "passages"})
 
 _worker_doc = None
 _worker_cache = None
@@ -593,14 +646,14 @@ def _cache_form(task, arg):
         return "text"
     if task == "count":
         return "count"
-    if task == "search":
+    if task in _WORD_TASKS:
         return "words"
     return None
 
 
 def _extract_page(task, doc, index, arg, collect_cache=False):
     value = _PAGE_TASKS[task](doc, index, arg)
-    if task == "search":
+    if task in _WORD_TASKS:
         result, words = value
         cache_value = (words[0], words[2], words[3]) if collect_cache else None
         return result, cache_value
@@ -754,9 +807,17 @@ def _live_page_values(src, task, arg, page_spec=None):
         return page_count, map_pages(doc, src, task, selected, arg)
 
 
-def _cache_value(form, value, arg):
+def _cache_value(task, form, value, arg):
+    """Project a cached page entry into what the task asked for.
+
+    Search and meaning search share the cached "words" form: one pays for the
+    extraction, both read it.
+    """
     if form == "words":
-        return _search_columns(_cached_word_columns(value), arg)
+        columns = _cached_word_columns(value)
+        if task == "passages":
+            return _word_passages(columns)
+        return _search_columns(columns, arg)
     return value
 
 
@@ -783,7 +844,8 @@ def _cache_page_values(src, task, arg, form, no_cache, page_spec=None):
             )
             cached = cache.lookup(key, form, selected)
             values = {
-                index: _cache_value(form, value, arg) for index, value in cached.items()
+                index: _cache_value(task, form, value, arg)
+                for index, value in cached.items()
             }
             missing = [
                 index for index in dict.fromkeys(selected) if index not in values
@@ -3695,11 +3757,72 @@ def _search_live_limited(src, page_spec, query, limit):
     return hits, truncated
 
 
+def _search_by_meaning(src, a, limit):
+    """Rank every text block in the page range by closeness to the query.
+
+    Literal search answers "where do these characters appear". This answers
+    "which passages are about this", so a query can use different words than
+    the page does. It reads the same cached words literal search caches, so
+    asking both ways costs one extraction.
+    """
+    from . import meaning
+
+    try:
+        model = meaning.load(HOME)
+    except meaning.MeaningError as error:
+        raise PdfGoatError(str(error)) from error
+
+    page_count, passage_pages = _cache_page_values(
+        src, "passages", None, "words", a.no_cache, a.pages
+    )
+    indices = list(parse_pages(a.pages, page_count) if a.pages else range(page_count))
+    candidates = [
+        {
+            "page": index + 1,
+            "block": passage["block"],
+            "rect": passage["rect"],
+            "text": passage["text"],
+        }
+        for index, passages in zip(indices, passage_pages)
+        for passage in passages
+        if passage["text"].strip()
+    ]
+    for candidate, score in zip(
+        candidates, model.score(a.query, [hit["text"] for hit in candidates])
+    ):
+        candidate["score"] = round(score, 4)
+    # Every candidate is ranked and none is dropped for scoring low: what
+    # counts as a weak match depends on the document, and a caller that only
+    # wants the best few says so with --limit and still learns how many there
+    # were.
+    ranked = sorted(
+        candidates, key=lambda hit: (-hit["score"], hit["page"], hit["block"])
+    )
+    return {
+        "verb": "search",
+        "inputs": [str(src)],
+        "outputs": [],
+        "query": a.query,
+        "mode": "meaning",
+        "count": len(ranked) if limit is None else min(limit, len(ranked)),
+        "candidates": len(candidates),
+        "hits": ranked if limit is None else ranked[:limit],
+        "truncated": limit is not None and len(ranked) > limit,
+        "model": {
+            "id": meaning.MODEL_ID,
+            "revision": meaning.MODEL_REVISION,
+            "dim": model.dim,
+        },
+    }
+
+
 def cmd_search(a):
     src = resolve(a.file)
     limit = a.limit
     if limit is not None and limit < 1:
         raise PdfGoatError("--limit must be 1 or more")
+    if a.meaning:
+        return _search_by_meaning(src, a, limit)
 
     if limit is None:
         page_count, rect_pages = _cache_page_values(
@@ -3756,7 +3879,9 @@ def cmd_search(a):
                         cached = cache.lookup(key, "words", batch)
                         for position, index in enumerate(batch, start=offset):
                             if index in cached:
-                                rects = _cache_value("words", cached[index], a.query)
+                                rects = _cache_value(
+                                    "search", "words", cached[index], a.query
+                                )
                             else:
                                 if doc is None:
                                     import pymupdf
@@ -3799,9 +3924,52 @@ def cmd_search(a):
         "inputs": [str(src)],
         "outputs": [],
         "query": a.query,
+        "mode": "literal",
         "count": len(hits),
         "hits": hits,
         "truncated": truncated,
+    }
+
+
+def cmd_setup_meaning(a):
+    from . import meaning
+
+    try:
+        installed = meaning.install(
+            HOME, log=lambda line: print(f"pdf-goat: {line}", file=sys.stderr), force=a.force
+        )
+    except meaning.MeaningError as error:
+        raise PdfGoatError(str(error)) from error
+    return {
+        "verb": "setup meaning",
+        "inputs": [],
+        "outputs": [installed["directory"]],
+        "model": {
+            "id": meaning.MODEL_ID,
+            "revision": meaning.MODEL_REVISION,
+            "license": meaning.MODEL_LICENSE,
+        },
+        "files": installed["files"],
+    }
+
+
+def cmd_setup_status(_a):
+    from . import meaning
+
+    report = meaning.status(HOME)
+    return {
+        "verb": "setup status",
+        "inputs": [],
+        "outputs": [],
+        "installed": report["installed"],
+        "model": {
+            "id": report["id"],
+            "revision": report["revision"],
+            "license": report["license"],
+            "dim": report["dim"],
+        },
+        "directory": report["directory"],
+        "files": report["files"],
     }
 
 
@@ -4389,6 +4557,12 @@ def _add_misc(sub):
     p.add_argument("--limit", type=int, help="stop after this many hits")
     p.add_argument("--pages", help="default: all pages")
     p.add_argument("--no-cache", action="store_true", help="skip the text cache")
+    p.add_argument(
+        "--meaning",
+        action="store_true",
+        help="rank passages by meaning instead of matching characters "
+        "(needs: pdf-goat setup meaning)",
+    )
     p.set_defaults(func=cmd_search)
     p = sub.add_parser("overlay", help="stamp one PDF over another")
     p.add_argument("file")
@@ -4399,6 +4573,14 @@ def _add_misc(sub):
     p.add_argument("file")
     p.add_argument("--no-cache", action="store_true", help="skip the text cache")
     p.set_defaults(func=cmd_count)
+    ns = _ns(sub, "setup", "install the optional local model")
+    p = ns.add_parser("meaning", help="download the model meaning search needs")
+    p.add_argument(
+        "--force", action="store_true", help="download again over the installed files"
+    )
+    p.set_defaults(func=cmd_setup_meaning)
+    p = ns.add_parser("status", help="report whether the meaning model is installed")
+    p.set_defaults(func=cmd_setup_status)
 
 
 # --------------------------------------------------------------------------- #

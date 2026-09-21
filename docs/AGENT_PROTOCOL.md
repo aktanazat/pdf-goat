@@ -92,6 +92,18 @@ an unlimited search over the same store also reports false with a short hit
 list. Hits and their page numbers come from real pages either way.
 `--no-cache` reads the file.
 
+`search --meaning QUERY` ranks passages instead of matching characters, so a query can use words the page does not. Without `--meaning` nothing about search changes. The unit is the text block the extractor already produces: a hit carries `page`, `block`, `rect`, `text`, and `score`. Its rectangle agrees with the block rectangle `get text-blocks` reports within the word-cache rounding described below.
+
+Every passage on the selected pages is scored and returned in score order. There is no score cutoff, so weak or negative scores still appear. `candidates` reports how many passages were ranked. A document that never discusses the query still returns a first hit. The score measures model similarity, not match confidence, and rank only compares the passages in this document.
+
+`--limit N` and `--first` keep the best N and set `truncated`; `candidates` still reports the full number ranked. `--pages` and `--no-cache` behave as they do for literal search. Both modes fill the same cached words, so asking one document both ways extracts it once. Every search result carries `mode`, either `literal` or `meaning`. A meaning result also carries `model` with the model id, the pinned revision, and the vector width.
+
+Meaning search never reaches the network and never truncates a passage. Upstream Model2Vec inference stops at 512 tokens by default; a passage longer than that is embedded whole here, so a dense page contributes its last paragraph as well as its first. The model has to be on disk first: `setup meaning` downloads the pinned revision, checks every file against a recorded size and SHA-256, and writes progress to stderr; `setup status` reports what is installed. A search with the model absent, or with the optional dependencies absent, fails with the command or the install line that fixes it.
+
+### Rectangle coordinates
+
+Every `rect` a result carries is `[x0, y0, x1, y1]` in points on the page's crop box, measured from its top-left corner with y increasing downward. `/Rotate` is ignored: a page rotated 90 or 270 degrees returns the same rectangle it returns unrotated, because extraction reads the unrotated page. To place a rectangle in PDF user space, the space of `/MediaBox`, `/CropBox` and an annotation `/Rect`, add the crop box origin and flip once about the crop box top: `pdf_x = crop.x0 + x` and `pdf_y = crop.y1 - y`, where `crop` is the page's `/CropBox`, or its `/MediaBox` when the page sets no crop box. Two shortcuts are wrong: flipping about the displayed page height misses a cropped or origin-shifted page, and inverting MuPDF's page transformation matrix misses a page that combines an offset crop box with a nonzero `/Rotate`. Search rectangles are unions of cached word boxes rounded to 0.1 pt; `get text-blocks` reports the extractor's own block box unrounded, and the two agree within that rounding.
+
 `preflight` reports a page in its `empty_pages` finding when the page declares no font and no image. It does not extract page text, so a page that declares a font but draws no glyphs is not reported empty, and neither is a blank page whose font resources are inherited from the page tree.
 
 `text` with `-o` and without `--layout` streams the page text to that file. The result then reports `page_count` and the file path in `outputs`, and carries no `pages` list. Without `-o` the result carries the per-page text in `pages`. `--layout` always returns the per-page layout in `pages`, with or without `-o`.

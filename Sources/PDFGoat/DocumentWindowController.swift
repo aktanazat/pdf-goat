@@ -25,6 +25,7 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
     private static let zoomStep: CGFloat = 1.189207115
 
     private let pdfView = PDFView()
+    private lazy var documentSearch = DocumentSearch(pdfView: pdfView)
     private let sidebar = NSVisualEffectView()
     private let splitViewController = NSSplitViewController()
     private var thumbnailView: PDFThumbnailView?
@@ -78,6 +79,26 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc func findWords(_: NSObject?) {
+        documentSearch.show(meaning: false)
+    }
+
+    @objc func findMeaning(_: NSObject?) {
+        documentSearch.show(meaning: true)
+    }
+
+    @objc func nextFindResult(_: NSObject?) {
+        documentSearch.move(by: 1)
+    }
+
+    @objc func previousFindResult(_: NSObject?) {
+        documentSearch.move(by: -1)
+    }
+
+    @objc private func documentWindowWillClose(_: Notification) {
+        documentSearch.close()
     }
 
     /// Drops the thumbnail view and its PDFKit-rendered images. The only
@@ -312,7 +333,21 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
         sidebarItem.holdingPriority = .defaultHigh
 
         let canvasController = NSViewController()
-        canvasController.view = pdfView
+        let canvas = NSView()
+        let searchView = documentSearch.view
+        canvas.addSubview(searchView)
+        canvas.addSubview(pdfView)
+        pdfView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            searchView.topAnchor.constraint(equalTo: canvas.safeAreaLayoutGuide.topAnchor),
+            searchView.leadingAnchor.constraint(equalTo: canvas.leadingAnchor),
+            searchView.trailingAnchor.constraint(equalTo: canvas.trailingAnchor),
+            pdfView.topAnchor.constraint(equalTo: searchView.bottomAnchor),
+            pdfView.leadingAnchor.constraint(equalTo: canvas.leadingAnchor),
+            pdfView.trailingAnchor.constraint(equalTo: canvas.trailingAnchor),
+            pdfView.bottomAnchor.constraint(equalTo: canvas.bottomAnchor),
+        ])
+        canvasController.view = canvas
         let canvasItem = NSSplitViewItem(viewController: canvasController)
         canvasItem.minimumThickness = 480
 
@@ -381,6 +416,10 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
     }
 
     private func observePageChanges() {
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(documentWindowWillClose(_:)),
+            name: NSWindow.willCloseNotification, object: window
+        )
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(pageChanged(_:)),
@@ -554,6 +593,8 @@ final class DocumentWindowController: NSWindowController, NSToolbarDelegate, @Ma
             return pdfView.canGoForward
         case #selector(focusPageField(_:)):
             return pageField?.window != nil
+        case #selector(nextFindResult(_:)), #selector(previousFindResult(_:)):
+            return documentSearch.hasResults
         default:
             return true
         }
