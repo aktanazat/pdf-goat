@@ -4649,6 +4649,43 @@ def _add_transcript(sub):
     p.set_defaults(func=cmd_transcript_resolve, glob=None)
 
 
+def cmd_office(a):
+    from .office import OfficeError, run_office
+
+    source = resolve(a.file) if a.file is not None else None
+    script = resolve(a.script) if a.script is not None else None
+    output = Path(a.output).expanduser().resolve() if a.output is not None else None
+    try:
+        result = run_office(
+            source=source, kind=a.new, script=script, output=output, timeout=a.timeout
+        )
+    except OfficeError as error:
+        raise PdfGoatError(str(error)) from error
+    return {
+        "verb": a.office_verb,
+        "inputs": [str(path) for path in (source, script) if path is not None],
+        "outputs": [str(output)] if output is not None else [],
+        **result,
+    }
+
+
+def _add_office(sub):
+    ns = _ns(sub, "office", "create, edit, and export with LibreOffice (macOS)")
+    p = ns.add_parser("run", help="run a trusted Python script on a document")
+    p.add_argument("script", help="Python file; receives document, desktop, uno, prop")
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input", dest="file", help="edit a private copy of this document")
+    source.add_argument("--new", choices=("writer", "calc", "impress"))
+    p.add_argument("-o", "--output", help="save a new Office file or PDF; omit to inspect")
+    p.add_argument("--timeout", type=int, default=120, help="job limit in seconds")
+    p.set_defaults(func=cmd_office, office_verb="office-run")
+    p = ns.add_parser("export", help="export an Office document without a script")
+    p.add_argument("file")
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("--timeout", type=int, default=120, help="job limit in seconds")
+    p.set_defaults(func=cmd_office, office_verb="office-export", script=None, new=None)
+
+
 def build_parser():
     p = PdfGoatArgumentParser(
         prog="pdf-goat", description="Local PDF editing and inspection tool"
@@ -4660,6 +4697,7 @@ def build_parser():
     )
     sub = p.add_subparsers(dest="cmd", required=True)
     _add_transcript(sub)
+    _add_office(sub)
 
     s = sub.add_parser("capabilities", help="discover command schemas for agents")
     s.add_argument("family", nargs="?", help="top-level command family")
