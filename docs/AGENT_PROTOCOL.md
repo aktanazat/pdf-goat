@@ -100,6 +100,34 @@ Every passage on the selected pages is scored and returned in score order. There
 
 Meaning search never reaches the network and never truncates a passage. Upstream Model2Vec inference stops at 512 tokens by default; a passage longer than that is embedded whole here, so a dense page contributes its last paragraph as well as its first. The model has to be on disk first: `setup meaning` downloads the pinned revision, checks every file against a recorded size and SHA-256, and writes progress to stderr; `setup status` reports what is installed. A search with the model absent, or with the optional dependencies absent, fails with the command or the install line that fixes it.
 
+### Standalone Office commands
+
+`office run SCRIPT --input FILE [-o OUTPUT]` runs a trusted local Python script
+against a private copy. `--new writer|calc|impress` replaces `--input` when
+creating a document. Without `-o`, the document is loaded read-only and the
+command does not save it. The script receives `document`, `desktop`, `uno`,
+and `prop(name, value)`; its own file runs as `__main__`.
+
+`office export FILE -o OUTPUT` saves through LibreOffice without an agent script.
+Both commands return `verb`, `inputs`, `outputs`, `stdout`, `stderr`, and
+`ok` in the normal standalone envelope. Script exceptions and timeout failures
+use the normal error envelope and a nonzero exit status. The default timeout
+is 120 seconds. `capabilities office` discloses both argument schemas.
+
+Outputs are DOCX/ODT/PDF for Writer, XLSX/ODS/PDF for Calc, and PPTX/ODP/PDF
+for Impress. Output aliases of the input or script, including hard links, are
+rejected. Each output is staged in a unique directory beside its destination
+and renamed only after LibreOffice exits successfully. A failed job leaves an
+existing destination unchanged. The input snapshot and temporary profile are
+deleted when the job ends.
+
+This macOS-only family is standalone, not a live-session command or a sandbox.
+Scripts have the caller's file and network access. Document macros and link
+updates are disabled during load; that does not restrict the supplied script.
+LibreOffice's document model is the editing API, including explicit formula
+recalculation through `document.calculateAll()`. Exported PDFs use the existing
+`text`, `search`, and `render` commands for independent inspection.
+
 ### Rectangle coordinates
 
 Every `rect` a result carries is `[x0, y0, x1, y1]` in points on the page's crop box, measured from its top-left corner with y increasing downward. `/Rotate` is ignored: a page rotated 90 or 270 degrees returns the same rectangle it returns unrotated, because extraction reads the unrotated page. To place a rectangle in PDF user space, the space of `/MediaBox`, `/CropBox` and an annotation `/Rect`, add the crop box origin and flip once about the crop box top: `pdf_x = crop.x0 + x` and `pdf_y = crop.y1 - y`, where `crop` is the page's `/CropBox`, or its `/MediaBox` when the page sets no crop box. Two shortcuts are wrong: flipping about the displayed page height misses a cropped or origin-shifted page, and inverting MuPDF's page transformation matrix misses a page that combines an offset crop box with a nonzero `/Rotate`. Search rectangles are unions of cached word boxes rounded to 0.1 pt; `get text-blocks` reports the extractor's own block box unrounded, and the two agree within that rounding.

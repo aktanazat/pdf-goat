@@ -156,6 +156,11 @@ Apple PDFKit supports text, button, and choice widgets. Full Acrobat form parity
 | Audio export | Extended | 4 | Uses system speech and saves page-linked narration metadata |
 | Scanner and Continuity Camera import | Native | 5 | Uses system capture and inserts reviewed pages into the working copy |
 
+The standalone macOS `office` commands already let a trusted agent script
+create and edit Writer, Calc, and Impress files, preserve the source, and
+export Office formats or PDF. This is separate from the native app milestones
+and does not add an interactive office suite to the app.
+
 ## Security, quality, and standards
 
 | Capability | Class | Milestone | Completion condition |

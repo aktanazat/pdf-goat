@@ -22,9 +22,10 @@ pdf-goat --help
 The launcher resolves its own location with `readlink -f` (macOS 12.3 or later,
 any Linux), so the clone can live anywhere. First run installs the Python
 dependencies through uv. On Linux, use the apt or dnf equivalents of the brew
-line. Three more tools cover four verbs: `from-html` and `from-md` need
-`weasyprint`, `convert` to Office formats needs `office2pdf-cli`, and `convert
-audio` needs the macOS `say` binary.
+line. `from-html` and `from-md` need `weasyprint`, `convert from-office`
+needs `office2pdf-cli`, and `convert audio` needs the macOS `say` binary.
+The `office` family uses LibreOffice for macOS, installed with
+`brew install --cask libreoffice` in `/Applications/LibreOffice.app`.
 
 ## Use
 
@@ -82,6 +83,47 @@ pdf-goat --agent capabilities pages
 pdf-goat --agent search report.pdf invoice --first
 pdf-goat --agent transcript read transcript.pdf --conferred 2026-06-12
 ```
+
+## Agent-driven Office editing
+
+Agents can create, inspect, and edit Writer documents, Calc spreadsheets, and
+Impress slides without opening a window. A trusted Python script gets the
+LibreOffice document model as `document`, plus `desktop`, `uno`, and
+`prop(name, value)` for UNO properties. The script runs inside LibreOffice's
+own Python runtime, so the CLI's Python packages are not available there.
+
+For example, save this as `edit.py` to replace text in a Writer document:
+
+```python
+replacement = document.createReplaceDescriptor()
+replacement.SearchString = "Draft"
+replacement.ReplaceString = "Reviewed"
+print(document.replaceAll(replacement))
+```
+
+```bash
+pdf-goat --agent capabilities office
+pdf-goat --agent office run edit.py --input report.docx -o reviewed.docx
+pdf-goat --agent office export reviewed.docx -o reviewed.pdf
+pdf-goat --agent office run create.py --new calc -o budget.xlsx
+```
+
+Use `--new writer`, `--new calc`, or `--new impress` to create a document.
+Omit `-o` when a script only inspects a file; its printed output is returned
+in the JSON `stdout` field. To recalculate formulas after editing Calc cells,
+the script can call `document.calculateAll()`.
+
+Writer saves DOCX, ODT, or PDF; Calc saves XLSX, ODS, or PDF; Impress saves
+PPTX, ODP, or PDF. Each job uses a private input copy and a temporary office
+profile. The command refuses an output that aliases its input or script.
+The destination is replaced only after the job succeeds. A timeout or command
+cancellation stops the job's office processes. `--timeout` defaults to 120 seconds.
+
+Only run scripts you trust: this is ordinary local Python, not a sandbox.
+Embedded document macros and automatic link updates are disabled on load;
+the supplied script still has your file and network access. Office format
+round-trips can change layout or unsupported features. Inspect the exported
+PDF before replacing an original. The native PDF viewer does not edit Office files.
 
 ## Native macOS app
 

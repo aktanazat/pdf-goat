@@ -111,6 +111,19 @@ metadata instead of base64 data.
 
 The MCP adapter is a thin local adapter over the native `pdf-goat` CLI. It does not contain PDF logic. It exposes a small set of workflow tools and discloses detailed command schemas on demand. This avoids loading dozens of feature-specific tool descriptions into every agent turn.
 
+### Standalone Office jobs (current)
+
+The macOS `office` family runs one headless LibreOffice process per command.
+The Python CLI owns the process group, timeout, input snapshot, temporary
+profile, and atomic output replacement. LibreOffice loads a private Python
+macro from that profile; the macro opens the snapshot, runs the explicitly
+supplied script, exports a new file, and closes the document. No listener,
+shared profile, or persistent service is used.
+
+This standalone scripting command has the caller's file and network access.
+It is not the restricted app-integrated worker described below and must not
+be dispatched as one. The native PDF viewer is unchanged.
+
 ### Existing Python transformer
 
 The current Python implementation covers merge, split, page operations, annotation, forms, security, conversion, optimization, accessibility, comparison, repair, and extraction. The target system uses it as the private worker for cold advanced jobs until native code covers an operation.
