@@ -209,4 +209,5 @@ an explicit app path: `--preview`, `--skim`, `--pdfgear`.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+AGPL-3.0, because pdf-goat builds on PyMuPDF, which is AGPL-3.0 licensed.
+See [LICENSE](LICENSE).
