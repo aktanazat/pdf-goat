@@ -4,14 +4,15 @@ use std::path::{Path, PathBuf};
 
 use clap::ArgMatches;
 use goat_common::args::{optional, required};
+use goat_common::parse::{parse_color, parse_point, parse_rect, selected_page};
 use goat_common::paths::{default_out, ensure_parent, out_dir, resolve};
 use goat_common::{Ctx, GoatError};
-use pdf_core::{Document, SaveOptions};
+use pdf_core::{Document, Point, Rect, SaveOptions};
 use pdf_forms::WidgetType;
 use pdf_text::{Block, TextFlags};
 use serde_json::{Map, Value};
 
-use crate::{EditError, edit_text, ooxml, plumber, pyfmt, redact};
+use crate::{EditError, edit_text, ooxml, place, plumber, pyfmt, redact};
 
 fn source(matches: &ArgMatches) -> Result<PathBuf, GoatError> {
     resolve(required::<String>(matches, "file")?)
@@ -294,5 +295,72 @@ pub(crate) fn pptx(matches: &ArgMatches, _ctx: &Ctx) -> Result<Map<String, Value
     write(&out, &ooxml::pptx(&slides))?;
     let mut result = receipt("convert-pptx", &src, &[out]);
     result.insert("slides".into(), slides.len().into());
+    Ok(result)
+}
+
+fn page_index(matches: &ArgMatches, doc: &Document) -> Result<usize, GoatError> {
+    selected_page(
+        *required::<i64>(matches, "page")?,
+        doc.page_count().map_err(EditError::from)?,
+    )
+}
+
+/// A `search`-frame box rounded to 0.1 pt, as `search` reports rectangles.
+fn frame_box(rect: Rect) -> Value {
+    let round = |v: f64| format!("{v:.1}").parse::<f64>().unwrap_or(v);
+    serde_json::json!([
+        round(rect.x0),
+        round(rect.y0),
+        round(rect.x1),
+        round(rect.y1)
+    ])
+}
+
+pub(crate) fn add_text(matches: &ArgMatches, _ctx: &Ctx) -> Result<Map<String, Value>, GoatError> {
+    let src = source(matches)?;
+    let out = output(matches, &src, "edited", "pdf")?;
+    let (x, y) = parse_point(required::<String>(matches, "at")?)?;
+    let color = parse_color(optional::<String>(matches, "color")?.map(String::as_str))?;
+    let mut doc = open(&src)?;
+    let index = page_index(matches, &doc)?;
+    let drawn = place::add_text(
+        &mut doc,
+        index,
+        &place::Text {
+            text: required::<String>(matches, "text")?,
+            at: Point::new(x, y),
+            font: required::<String>(matches, "font")?,
+            size: *required::<f64>(matches, "size")?,
+            color: color.as_deref().unwrap_or(&[0.0]),
+        },
+    )?;
+    save(&doc, &out)?;
+    let mut result = receipt("edit-add-text", &src, &[out]);
+    result.insert("page".into(), (index + 1).into());
+    result.insert("bbox".into(), frame_box(drawn.bbox));
+    result.insert("font".into(), drawn.font.into());
+    Ok(result)
+}
+
+pub(crate) fn add_image(matches: &ArgMatches, _ctx: &Ctx) -> Result<Map<String, Value>, GoatError> {
+    let src = source(matches)?;
+    let image = resolve(required::<String>(matches, "image")?)?;
+    let out = output(matches, &src, "edited", "pdf")?;
+    let values = parse_rect(required::<String>(matches, "rect")?)?;
+    let &[x0, y0, x1, y1] = values.as_slice() else {
+        return Err(GoatError::value_error("Rect: bad seq len"));
+    };
+    let data = fs::read(&image).map_err(|e| GoatError::os(&e, &image))?;
+    let mut doc = open(&src)?;
+    let index = page_index(matches, &doc)?;
+    let bbox = place::add_image(&mut doc, index, &data, Rect::new(x0, y0, x1, y1))?;
+    save(&doc, &out)?;
+    let mut result = receipt("edit-add-image", &src, &[out]);
+    result.insert(
+        "inputs".into(),
+        serde_json::json!([src.to_string_lossy(), image.to_string_lossy()]),
+    );
+    result.insert("page".into(), (index + 1).into());
+    result.insert("bbox".into(), frame_box(bbox));
     Ok(result)
 }

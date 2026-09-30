@@ -55,11 +55,20 @@ pdf-goat extract report.pdf --pages 2-5,9 -o excerpt.pdf
 pdf-goat redact statement.pdf --find "[0-9]{3}-[0-9]{2}-[0-9]{4}" -o clean.pdf
 pdf-goat security sign contract.pdf -o signed.pdf
 pdf-goat render report.pdf --pages 1 --dpi 150 -o renders
+pdf-goat edit add-text form.pdf --text 'Jane Q. Member' --font 'Brush Script MT' --size 20 --at 90,612 -o signed.pdf
 ```
 
 `pdf-goat --help` lists the command families, and `pdf-goat <family> --help`
 lists their verbs. Every run is appended to a SQLite ledger at
 `~/.pdf-goat/ledger.db`; read it with `pdf-goat jobs`.
+
+To sign a flat form, one without fillable fields, find each label with
+`search` and draw beside its rectangle with `edit add-text`: a typed signature
+in a script font such as `--font 'Brush Script MT'`, a date in the default
+Helvetica, and `--text ✔ --font ZapfDingbats` for a printed check box. `--at`
+is the start of the text's baseline, in the coordinates `search` returns.
+`edit add-image` places a PNG or JPEG signature inside `--rect`. Each run
+writes a new file; check the result with `render --clip`.
 
 Page-by-page verbs such as `text`, `search`, `count`, and `render` start
 sequentially. After 200 ms, they use worker threads if at least eight pages
@@ -148,11 +157,19 @@ PDF before replacing an original. The native PDF viewer does not edit Office fil
   differ from older releases. Installed fonts affect PDFs that omit font programs.
   HTML conversion rasterizes SVG artwork at twice CSS resolution and adds a
   positioned, searchable text layer for its visible labels.
-- `pages flatten` keeps opaque page content as vectors. Pages that actually use
-  transparency become opaque RGB images at 144 dpi, with a searchable text layer.
-  This removes transparency but limits higher-zoom detail on those pages.
-- OCR uses Vision rather than Tesseract, so recognized words and word boxes can
-  differ. It does not automatically convert the output to PDF/A.
+- `pages flatten` bakes annotations and form fields into page content. Page
+  content, including transparency, stays vector and unchanged, so it keeps full
+  detail at any zoom.
+- OCR uses macOS Vision. On 21 synthetic scans (100 to 600 dpi, small text,
+  accents, digits, tables, two columns, rotated, skewed, noisy and bilevel pages)
+  it reads as accurately as ocrmypdf with Tesseract on all but two pages: Vision
+  reads a yen sign as a dot and skips a lone digit in a table cell. A page that is
+  one scanned image is read at the scan's own resolution (150 to 600 dpi). The
+  hidden text is fitted to each word's ink, so search highlights and selection
+  sit on the scanned words. The output is PDF/A-2b and passes veraPDF. When the
+  source holds something PDF/A cannot carry, such as a font that cannot be
+  embedded, the plain OCR file is written instead, `standard` is null and
+  `warnings` says why.
 - `convert pdfa` prepares PDF/A-2b output but does not run an external validator.
   Its `conformance_validated: false` result is deliberate. Validate archival
   deliverables with an independent tool such as veraPDF.
