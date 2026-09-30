@@ -1592,6 +1592,7 @@ dependencies = [
  "p521",
  "pdf-core",
  "pdf-font",
+ "pdf-inspect",
  "pdf-interp",
  "pdf-ocr",
  "pdf-raster",

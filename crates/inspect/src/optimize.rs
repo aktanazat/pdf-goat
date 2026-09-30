@@ -457,8 +457,9 @@ fn normalize_annotation_flags(document: &mut Document) -> Result<(), GoatError> 
 }
 
 /// PDF/A-2b candidate: embedded fonts, identification XMP, an sRGB output intent,
-/// no encryption, and no document-level actions or JavaScript.
-fn make_pdfa(document: &mut Document) -> Result<(), GoatError> {
+/// no encryption, and no document-level actions or JavaScript. Callers save the
+/// result without encryption, as PDF 1.7.
+pub fn make_pdfa(document: &mut Document) -> Result<(), GoatError> {
     embed_missing(document)?;
     normalize_annotation_flags(document)?;
     let root = document.catalog_ref().map_err(doc::pdf_error)?;

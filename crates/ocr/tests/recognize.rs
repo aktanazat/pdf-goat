@@ -85,15 +85,15 @@ mod macos {
         let (ink_right, ink_bottom) = (left + (11 * 6 - 1) * DOT, top + 7 * DOT);
         let near =
             |actual: f64, expected: usize| (actual - expected as f64).abs() < 3.0 * DOT as f64;
-        let b = line.bbox;
+        let b = line.quad.bounds();
         assert!(near(b.x, left) && near(b.y, top), "line box {b:?}");
         assert!(
             near(b.x + b.width, ink_right) && near(b.y + b.height, ink_bottom),
             "line box {b:?}"
         );
 
-        let hello = line.words[0].bbox.unwrap();
-        let older = line.words[1].bbox.unwrap();
+        let hello = line.words[0].quad.unwrap().bounds();
+        let older = line.words[1].quad.unwrap().bounds();
         assert!(near(hello.x, left), "HELLO box {hello:?}");
         assert!(near(older.x, left + 6 * 6 * DOT), "OLDER box {older:?}");
         assert!(

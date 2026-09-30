@@ -202,3 +202,94 @@ fn verify_reports_no_signatures_for_an_unsigned_file() {
     assert_eq!(verified["signature_count"], 0);
     assert_eq!(verified["outputs"], Value::Array(Vec::new()));
 }
+
+/// A composite font without a descendant font cannot be embedded, so the
+/// file cannot become PDF/A. The page already has text, so no recognition
+/// runs and this holds on every platform.
+#[test]
+fn ocr_keeps_its_result_and_names_the_reason_when_pdfa_conversion_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut font = Dict::new();
+    font.insert("Type", pdf_core::Object::name("Font"));
+    font.insert("Subtype", pdf_core::Object::name("Type0"));
+    font.insert("BaseFont", pdf_core::Object::name("Orphan"));
+    font.insert("Encoding", pdf_core::Object::name("Identity-H"));
+    let mut builder = PdfBuilder::new();
+    builder
+        .page(612.0, 792.0)
+        .resource("Font", "F9", pdf_core::Object::Dict(font))
+        .raw_content(b"BT /F9 12 Tf 72 700 Td <0001> Tj ET");
+    let src = builder.save(dir.path().join("typed.pdf"));
+    let out = dir.path().join("typed-ocr.pdf");
+    let result = run(
+        dir.path(),
+        &[
+            "convert",
+            "ocr",
+            &src.to_string_lossy(),
+            "-o",
+            &out.to_string_lossy(),
+        ],
+    )
+    .expect("OCR succeeds without PDF/A");
+    assert_eq!(result["standard"], Value::Null);
+    let warnings = result["warnings"].as_array().expect("warnings is a list");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let warning = warnings[0].as_str().expect("a warning is text");
+    assert!(
+        warning.contains("PDF/A-2b") && warning.contains("descendant"),
+        "the warning names the standard and the reason: {warning}"
+    );
+    assert!(
+        fs::read(&out)
+            .expect("the OCR result is written")
+            .starts_with(b"%PDF-")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ocr_saves_a_pdfa_2b_candidate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut builder = PdfBuilder::new();
+    builder.page(200.0, 200.0);
+    let src = builder.save(dir.path().join("blank.pdf"));
+    let out = dir.path().join("blank-ocr.pdf");
+    let result = run(
+        dir.path(),
+        &[
+            "convert",
+            "ocr",
+            &src.to_string_lossy(),
+            "-o",
+            &out.to_string_lossy(),
+        ],
+    )
+    .expect("OCR succeeds");
+    assert_eq!(result["standard"], "PDF/A-2b");
+    assert_eq!(result["warnings"], Value::Array(Vec::new()));
+    let bytes = fs::read(&out).expect("the OCR result is written");
+    assert!(bytes.starts_with(b"%PDF-1.7"), "PDF/A-2 files are PDF 1.7");
+    let doc = pdf_core::Document::load(bytes).expect("reopen");
+    let catalog = doc.catalog().expect("catalog");
+    let metadata = doc
+        .resolve_stream(catalog.get(b"Metadata").expect("catalog Metadata"))
+        .expect("resolve Metadata")
+        .expect("Metadata is a stream");
+    let xmp = doc.decode_stream(&metadata).expect("decode Metadata");
+    let xmp = String::from_utf8_lossy(&xmp.data);
+    assert!(
+        xmp.contains("<pdfaid:part>2</pdfaid:part>")
+            && xmp.contains("<pdfaid:conformance>B</pdfaid:conformance>"),
+        "{xmp}"
+    );
+    let intents = doc
+        .resolve_array(catalog.get(b"OutputIntents").expect("OutputIntents"))
+        .expect("resolve OutputIntents")
+        .expect("OutputIntents is an array");
+    let intent = doc
+        .resolve_dict(intents.first().expect("one output intent"))
+        .expect("resolve the intent")
+        .expect("the intent is a dictionary");
+    assert_eq!(intent.get_name(b"S"), Some(&b"GTS_PDFA1"[..]));
+}

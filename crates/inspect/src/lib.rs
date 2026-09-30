@@ -24,6 +24,8 @@ mod optimize;
 mod report;
 mod security;
 
+pub use optimize::make_pdfa;
+
 /// Registers every verb this crate provides.
 pub fn register(registry: &mut Registry) {
     report::register(registry);

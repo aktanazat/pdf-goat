@@ -2,7 +2,9 @@
 //!
 //! [`recognize`] runs Vision's accurate text recognizer, with language
 //! correction on, over an 8-bit gray or RGBA bitmap and returns the lines it
-//! read with per-word boxes. Boxes are in pixels of the bitmap with a top-left
+//! read with per-word corner quads. Vision can leave whole lines of a page
+//! unread while its text detector still finds them; those regions are read
+//! again on their own. Coordinates are pixels of the bitmap with a top-left
 //! origin. On every other target the crate builds and [`recognize`] returns
 //! [`OcrError::Unsupported`].
 
@@ -77,22 +79,70 @@ pub struct Rect {
     pub height: f64,
 }
 
+/// A position in bitmap pixels, origin at the top-left corner, y growing
+/// downward.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// The corners Vision gives a run of text, named in the text's own
+/// orientation: `top_left` is where the first character's top edge starts
+/// and `bottom_left` lies below it. Skewed or rotated text gives a turned
+/// quadrilateral.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quad {
+    pub top_left: Point,
+    pub top_right: Point,
+    pub bottom_right: Point,
+    pub bottom_left: Point,
+}
+
+impl Quad {
+    /// The smallest axis-aligned box holding all four corners.
+    pub fn bounds(&self) -> Rect {
+        let corners = [
+            self.top_left,
+            self.top_right,
+            self.bottom_right,
+            self.bottom_left,
+        ];
+        let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+        let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for corner in corners {
+            x0 = x0.min(corner.x);
+            y0 = y0.min(corner.y);
+            x1 = x1.max(corner.x);
+            y1 = y1.max(corner.y);
+        }
+        Rect {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        }
+    }
+}
+
 /// A run of non-whitespace characters inside a [`Line`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Word {
     pub text: String,
     /// Where Vision places the word; `None` when Vision gave no box for its
     /// character range.
-    pub bbox: Option<Rect>,
+    pub quad: Option<Quad>,
 }
 
-/// One recognized line of text, in the order Vision reports lines.
+/// One recognized line of text. Lines come in Vision's reading order; a
+/// line read on the second pass sits after the nearest line above it in
+/// the same column.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Line {
     pub text: String,
     /// Vision's confidence for the line, 0.0 to 1.0.
     pub confidence: f32,
-    pub bbox: Rect,
+    pub quad: Quad,
     /// The line's whitespace-separated words, in text order.
     pub words: Vec<Word>,
 }

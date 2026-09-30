@@ -38,6 +38,7 @@ objc2-vision = { version = "0.3.2", default-features = false, features = [
     "std",
     "objc2-core-foundation",
     "objc2-core-graphics",
+    "VNDetectTextRectanglesRequest",
     "VNObservation",
     "VNRecognizeTextRequest",
     "VNRequest",

@@ -25,6 +25,7 @@ p521 = { version = "0.13.3", default-features = false, features = ["ecdsa", "std
 pdf-core = { workspace = true }
 pdf-font = { workspace = true }
 pdf-interp = { workspace = true }
+pdf-inspect = { workspace = true }
 pdf-ocr = { workspace = true }
 pdf-raster = { workspace = true }
 pdf-render = { workspace = true }

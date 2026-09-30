@@ -140,12 +140,20 @@ fn convert_ocr(matches: &ArgMatches, _ctx: &Ctx) -> Result<Map<String, Value>, G
         None => ensure_parent(&default_out(&src_text, "ocr", "pdf")?)?,
     };
     let force = flag(matches, "force")?;
-    let data = ocr::ocr_document(read_source(&src)?, force).map_err(GoatError::message)?;
-    write_output(&out, &data)?;
+    let ocr = ocr::ocr_document(read_source(&src)?, force).map_err(GoatError::message)?;
+    write_output(&out, &ocr.data)?;
     let mut result = Map::new();
     result.insert("verb".into(), "convert-ocr".into());
     result.insert("inputs".into(), Value::Array(vec![path_text(&src)]));
     result.insert("outputs".into(), Value::Array(vec![path_text(&out)]));
+    result.insert(
+        "standard".into(),
+        ocr.standard.map_or(Value::Null, Value::from),
+    );
+    result.insert(
+        "warnings".into(),
+        Value::Array(ocr.warnings.into_iter().map(Value::from).collect()),
+    );
     Ok(result)
 }
 

@@ -6,19 +6,20 @@ use goat_fixtures::PdfBuilder;
 use pdf_core::SaveOptions;
 
 fn recognized(text: &str) -> Vec<pdf_ocr::Line> {
-    let bbox = pdf_ocr::Rect {
-        x: 200.0,
-        y: 300.0,
-        width: 600.0,
-        height: 80.0,
+    let point = |x, y| pdf_ocr::Point { x, y };
+    let quad = pdf_ocr::Quad {
+        top_left: point(200.0, 300.0),
+        top_right: point(800.0, 300.0),
+        bottom_right: point(800.0, 380.0),
+        bottom_left: point(200.0, 380.0),
     };
     vec![pdf_ocr::Line {
         text: text.to_owned(),
         confidence: 1.0,
-        bbox,
+        quad,
         words: vec![pdf_ocr::Word {
             text: text.to_owned(),
-            bbox: Some(bbox),
+            quad: Some(quad),
         }],
     }]
 }
@@ -50,10 +51,16 @@ fn forced_ocr_replaces_existing_text_instead_of_keeping_two_layers() {
         },
     )
     .expect("raster");
+    let gray = raster.to_gray8(255);
+    let scan = Scan {
+        pixmap: &raster,
+        gray: &gray,
+        dpi: DPI,
+    };
     apply_page(
         &mut doc,
         &page,
-        &raster,
+        &scan,
         &recognized("replacement"),
         true,
         &mut font::Fonts::default(),
@@ -83,10 +90,16 @@ fn unicode_ocr_stays_over_rotated_cropped_userunit_pages() {
             (bounds.height() * DPI / 72.0).ceil() as u32,
         )
         .expect("bitmap");
+        let gray = raster.to_gray8(255);
+        let scan = Scan {
+            pixmap: &raster,
+            gray: &gray,
+            dpi: DPI,
+        };
         apply_page(
             &mut doc,
             &page,
-            &raster,
+            &scan,
             &recognized("caféΩЖ"),
             false,
             &mut font::Fonts::default(),
