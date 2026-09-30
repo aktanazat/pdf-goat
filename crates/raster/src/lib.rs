@@ -13,6 +13,7 @@ mod mask;
 mod path;
 mod pixmap;
 mod raster;
+mod shade;
 mod stroke;
 
 pub use blend::BlendMode;
@@ -25,4 +26,5 @@ pub use mask::Mask;
 pub use path::{Path, PathBuilder, PathEl};
 pub use pixmap::{Color, MAX_DIMENSION, MAX_PIXELS, Pixmap, RasterError};
 pub use raster::FillRule;
+pub use shade::{ShadePainter, ShadeSource, ShadeVertex};
 pub use stroke::{Dash, LineCap, LineJoin, Stroke};

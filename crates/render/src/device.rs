@@ -111,6 +111,9 @@ pub(crate) struct RasterDevice {
     masks: HashMap<u64, Arc<raster::Mask>>,
     mask_bytes: usize,
     groups: Vec<Group>,
+    /// The next clip is a tiling cell's /BBox. MuPDF gives the cell pixmap
+    /// that box rounded out to whole pixels and never antialiases it.
+    cell_scissor: bool,
 }
 
 impl RasterDevice {
@@ -134,6 +137,7 @@ impl RasterDevice {
             masks: HashMap::new(),
             mask_bytes: 0,
             groups: Vec::new(),
+            cell_scissor: false,
         })
     }
 
@@ -201,9 +205,12 @@ impl RasterDevice {
         Ok(Some(coverage))
     }
 
+    /// Paints with `brush` through `draw`. `shape` names the device pixels
+    /// the drawn shape can reach; a shading brush is scissored to them.
     fn paint(
         &mut self,
         brush: interp::Brush<'_>,
+        shape: impl FnOnce(&mut raster::Canvas) -> raster::IntRect,
         draw: impl FnOnce(&mut raster::Canvas, &raster::Paint<'_>),
     ) -> Result<(), RenderError> {
         let mask = self.mask(brush.soft_mask)?;
@@ -221,31 +228,8 @@ impl RasterDevice {
             }
             interp::Paint::Shading(shading) => {
                 let matrix = shading.matrix.concat(&self.post);
-                if shading.shading.mesh().is_empty() {
-                    if let Some(inverse) = matrix.invert() {
-                        let shader = raster::FnShader(|x, y| {
-                            shading_color(&shading.shading, Point::new(x, y).transform(&inverse))
-                        });
-                        let mut paint = raster::Paint::shader(&shader);
-                        paint.composite = composite;
-                        draw(&mut self.canvas, &paint);
-                    }
-                } else {
-                    let mut image =
-                        self.child(self.canvas.width(), self.canvas.height(), Matrix::IDENTITY)?;
-                    image.mesh(&shading.shading, matrix);
-                    let pixmap = image.finish()?;
-                    if let Some(shader) = raster::PixmapShader::new(
-                        &pixmap,
-                        &raster::Transform::IDENTITY,
-                        raster::Filter::Nearest,
-                        false,
-                    ) {
-                        let mut paint = raster::Paint::shader(&shader);
-                        paint.composite = composite;
-                        draw(&mut self.canvas, &paint);
-                    }
-                }
+                let shape = shape(&mut self.canvas);
+                self.shade(&shading.shading, matrix, composite, Some(shape), draw)?;
             }
             interp::Paint::Tiling(tile) => {
                 let matrix = tile.matrix.concat(&self.post);
@@ -268,13 +252,24 @@ impl RasterDevice {
                 let origin = Matrix::translate(-f64::from(bounds.x0), -f64::from(bounds.y0));
                 let mut image =
                     self.child(bounds.width(), bounds.height(), self.post.concat(&origin))?;
+                image.cell_scissor = true;
                 tile.run_cell(&mut image)?;
                 let pixmap = image.finish()?;
+                // Every device pixel a placed copy can reach, in pattern
+                // space: the cell pixmap widened by the pixel its truncated
+                // placement can move it.
+                let reach = Rect::new(
+                    f64::from(bounds.x0) - 1.0,
+                    f64::from(bounds.y0) - 1.0,
+                    f64::from(bounds.x1) + 1.0,
+                    f64::from(bounds.y1) + 1.0,
+                )
+                .transform(&inverse);
                 let shader = TileShader {
                     pixmap: &pixmap,
                     inverse,
                     matrix,
-                    bbox: tile.bbox,
+                    reach,
                     origin: bounds,
                     step_x,
                     step_y,
@@ -288,44 +283,81 @@ impl RasterDevice {
         Ok(())
     }
 
-    fn mesh(&mut self, shading: &interp::Shading, matrix: Matrix) {
-        let depth = self.canvas.clip_depth();
-        if let Some(bbox) = shading.bbox() {
-            self.canvas.push_clip_rect(rect(bbox), &transform(matrix));
+    /// Paints `shading` under `matrix` (shading space to device) as PyMuPDF
+    /// does. The scissor is the clip bounds, cut to `shape` for a pattern
+    /// paint and to the shading's bound when a clip is in force (MuPDF's
+    /// display list shrinks a clip to what it contains). The background fills
+    /// the scissor, the triangles paint the bound within it, and `draw`
+    /// composites the result with `composite`.
+    fn shade(
+        &mut self,
+        shading: &interp::Shading,
+        matrix: Matrix,
+        composite: raster::Composite<'_>,
+        shape: Option<raster::IntRect>,
+        draw: impl FnOnce(&mut raster::Canvas, &raster::Paint<'_>),
+    ) -> Result<(), RenderError> {
+        let mut scissor = self.canvas.clip_bounds();
+        if let Some(shape) = shape {
+            scissor = scissor.intersect(&shape);
         }
-        if let Some([r, g, b]) = shading.background() {
-            self.canvas.fill_rect(
-                self.canvas.clip_bounds().to_rect(),
-                &raster::Transform::IDENTITY,
-                &raster::Paint::solid(raster::Color::rgb(r, g, b)),
-            );
+        let bound = shading
+            .bound()
+            .map(|bound| rect(bound.transform(&matrix)).round_out());
+        if let Some(bound) = bound
+            && (shape.is_some() || self.canvas.clip_depth() > 0)
+        {
+            scissor = scissor.intersect(&bound);
         }
-        for triangle in shading.mesh() {
-            let points = triangle.points.map(|p| {
-                let p = p.transform(&matrix);
-                raster::Point::new(p.x, p.y)
-            });
-            self.canvas.fill_mesh_triangle(points, triangle.colors);
+        let clip = match bound {
+            Some(bound) => bound.intersect(&scissor),
+            None => scissor,
+        };
+        if clip.is_empty() {
+            return Ok(());
         }
-        self.canvas.restore_clip_depth(depth);
+        let background = shading.background().map(|c| c.map(|v| (v * 255.0) as u8));
+        let area = if background.is_some() { scissor } else { clip };
+        let source = match shading.lut() {
+            Some(lut) => raster::ShadeSource::Parameter(lut),
+            None => raster::ShadeSource::Rgb,
+        };
+        let mut painter = raster::ShadePainter::new(area, clip, source)?;
+        let scissor = Rect::new(
+            f64::from(clip.x0),
+            f64::from(clip.y0),
+            f64::from(clip.x1),
+            f64::from(clip.y1),
+        );
+        shading.triangles(&matrix, scissor, &mut |triangle| {
+            painter.triangle(triangle.map(|v| raster::ShadeVertex {
+                x: v.x,
+                y: v.y,
+                value: v.value,
+            }));
+        });
+        let pixmap = painter.finish(background);
+        let placement = raster::Transform::translate(f64::from(area.x0), f64::from(area.y0));
+        if let Some(shader) =
+            raster::PixmapShader::new(&pixmap, &placement, raster::Filter::Nearest, false)
+        {
+            let mut paint = raster::Paint::shader(&shader);
+            paint.composite = composite;
+            draw(&mut self.canvas, &paint);
+        }
+        Ok(())
     }
 }
 
-fn shading_color(shading: &interp::Shading, point: Point) -> raster::Color {
-    if shading.bbox().is_some_and(|bbox| !bbox.contains(point)) {
-        return raster::Color::TRANSPARENT;
-    }
-    match shading.sample(point).or_else(|| shading.background()) {
-        Some([r, g, b]) => raster::Color::rgb(r, g, b),
-        None => raster::Color::TRANSPARENT,
-    }
-}
-
+/// Paints copies of one rendered cell the way MuPDF's `fz_draw_end_tile`
+/// does: the cell pixmap covers the cell's rounded-out device box, and each
+/// copy is placed at the truncated device offset of its step, so a cell edge
+/// that ends inside a pixel keeps that pixel's partial coverage.
 struct TileShader<'a> {
     pixmap: &'a raster::Pixmap,
     inverse: Matrix,
     matrix: Matrix,
-    bbox: Rect,
+    reach: Rect,
     origin: raster::IntRect,
     step_x: f64,
     step_y: f64,
@@ -336,18 +368,29 @@ impl raster::Shader for TileShader<'_> {
     fn shade_row(&self, x: i32, y: i32, out: &mut [[u8; 4]]) {
         for (i, pixel) in out.iter_mut().enumerate() {
             *pixel = [0; 4];
-            let p = Point::new(f64::from(x) + i as f64 + 0.5, f64::from(y) + 0.5)
-                .transform(&self.inverse);
-            let k0 = ((p.x - self.bbox.x1) / self.step_x).ceil() as i64;
-            let k1 = ((p.x - self.bbox.x0) / self.step_x).floor() as i64;
-            let j0 = ((p.y - self.bbox.y1) / self.step_y).ceil() as i64;
-            let j1 = ((p.y - self.bbox.y0) / self.step_y).floor() as i64;
+            let px = f64::from(x) + i as f64;
+            let p = Point::new(px + 0.5, f64::from(y) + 0.5).transform(&self.inverse);
+            let k0 = ((p.x - self.reach.x1) / self.step_x).ceil() as i64;
+            let k1 = ((p.x - self.reach.x0) / self.step_x).floor() as i64;
+            let j0 = ((p.y - self.reach.y1) / self.step_y).ceil() as i64;
+            let j1 = ((p.y - self.reach.y0) / self.step_y).floor() as i64;
             for j in j0..=j1 {
                 for k in k0..=k1 {
-                    let q = Point::new(p.x - k as f64 * self.step_x, p.y - j as f64 * self.step_y)
-                        .transform(&self.matrix);
-                    let qx = (q.x - f64::from(self.origin.x0)).floor();
-                    let qy = (q.y - f64::from(self.origin.y0)).floor();
+                    // MuPDF: `fz_pre_translate(ctm, x * xstep, y * ystep)` in
+                    // single precision, then the pixmap origin takes the
+                    // integer part (60 × 4.1666665 lands at 249, not 250).
+                    let kx = k as f32 * self.step_x as f32;
+                    let jy = j as f32 * self.step_y as f32;
+                    let placed_x = (self.origin.x0 as f32
+                        + kx * self.matrix.a as f32
+                        + jy * self.matrix.c as f32)
+                        .trunc();
+                    let placed_y = (self.origin.y0 as f32
+                        + kx * self.matrix.b as f32
+                        + jy * self.matrix.d as f32)
+                        .trunc();
+                    let qx = px - f64::from(placed_x);
+                    let qy = f64::from(y) - f64::from(placed_y);
                     if qx < 0.0 || qy < 0.0 {
                         continue;
                     }
@@ -376,17 +419,27 @@ impl interp::Device for RasterDevice {
         self.apply(|this| {
             let path = path(source);
             let ctm = transform(event.ctm.concat(&this.post));
-            this.paint(event.brush, |canvas, paint| {
-                canvas.fill_path(
-                    &path,
-                    &ctm,
-                    raster::FillStyle {
-                        rule: rule(event.rule),
-                        thin_line: true,
-                    },
-                    paint,
-                )
-            })
+            // MuPDF paints a pattern through the fill path as a clip, and a
+            // rectangular clip is a whole-pixel scissor.
+            let scissor = match event.brush.paint {
+                interp::Paint::Color(_) => None,
+                _ => path.transform(&ctm).as_rect().map(rect_scissor),
+            };
+            let style = raster::FillStyle {
+                rule: rule(event.rule),
+                thin_line: true,
+            };
+            this.paint(
+                event.brush,
+                |canvas| match scissor {
+                    Some(rect) => rect.round_out().intersect(&canvas.clip_bounds()),
+                    None => canvas.fill_bounds(&path, &ctm),
+                },
+                |canvas, paint| match scissor {
+                    Some(rect) => canvas.fill_rect(rect, &raster::Transform::IDENTITY, paint),
+                    None => canvas.fill_path(&path, &ctm, style, paint),
+                },
+            )
         });
     }
 
@@ -395,19 +448,28 @@ impl interp::Device for RasterDevice {
             let path = path(source);
             let ctm = transform(event.ctm.concat(&this.post));
             let style = stroke(event.style);
-            this.paint(event.brush, |canvas, paint| {
-                canvas.stroke_path(&path, &ctm, &style, paint)
-            })
+            this.paint(
+                event.brush,
+                |canvas| canvas.stroke_bounds(&path, &ctm, &style),
+                |canvas, paint| canvas.stroke_path(&path, &ctm, &style, paint),
+            )
         });
     }
 
     fn clip_path(&mut self, source: &interp::Path, event: &interp::ClipEvent<'_>) {
         self.apply(|this| {
-            this.canvas.push_clip_path(
-                &path(source),
-                &transform(event.ctm.concat(&this.post)),
-                rule(event.rule),
-            );
+            let path = path(source);
+            let ctm = transform(event.ctm.concat(&this.post));
+            if std::mem::take(&mut this.cell_scissor) {
+                let scissor = this.canvas.fill_bounds(&path, &ctm);
+                this.canvas
+                    .push_clip_rect(scissor.to_rect(), &raster::Transform::IDENTITY);
+            } else if let Some(rect) = path.transform(&ctm).as_rect() {
+                this.canvas
+                    .push_clip_rect(rect_scissor(rect), &raster::Transform::IDENTITY);
+            } else {
+                this.canvas.push_clip_path(&path, &ctm, rule(event.rule));
+            }
             Ok(())
         });
     }
@@ -439,9 +501,13 @@ impl interp::Device for RasterDevice {
                 };
                 if let Some(brush) = run.fill {
                     let ctm = transform(glyph.trm.concat(&this.post));
-                    this.paint(brush, |canvas, paint| {
-                        canvas.fill_path(&outline, &ctm, raster::FillStyle::default(), paint)
-                    })?;
+                    this.paint(
+                        brush,
+                        |canvas| canvas.fill_bounds(&outline, &ctm),
+                        |canvas, paint| {
+                            canvas.fill_path(&outline, &ctm, raster::FillStyle::default(), paint)
+                        },
+                    )?;
                 }
                 if let Some(brush) = run.stroke
                     && let Some(inverse) = run.ctm.invert()
@@ -449,9 +515,11 @@ impl interp::Device for RasterDevice {
                     let user_outline = outline.transform(&transform(glyph.trm.concat(&inverse)));
                     let ctm = transform(run.ctm.concat(&this.post));
                     let style = stroke(run.stroke_style);
-                    this.paint(brush, |canvas, paint| {
-                        canvas.stroke_path(&user_outline, &ctm, &style, paint)
-                    })?;
+                    this.paint(
+                        brush,
+                        |canvas| canvas.stroke_bounds(&user_outline, &ctm, &style),
+                        |canvas, paint| canvas.stroke_path(&user_outline, &ctm, &style, paint),
+                    )?;
                 }
             }
             Ok(())
@@ -469,34 +537,9 @@ impl interp::Device for RasterDevice {
                 soft_mask: mask.as_deref(),
             };
             let bounds = this.canvas.clip_bounds().to_rect();
-            if event.shading.mesh().is_empty() {
-                if let Some(inverse) = matrix.invert() {
-                    let shader = raster::FnShader(|x, y| {
-                        shading_color(event.shading, Point::new(x, y).transform(&inverse))
-                    });
-                    let mut paint = raster::Paint::shader(&shader);
-                    paint.composite = composite;
-                    this.canvas
-                        .fill_rect(bounds, &raster::Transform::IDENTITY, &paint);
-                }
-            } else {
-                let mut image =
-                    this.child(this.canvas.width(), this.canvas.height(), Matrix::IDENTITY)?;
-                image.mesh(event.shading, matrix);
-                let pixmap = image.finish()?;
-                if let Some(shader) = raster::PixmapShader::new(
-                    &pixmap,
-                    &raster::Transform::IDENTITY,
-                    raster::Filter::Nearest,
-                    false,
-                ) {
-                    let mut paint = raster::Paint::shader(&shader);
-                    paint.composite = composite;
-                    this.canvas
-                        .fill_rect(bounds, &raster::Transform::IDENTITY, &paint);
-                }
-            }
-            Ok(())
+            this.shade(event.shading, matrix, composite, None, |canvas, paint| {
+                canvas.fill_rect(bounds, &raster::Transform::IDENTITY, paint);
+            })
         });
     }
 
@@ -554,9 +597,16 @@ impl interp::Device for RasterDevice {
             } else {
                 raster::Filter::Nearest
             };
-            this.paint(event.brush, |canvas, paint| {
-                canvas.draw_stencil(&mask, &ctm, filter, paint)
-            })
+            this.paint(
+                event.brush,
+                |canvas| {
+                    canvas.fill_bounds(
+                        &raster::Path::from_rect(raster::Rect::new(0.0, 0.0, 1.0, 1.0)),
+                        &ctm,
+                    )
+                },
+                |canvas, paint| canvas.draw_stencil(&mask, &ctm, filter, paint),
+            )
         });
     }
 
@@ -596,4 +646,20 @@ impl interp::Device for RasterDevice {
     fn wants_type3_procs(&self) -> bool {
         self.draw_text
     }
+}
+
+/// The whole-pixel scissor MuPDF uses instead of a mask for an axis-aligned
+/// rectangular clip: the rectangle's edges land on its rasteriser's 17 × 15
+/// antialiasing subsample grid (truncated), and the pixel bounds round out
+/// from there.
+fn rect_scissor(rect: raster::Rect) -> raster::Rect {
+    fn outward(lo: f64, hi: f64, samples: f64) -> (f64, f64) {
+        (
+            ((lo * samples).floor() / samples).floor(),
+            ((hi * samples).floor() / samples).ceil(),
+        )
+    }
+    let (x0, x1) = outward(rect.x0, rect.x1, 17.0);
+    let (y0, y1) = outward(rect.y0, rect.y1, 15.0);
+    raster::Rect::new(x0, y0, x1, y1)
 }

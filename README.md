@@ -153,10 +153,20 @@ PDF before replacing an original. The native PDF viewer does not edit Office fil
 
 ## Output and verification
 
-- Generated PDF bytes, compression sizes, antialiasing and gradient colors can
-  differ from older releases. Installed fonts affect PDFs that omit font programs.
-  HTML conversion rasterizes SVG artwork at twice CSS resolution and adds a
-  positioned, searchable text layer for its visible labels.
+- Generated PDF bytes and compression sizes can differ from older releases.
+  Installed fonts affect PDFs that omit font programs. HTML conversion rasterizes
+  SVG artwork at twice CSS resolution and adds a positioned, searchable text
+  layer for its visible labels.
+- Shadings (axial, radial, function-based, triangle meshes, Coons and tensor
+  patches) and tiling patterns are rasterized the way MuPDF does: the same
+  256-entry color table, triangle tessellation and fixed-point fill, MuPDF's
+  Background, BBox and clipping rules, and tiling cells copied at MuPDF's pixel
+  offsets. On 54 synthetic shading pages at 72, 144 and 300 dpi, 153 of 162
+  renders are within one level per channel of PyMuPDF and 135 are identical.
+  Remaining differences: DeviceCMYK colors can differ by up to 8 levels, in
+  plain fills as well, because PyMuPDF converts them through an ICC profile; a
+  45 degree axial gradient can differ by up to 3 levels on a few hundred pixels;
+  antialiased edges of strokes and non-rectangular clips are not pixel-matched.
 - `pages flatten` bakes annotations and form fields into page content. Page
   content, including transparency, stays vector and unchanged, so it keeps full
   detail at any zoom.

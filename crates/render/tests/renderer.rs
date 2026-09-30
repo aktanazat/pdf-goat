@@ -41,6 +41,36 @@ fn nested_clip_is_restored_before_the_next_paint() {
     assert_eq!(image.pixel(35, 20), Some([0, 0, 255, 255]));
 }
 
+/// MuPDF turns an axis-aligned rectangular clip into a whole-pixel scissor
+/// rounded outward (no antialiased edge), while a rotated one keeps its
+/// antialiased mask.
+#[test]
+fn rectangular_clip_is_a_whole_pixel_scissor_rounded_outward() {
+    let doc = document(
+        b"q 5.3 5.3 20 20 re W n 1 0 0 rg 0 0 40 40 re f Q",
+        Dict::new(),
+    );
+    let image = pixels(&doc);
+    assert_eq!(image.pixel(4, 20), Some([255, 255, 255, 255]));
+    assert_eq!(image.pixel(5, 20), Some([255, 0, 0, 255]));
+    assert_eq!(image.pixel(25, 20), Some([255, 0, 0, 255]));
+    assert_eq!(image.pixel(26, 20), Some([255, 255, 255, 255]));
+    assert_eq!(image.pixel(20, 14), Some([255, 0, 0, 255]));
+    assert_eq!(image.pixel(20, 13), Some([255, 255, 255, 255]));
+    let rotated = document(
+        b"q 0.7071 0.7071 -0.7071 0.7071 20 0 cm 0 0 14 14 re W n 1 0 0 rg 0 0 40 40 re f Q",
+        Dict::new(),
+    );
+    let image = pixels(&rotated);
+    // The diamond's bottom corner sits at device (20, 40); five rows up its
+    // left edge crosses x = 15.5, so pixel 15 is partly covered.
+    let [_, g, _, _] = image.pixel(15, 35).unwrap();
+    assert!(
+        g > 0 && g < 255,
+        "rotated clip edge should be antialiased, got green {g}"
+    );
+}
+
 #[test]
 fn crop_rotation_and_user_unit_move_content_and_dimensions_together() {
     let mut doc = document(b"1 0 0 rg 10 5 10 10 re f", Dict::new());
@@ -167,8 +197,140 @@ fn axial_shading_evaluates_its_function_across_the_page() {
     let mut resources = Dict::new();
     resources.insert("Shading", shadings);
     let image = pixels(&document(b"/S sh", resources));
-    assert_eq!(image.pixel(0, 20), Some([252, 0, 3, 255]));
-    assert_eq!(image.pixel(39, 20), Some([3, 0, 252, 255]));
+    // MuPDF samples the 256-entry table at integer device x: pixel 0 is the
+    // exact start colour; pixel 39 lands on entry 249 (255 × 39 / 40 in
+    // 16.16 fixed point), whose bytes truncate 255 × (1 − 249 / 255) and
+    // 255 × 249 / 255 computed in f32.
+    assert_eq!(image.pixel(0, 20), Some([255, 0, 0, 255]));
+    let [r, g, b, a] = image.pixel(39, 20).unwrap();
+    assert!((5..=6).contains(&r) && g == 0 && (248..=249).contains(&b) && a == 255);
+}
+
+/// MuPDF's model: the background fills the scissor, which its display list
+/// shrinks to the shading's BBox under a clip, and the axial gradient is a
+/// 256-entry byte table sampled once per device pixel.
+#[test]
+fn shading_background_fills_only_the_bbox_under_a_clip() {
+    let mut function = Dict::new();
+    function.insert("FunctionType", 2);
+    function.insert("Domain", Object::Array(vec![0.into(), 1.into()]));
+    function.insert("C0", Object::Array(vec![1.into(), 0.into(), 0.into()]));
+    function.insert("C1", Object::Array(vec![0.into(), 0.into(), 1.into()]));
+    function.insert("N", 1);
+    let mut shading = Dict::new();
+    shading.insert("ShadingType", 2);
+    shading.insert("ColorSpace", name("DeviceRGB"));
+    shading.insert(
+        "Coords",
+        Object::Array(vec![15.into(), 0.into(), 25.into(), 0.into()]),
+    );
+    shading.insert("Function", function);
+    shading.insert("BBox", Rect::new(10.0, 10.0, 30.0, 30.0).to_object());
+    shading.insert(
+        "Background",
+        Object::Array(vec![0.into(), 1.into(), 0.into()]),
+    );
+    let mut shadings = Dict::new();
+    shadings.insert("S", shading);
+    let mut resources = Dict::new();
+    resources.insert("Shading", shadings);
+    let image = pixels(&document(b"q 5 5 30 30 re W n /S sh Q", resources));
+    // Inside the clip but outside the BBox: untouched, not background.
+    assert_eq!(image.pixel(7, 20), Some([255, 255, 255, 255]));
+    // Inside the BBox but before the axis starts: background.
+    assert_eq!(image.pixel(12, 20), Some([0, 255, 0, 255]));
+    // Along the axis both channels come from one table entry (red = 255 − i,
+    // blue = i, each truncated from f32), so they sum to 254 or 255 while red
+    // falls strictly.
+    let row: Vec<[u8; 4]> = (15..24).map(|x| image.pixel(x, 20).unwrap()).collect();
+    for pixel in &row {
+        let sum = u16::from(pixel[0]) + u16::from(pixel[2]);
+        assert!((254..=255).contains(&sum), "row {row:?}");
+    }
+    for pair in row.windows(2) {
+        assert!(pair[0][0] > pair[1][0], "red steps {row:?}");
+    }
+}
+
+/// MuPDF scales an Indexed mesh colour by 255 before the palette lookup
+/// (clamped to hival), so an undecoded index of 1 paints the last entry.
+#[test]
+fn indexed_mesh_vertex_colours_follow_mupdf_scaling() {
+    let mut doc = document(b"/S sh", Dict::new());
+    let mut shading = Dict::new();
+    shading.insert("ShadingType", 4);
+    shading.insert(
+        "ColorSpace",
+        Object::Array(vec![
+            name("Indexed"),
+            name("DeviceRGB"),
+            3.into(),
+            pdf_core::PdfString::hex(b"\xff\x00\x00\x00\xff\x00\x00\x00\xff\xff\xff\x00".to_vec())
+                .into(),
+        ]),
+    );
+    shading.insert("BitsPerCoordinate", 8);
+    shading.insert("BitsPerComponent", 8);
+    shading.insert("BitsPerFlag", 8);
+    shading.insert(
+        "Decode",
+        Object::Array(vec![
+            0.into(),
+            40.into(),
+            0.into(),
+            40.into(),
+            0.into(),
+            255.into(),
+        ]),
+    );
+    let stream = doc.add(Stream::new(
+        shading,
+        vec![0, 0, 0, 1, 0, 255, 0, 1, 0, 0, 255, 1],
+    ));
+    let mut shadings = Dict::new();
+    shadings.insert("S", stream);
+    let mut resources = Dict::new();
+    resources.insert("Shading", shadings);
+    set_resources(&mut doc, resources);
+    let image = pixels(&doc);
+    assert_eq!(image.pixel(10, 30), Some([255, 255, 0, 255]));
+    assert_eq!(image.pixel(30, 10), Some([255, 255, 255, 255]));
+}
+
+/// MuPDF copies the whole rendered cell pixmap for every tile, so a cell
+/// edge that ends inside a device pixel keeps that pixel's partial coverage
+/// in every copy.
+#[test]
+fn tiling_cell_edge_inside_a_pixel_keeps_its_coverage_in_every_copy() {
+    let mut doc = document(b"/Pattern cs /P scn 0 0 40 40 re f", Dict::new());
+    let mut tile = Dict::new();
+    tile.insert("Type", name("Pattern"));
+    tile.insert("PatternType", 1);
+    tile.insert("PaintType", 1);
+    tile.insert("TilingType", 1);
+    tile.insert("BBox", Rect::new(0.0, 0.0, 7.3, 8.0).to_object());
+    tile.insert("XStep", 12);
+    tile.insert("YStep", 12);
+    tile.insert("Resources", Dict::new());
+    let pattern = doc.add(Stream::new(tile, b"1 0 0 rg 0 0 7.3 8 re f".to_vec()));
+    let mut patterns = Dict::new();
+    patterns.insert("P", pattern);
+    let mut resources = Dict::new();
+    resources.insert("Pattern", patterns);
+    set_resources(&mut doc, resources);
+    let image = pixels(&doc);
+    // The cell's right edge covers 0.3 of pixel 7 (and of pixel 19 in the
+    // next copy): red over white at alpha 76 or 77 leaves green at 178..179.
+    for x in [7, 19] {
+        let [r, g, b, _] = image.pixel(x, 37).unwrap();
+        assert!(
+            r == 255 && (177..=180).contains(&g) && g == b,
+            "pixel {x}: {:?}",
+            [r, g, b]
+        );
+    }
+    assert_eq!(image.pixel(8, 37), Some([255, 255, 255, 255]));
+    assert_eq!(image.pixel(12, 37), Some([255, 0, 0, 255]));
 }
 
 #[test]

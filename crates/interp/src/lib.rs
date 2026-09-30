@@ -38,7 +38,7 @@ pub use font::{FontFlags, FontSubtype, PdfFont};
 pub use image::{AlphaChannel, ColorFamily, ImagePixels, ImageSamples, PdfImage, StencilPixels};
 pub use path::{FillRule, LineCap, LineJoin, Path, PathEl, StrokeStyle};
 pub use pattern::{ShadingPaint, SoftMask, TilingPaint};
-pub use shading::{MeshTriangle, Shading};
+pub use shading::{ShadeVertex, Shading};
 
 /// Why a run stopped.
 #[derive(Debug)]

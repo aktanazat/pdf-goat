@@ -537,104 +537,37 @@ impl Canvas {
         self.cov = cov;
     }
 
+    /// Pixels that filling `path` can reach: the bounds of its flattened,
+    /// non-horizontal edges rounded out and limited to the clip. A shading
+    /// painted through the path is scissored to this, as MuPDF does.
+    pub fn fill_bounds(&mut self, path: &Path, transform: &Transform) -> IntRect {
+        self.edges.clear();
+        self.edges.add_path(path, transform);
+        self.edge_bounds()
+    }
+
+    /// Pixels that stroking `path` can reach; see [`Canvas::fill_bounds`].
+    pub fn stroke_bounds(
+        &mut self,
+        path: &Path,
+        transform: &Transform,
+        stroke: &Stroke,
+    ) -> IntRect {
+        self.edges.clear();
+        stroke_edges(path, transform, stroke, &mut self.edges);
+        self.edge_bounds()
+    }
+
+    fn edge_bounds(&self) -> IntRect {
+        match self.edges.bbox() {
+            Some(bbox) => bbox.round_out().intersect(&self.top_clip().bounds),
+            None => IntRect::EMPTY,
+        }
+    }
+
     /// Paints a precomputed coverage mask (for example a cached glyph).
     pub fn fill_mask(&mut self, mask: &Mask, paint: &Paint<'_>) {
         self.paint(mask, paint.source, None, &paint.composite);
-    }
-
-    /// Paints an opaque Gouraud triangle in device coordinates. Samples are
-    /// taken at integer device points and RGB components are floored to bytes.
-    /// Scanlines include their left/top edges and exclude right/bottom edges;
-    /// adjoining triangles therefore own each sample exactly once, regardless
-    /// of winding or draw order. Edges are not independently anti-aliased.
-    pub fn fill_mesh_triangle(&mut self, points: [Point; 3], colors: [[f32; 3]; 3]) {
-        if points.iter().any(|p| !p.is_finite()) {
-            return;
-        }
-        let points = points.map(|p| Point::new(p.x.clamp(-1e300, 1e300), p.y.clamp(-1e300, 1e300)));
-        let [a, b, c] = points;
-        let ab = b - a;
-        let ac = c - a;
-        let scale = ab.x.abs().max(ab.y.abs()).max(ac.x.abs()).max(ac.y.abs());
-        if scale == 0.0 {
-            return;
-        }
-        let u = Point::new(ab.x / scale, ab.y / scale);
-        let v = Point::new(ac.x / scale, ac.y / scale);
-        let area = u.cross(v);
-        if area == 0.0 {
-            return;
-        }
-        let colors = colors.map(|rgb| rgb.map(|value| f64::from(crate::pixmap::unit(value))));
-        let delta_b: [f64; 3] = std::array::from_fn(|k| colors[1][k] - colors[0][k]);
-        let delta_c: [f64; 3] = std::array::from_fn(|k| colors[2][k] - colors[0][k]);
-        let step: [f64; 3] =
-            std::array::from_fn(|k| 255.0 * (v.y * delta_b[k] - u.y * delta_c[k]) / area / scale);
-        let limit = self.top_clip().bounds.intersect(&self.bounds());
-        let y0 = crate::geom::saturate_i32(a.y.min(b.y).min(c.y).ceil()).max(limit.y0);
-        let y1 = crate::geom::saturate_i32(a.y.max(b.y).max(c.y).ceil()).min(limit.y1);
-        let Canvas {
-            base,
-            layers,
-            clips,
-            row_cov,
-            row_src,
-            ..
-        } = self;
-        let clip = &clips[clips.len() - 1];
-        for y in y0..y1 {
-            let fy = f64::from(y);
-            let mut left = f64::INFINITY;
-            let mut right = f64::NEG_INFINITY;
-            for i in 0..3 {
-                let mut start = points[i];
-                let mut end = points[(i + 1) % 3];
-                if start.y > end.y {
-                    std::mem::swap(&mut start, &mut end);
-                }
-                if fy >= start.y && fy < end.y {
-                    // A shared edge always uses the same low-to-high endpoint
-                    // order, so its rounded intersection is identical on both sides.
-                    let t = (fy - start.y) / (end.y - start.y);
-                    let x = (1.0 - t) * start.x + t * end.x;
-                    left = left.min(x);
-                    right = right.max(x);
-                }
-            }
-            let x0 = crate::geom::saturate_i32(left.ceil()).max(limit.x0);
-            let x1 = crate::geom::saturate_i32(right.ceil()).min(limit.x1);
-            if x0 >= x1 {
-                continue;
-            }
-            let point = Point::new((f64::from(x0) - a.x) / scale, (fy - a.y) / scale);
-            let wb = point.cross(v) / area;
-            let wc = u.cross(point) / area;
-            let first: [f64; 3] =
-                std::array::from_fn(|k| 255.0 * (colors[0][k] + wb * delta_b[k] + wc * delta_c[k]));
-            let n = (x1 - x0) as usize;
-            row_src.clear();
-            for i in 0..n {
-                let rgb: [u8; 3] = std::array::from_fn(|k| {
-                    (first[k] + i as f64 * step[k]).clamp(0.0, 255.0) as u8
-                });
-                row_src.push([rgb[0], rgb[1], rgb[2], 255]);
-            }
-            row_cov.clear();
-            row_cov.resize(n, 255);
-            clip.apply(x0, y, row_cov);
-            draw_row(
-                base,
-                layers,
-                DrawRow {
-                    x: x0 as u32,
-                    y: y as u32,
-                    source: SrcRow::Pixels(row_src.as_flattened()),
-                    coverage: row_cov,
-                    shape: row_cov,
-                    mode: BlendMode::Normal,
-                },
-            );
-        }
     }
 
     /// Draws `image` into the parallelogram that `transform` makes of the

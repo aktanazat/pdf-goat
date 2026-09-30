@@ -172,7 +172,14 @@ fn axial_shading_has_unpainted_ends_without_extension() {
         .raw_content(b"/S sh");
     let mut paints = Paints::default();
     run(b, &mut paints);
-    assert_eq!(paints.gradients, vec![[None, Some([0.5, 0.0, 0.5]), None]]);
+    // Colours are sampled in single precision as MuPDF does, so the midpoint
+    // is within f32 noise of the exact blend.
+    let [start, middle, end] = paints.gradients[0];
+    assert_eq!((start, end), (None, None));
+    let middle = middle.expect("the axis midpoint is painted");
+    for (got, want) in middle.into_iter().zip([0.5, 0.0, 0.5]) {
+        assert!((got - want).abs() < 1e-6, "midpoint colour {middle:?}");
+    }
 }
 
 #[test]
