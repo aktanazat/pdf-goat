@@ -1,0 +1,21 @@
+# Vendored copy of hayro-jbig2 0.3.0 (https://github.com/LaurenzV/hayro,
+# Apache-2.0 OR MIT; LICENSE-APACHE and LICENSE-MIT are beside this file).
+# Local change: a per-decode bitmap and work budget in src/limits.rs, set in
+# src/lib.rs `decode_with`, so a corrupted symbol dictionary or halftone grid
+# fails fast instead of allocating and decoding gigapixels.
+[package]
+name = "pdf-codec-jbig2"
+version = "0.3.0"
+edition = "2024"
+authors = ["Laurenz Stampfl <laurenz.stampfl@gmail.com>"]
+description = "hayro-jbig2 0.3.0 with a bitmap budget (vendored for pdf-codec)."
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[lib]
+name = "pdf_codec_jbig2"
+path = "src/lib.rs"
+
+
+[dependencies]
+hayro-ccitt = { version = "0.3.0", default-features = false }

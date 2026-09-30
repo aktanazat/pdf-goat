@@ -1,0 +1,25 @@
+[package]
+name = "pdf-forms"
+description = "AcroForm fields, annotations, appearance streams, and flattening for pdf-goat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+roxmltree = "0.21.1"
+goat-common = { workspace = true }
+pdf-core = { workspace = true }
+pdf-font = { workspace = true }
+pdf-interp = { workspace = true }
+pdf-render = { workspace = true }
+pdf-text = { workspace = true }
+
+[dev-dependencies]
+goat-fixtures = { workspace = true }
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

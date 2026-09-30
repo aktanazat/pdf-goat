@@ -1,0 +1,15 @@
+[package]
+name = "pdf-core"
+description = "PDF object model, parser, writer, filters, page tree, and content streams."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pdf-crypt = { workspace = true }
+miniz_oxide = "0.8.9"
+md-5 = "0.10.6"

@@ -1,0 +1,20 @@
+[package]
+name = "goat-common"
+description = "Shared CLI contract: errors, command registration, path and page helpers, text cache, ledger."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+blake2 = "0.10.6"
+clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Python dicts keep insertion order; every JSON object the CLI prints must too.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,0 +1,30 @@
+[package]
+name = "pdf-text"
+description = "Structured text as MuPDF's stext device builds it, and the text verbs: text, count, search, get text-blocks, compare text, convert html and audio, setup, transcript."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+fancy-regex = "0.19.2"
+goat-common = { workspace = true }
+pdf-codec = { workspace = true }
+pdf-core = { workspace = true }
+pdf-interp = { workspace = true }
+pdf-meaning = { workspace = true }
+# Python dicts keep insertion order; every JSON object the CLI prints must too.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+sha2 = "0.10.9"
+tempfile = "3.27.0"
+unicode-ident = "1.0.24"
+unicode_names2 = "4.0.0"
+
+[dev-dependencies]
+goat-fixtures = { workspace = true }

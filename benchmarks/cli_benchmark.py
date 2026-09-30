@@ -4,8 +4,8 @@ Each trial launches the installed entry point through `/usr/bin/time -l`, so
 the numbers include interpreter start, imports, and the ledger write. Peak
 memory is the per-process physical footprint reported by macOS.
 
-    .venv/bin/python benchmarks/cli_benchmark.py --output results.json a.pdf b.pdf
-    .venv/bin/python benchmarks/cli_benchmark.py --compare before.json after.json
+    python3 benchmarks/cli_benchmark.py --output results.json a.pdf b.pdf
+    python3 benchmarks/cli_benchmark.py --compare before.json after.json
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / ".venv" / "bin" / "pdf-goat-cli"
+CLI = ROOT / "target" / "release" / "pdf-goat"
 MANIFEST = ROOT / "benchmarks" / "results" / "viewer-comparison-corpus.json"
 
 

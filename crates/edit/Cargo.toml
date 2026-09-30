@@ -1,0 +1,31 @@
+[package]
+name = "pdf-edit"
+description = "Redaction, text editing, and table/Office conversions for pdf-goat."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+crc32fast = "1.5.0"
+goat-common = { workspace = true }
+miniz_oxide = "0.8.9"
+pdf-codec = { workspace = true }
+pdf-core = { workspace = true }
+pdf-font = { workspace = true }
+pdf-forms = { workspace = true }
+pdf-interp = { workspace = true }
+pdf-render = { workspace = true }
+pdf-text = { workspace = true }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+[dev-dependencies]
+goat-fixtures = { workspace = true }
+tempfile = "3.27.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+roxmltree = "0.21.1"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

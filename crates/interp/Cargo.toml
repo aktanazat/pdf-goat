@@ -1,0 +1,19 @@
+[package]
+name = "pdf-interp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PDF content-stream interpreter: graphics state, fonts, colour, shadings, images, optional content, annotation appearances, reported to a Device"
+
+[dependencies]
+pdf-core = { workspace = true }
+pdf-font = { workspace = true }
+pdf-codec = { workspace = true }
+unicode-bidi = "0.3.18"
+
+[dev-dependencies]
+goat-fixtures = { workspace = true }
+
+[lints]
+workspace = true

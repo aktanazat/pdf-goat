@@ -2,7 +2,7 @@
 
 Status: this is the target feature ledger. Class and milestone identify planned
 ownership and delivery order. They do not mean that a feature is implemented.
-[`README.md`](../README.md) describes the current Python CLI and native viewer.
+[`README.md`](../README.md) describes the current Rust CLI and native viewer.
 
 ## Scope rule
 
@@ -28,17 +28,17 @@ says the desktop editor remains free and that charging for some future advanced
 options is still under consideration. This ledger uses the Mac features listed
 in PDFgear's current official material.
 
-The current `pdf-goat` CLI covers document structure, annotations, forms,
-security, conversion, optimization, accessibility, comparison, repair, and
-extraction. The target native app uses the current CLI through the private
-worker when native coverage is not yet available.
+The current Rust CLI covers document structure, annotations, forms, security,
+conversion, optimization, accessibility, comparison, repair, and extraction.
+The target native app will reuse it through a private worker when Apple
+frameworks do not cover an operation. That app integration is not built.
 
 ## Delivery classes
 
 | Class | Meaning |
 | --- | --- |
 | Native | Swift and Apple frameworks own the interactive or frequent path |
-| Extended | Private `pdf-goat-worker` owns a cold local job while native coverage grows |
+| Extended | Rust CLI owns standalone advanced jobs; app-worker integration remains planned |
 | Prove | A correctness or compatibility prototype must pass before the feature can mutate user files |
 | Excluded | Intentionally outside the product |
 

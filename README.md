@@ -1,31 +1,50 @@
 # pdf-goat
 
-Local PDF tooling for macOS and Linux. One CLI covers inspection, page edits,
-conversion, extraction, security, and repair. A native macOS app opens the same
-files in a read-only PDFKit viewer.
+Local PDF tooling for macOS and Linux. The Rust CLI covers inspection, page edits,
+conversion, extraction, security, and repair. Its workspace owns PDF parsing,
+writing, text extraction, and rendering; no PDF engine library runs behind it.
+The separate native macOS app remains a read-only PDFKit viewer.
 
-No account and no document upload. Dependency installation and the explicit
-`setup meaning` model download use the network. Searching stays local.
+No account and no document upload. Building dependencies and `setup meaning`
+use the network. HTML inputs can fetch linked stylesheets, fonts, and images.
+Document processing and searching stay local.
 
 ## Install
 
-Requires [uv](https://docs.astral.sh/uv/).
+Requires [Rust 1.98 or later](https://rustup.rs/).
 
 ```bash
-brew install ghostscript qpdf tesseract   # PDF/A and reduce, repair and flatten, OCR
 git clone https://github.com/aktanazat/pdf-goat.git ~/Documents/projects/pdf-goat
+cargo build --release --manifest-path ~/Documents/projects/pdf-goat/Cargo.toml -p pdf-goat
 mkdir -p ~/.local/bin
 ln -sf ~/Documents/projects/pdf-goat/pdf-goat ~/.local/bin/pdf-goat
 pdf-goat --help
 ```
 
 The launcher resolves its own location with `readlink -f` (macOS 12.3 or later,
-any Linux), so the clone can live anywhere. First run installs the Python
-dependencies through uv. On Linux, use the apt or dnf equivalents of the brew
-line. `from-html` and `from-md` need `weasyprint`, `convert from-office`
-needs `office2pdf-cli`, and `convert audio` needs the macOS `say` binary.
+any Linux), so the clone can live anywhere. It runs the compiled release binary;
+it does not install packages or build code on first use. Rebuild after pulling
+source changes.
+
+OCR uses Apple's Vision framework and requires macOS. Speech conversion uses
+the macOS speech tools. `convert from-office` needs `office2pdf` on `PATH`.
 The `office` family uses LibreOffice for macOS, installed with
 `brew install --cask libreoffice` in `/Applications/LibreOffice.app`.
+Ordinary PDF commands need neither Python, Ghostscript, qpdf, nor Tesseract.
+
+### Verify a source build
+
+The complete test suite needs the pinned meaning model, the macOS Helvetica
+font collection, and a system font covering Japanese. Missing or invalid assets
+fail their checks rather than silently skipping them. The tests never download
+the model. Use `PDF_GOAT_HOME` to keep model and command state in a separate
+directory.
+
+```bash
+cargo run -p pdf-goat -- setup meaning
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
 
 ## Use
 
@@ -42,13 +61,11 @@ pdf-goat render report.pdf --pages 1 --dpi 150 -o renders
 lists their verbs. Every run is appended to a SQLite ledger at
 `~/.pdf-goat/ledger.db`; read it with `pdf-goat jobs`.
 
-Page-by-page verbs such as `text`, `search`, `count`, `render`, and `redact`
-spread long documents across worker processes once the first pages prove the
-job slow: eight by default, or `PDF_GOAT_WORKERS`, capped at the CPU count.
-Each worker holds its own copy of the document. Measured on a 1,063-page
-text-heavy file with eight workers, a `text` run peaked near 450 MB across all
-processes for a second or two, and a 200 DPI `render` near 800 MB.
-`PDF_GOAT_WORKERS=1` keeps every verb in one process.
+Page-by-page verbs such as `text`, `search`, `count`, and `render` start
+sequentially. After 200 ms, they use worker threads if at least eight pages
+remain. The worker ceiling is eight by default, or `PDF_GOAT_WORKERS`, capped
+at the CPU count. Each worker opens its own document handle.
+`PDF_GOAT_WORKERS=1` keeps page work sequential.
 
 The CLI stores a derived text cache at `PDF_GOAT_HOME/cache.sqlite`. The
 `PDF_GOAT_CACHE_MB` setting limits cached row payloads to 256 MiB by default.
@@ -90,7 +107,7 @@ Agents can create, inspect, and edit Writer documents, Calc spreadsheets, and
 Impress slides without opening a window. A trusted Python script gets the
 LibreOffice document model as `document`, plus `desktop`, `uno`, and
 `prop(name, value)` for UNO properties. The script runs inside LibreOffice's
-own Python runtime, so the CLI's Python packages are not available there.
+own Python runtime. The Rust CLI does not supply a Python environment.
 
 For example, save this as `edit.py` to replace text in a Writer document:
 
@@ -125,6 +142,24 @@ the supplied script still has your file and network access. Office format
 round-trips can change layout or unsupported features. Inspect the exported
 PDF before replacing an original. The native PDF viewer does not edit Office files.
 
+## Output and verification
+
+- Generated PDF bytes, compression sizes, antialiasing and gradient colors can
+  differ from older releases. Installed fonts affect PDFs that omit font programs.
+  HTML conversion rasterizes SVG artwork at twice CSS resolution and adds a
+  positioned, searchable text layer for its visible labels.
+- `pages flatten` keeps opaque page content as vectors. Pages that actually use
+  transparency become opaque RGB images at 144 dpi, with a searchable text layer.
+  This removes transparency but limits higher-zoom detail on those pages.
+- OCR uses Vision rather than Tesseract, so recognized words and word boxes can
+  differ. It does not automatically convert the output to PDF/A.
+- `convert pdfa` prepares PDF/A-2b output but does not run an external validator.
+  Its `conformance_validated: false` result is deliberate. Validate archival
+  deliverables with an independent tool such as veraPDF.
+- `security sign` creates a self-signed demonstration signature, not an identity
+  certificate. In `security verify`, `trusted` checks the local signature policy;
+  it does not establish a public trust chain or check revocation.
+
 ## Native macOS app
 
 ```sh
@@ -140,7 +175,6 @@ Search uses the CLI installed at `~/.local/bin/pdf-goat`.
 Meaning search needs a one-time setup:
 
 ```sh
-uv sync --project ~/Documents/projects/pdf-goat --extra meaning
 pdf-goat setup meaning
 pdf-goat search report.pdf "spending plan" --meaning --limit 5
 ```
@@ -209,5 +243,5 @@ an explicit app path: `--preview`, `--skim`, `--pdfgear`.
 
 ## License
 
-AGPL-3.0, because pdf-goat builds on PyMuPDF, which is AGPL-3.0 licensed.
+AGPL-3.0.
 See [LICENSE](LICENSE).

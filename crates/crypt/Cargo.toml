@@ -1,0 +1,18 @@
+[package]
+name = "pdf-crypt"
+description = "PDF standard security handler: RC4 and AES, revisions 2 to 6."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aes = "0.8.4"
+cbc = { version = "0.1.2", features = ["alloc"] }
+getrandom = "0.2.17"
+md-5 = "0.10.6"
+sha2 = "0.10.9"
+unicode-normalization = "0.1.25"

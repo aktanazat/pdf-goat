@@ -1,7 +1,7 @@
 # PDF Goat system design
 
 Status: this document defines the target native architecture.
-[`README.md`](../README.md) describes the current Python CLI and read-only
+[`README.md`](../README.md) describes the current Rust CLI and read-only
 native viewer.
 
 ## Purpose
@@ -42,7 +42,7 @@ The native app, command-line control, and MCP adapter meet at one command model.
 +--------------------------------------------------+
 ```
 
-In the target architecture, the current Python implementation runs as the private out-of-process `pdf-goat-worker` for advanced operations that Apple frameworks do not support. It does not own a session. `DocumentEngine` gives it an immutable input snapshot, receives a new candidate PDF, validates that output, and imports it as one transaction.
+In the target architecture, the Rust CLI implementation will run behind the private out-of-process `pdf-goat-worker` interface for advanced operations that Apple frameworks do not support. It will not own a session. `DocumentEngine` will give it an immutable input snapshot, receive a new candidate PDF, validate that output, and import it as one transaction.
 
 ## Linked abstraction levels
 
@@ -99,7 +99,7 @@ UI work stays on the main actor. OCR, extraction, comparison, and conversion run
 
 ### Native `pdf-goat` CLI
 
-The target public `pdf-goat` command is a small Swift command-line target with two explicit profiles. Existing file-in file-out verbs run without the app through a transient `DocumentEngine`. Live-document families target a named app session. Both profiles use the same command and receipt types. The current Python launcher runs behind the private `pdf-goat-worker` name, while existing file verbs keep their names and JSON contracts.
+The target public `pdf-goat` command is a small Swift command-line target with two explicit profiles. Existing file-in file-out verbs will run without the app through a transient `DocumentEngine`. Live-document families will target a named app session. Both profiles will use the same command and receipt types. The Rust implementation will run behind the private `pdf-goat-worker` name. Today, the standalone Rust CLI is the public command; the app integration is not built.
 
 Dispatch never guesses. A request with a session and document ID uses the live profile. A request with file paths and no session ID uses the standalone profile. A request that identifies both fails. Before standalone work opens a source, it checks the workspace for a live session with that source fingerprint and fails with `source_changed` instead of reading stale on-disk bytes.
 
@@ -114,7 +114,7 @@ The MCP adapter is a thin local adapter over the native `pdf-goat` CLI. It does 
 ### Standalone Office jobs (current)
 
 The macOS `office` family runs one headless LibreOffice process per command.
-The Python CLI owns the process group, timeout, input snapshot, temporary
+The CLI owns the process group, timeout, input snapshot, temporary
 profile, and atomic output replacement. LibreOffice loads a private Python
 macro from that profile; the macro opens the snapshot, runs the explicitly
 supplied script, exports a new file, and closes the document. No listener,
@@ -124,9 +124,9 @@ This standalone scripting command has the caller's file and network access.
 It is not the restricted app-integrated worker described below and must not
 be dispatched as one. The native PDF viewer is unchanged.
 
-### Existing Python transformer
+### Existing Rust transformer
 
-The current Python implementation covers merge, split, page operations, annotation, forms, security, conversion, optimization, accessibility, comparison, repair, and extraction. The target system uses it as the private worker for cold advanced jobs until native code covers an operation.
+The current Rust implementation covers merge, split, page operations, annotation, forms, security, conversion, optimization, accessibility, comparison, repair, and extraction. It is written in this repository without PDF libraries (see the [Rust gate](PLAN.md#rust-gate)). The target system uses it as the private worker for cold advanced jobs until native code covers an operation.
 
 Rules for this boundary:
 

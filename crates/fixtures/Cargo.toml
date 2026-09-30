@@ -1,0 +1,15 @@
+[package]
+name = "goat-fixtures"
+description = "Deterministic PDF fixtures for tests, built with pdf-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pdf-core = { workspace = true }
+pdf-codec = { workspace = true }
+pdf-font = { workspace = true }

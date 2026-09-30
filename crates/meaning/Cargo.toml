@@ -1,0 +1,20 @@
+[package]
+name = "pdf-meaning"
+description = "Pinned Model2Vec static embeddings for meaning search."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
+# The same Unicode tables the pinned model's tokenizer was built against
+# (NFD from Unicode 9.0, general categories), so normalization matches it.
+unicode-normalization-alignments = "0.1.12"
+unicode_categories = "0.1.1"

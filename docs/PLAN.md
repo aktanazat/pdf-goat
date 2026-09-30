@@ -7,7 +7,7 @@ measurements decide the targets and choices that are not yet proved.
 
 `PDFGoat.app` is the target native interface for every included row in
 [`FEATURES.md`](FEATURES.md). The target native `pdf-goat` CLI controls the
-same live document. The private Python worker handles cold operations that do
+same live document. The private Rust worker handles cold operations that do
 not yet have a correct Apple-framework implementation.
 
 ## Milestone 0: measurement and platform proof
@@ -23,8 +23,8 @@ Build the proof before committing to a renderer, transport, storage layout, or f
 5. Prove text, button, and choice widget read, fill, create, save, and cross-reader behavior.
 6. Compare one versioned JSON request and response over Apple Events and XPC. Test first-run and denied consent, no running app, multiple sessions, headless use, latency, and reply size. Select one route.
 7. Prove the standalone and live dispatch boundary defined in [`SYSTEM.md`](SYSTEM.md#native-pdf-goat-cli).
-8. Prove that the current `pdf-goat --agent` jobs follow the private-worker boundary in [`SYSTEM.md`](SYSTEM.md#existing-python-transformer).
-9. Prove the restricted worker and operation-scoped password transport defined in [`SYSTEM.md`](SYSTEM.md#existing-python-transformer) and [`AGENT_PROTOCOL.md`](AGENT_PROTOCOL.md#access-and-safety).
+8. Prove that the current `pdf-goat --agent` jobs follow the private-worker boundary in [`SYSTEM.md`](SYSTEM.md#existing-rust-transformer).
+9. Prove the restricted worker and operation-scoped password transport defined in [`SYSTEM.md`](SYSTEM.md#existing-rust-transformer) and [`AGENT_PROTOCOL.md`](AGENT_PROTOCOL.md#access-and-safety).
 10. Prove the working-copy and source-save behavior defined in [`SYSTEM.md`](SYSTEM.md#pdfgoatapp) across autosave, Versions, Save, Replace, crash, and external source edits.
 11. Prove the `DocumentEngine` transaction boundary for page reorder and widget fill through standard PDFKit views, or disable those direct-editing paths.
 12. Prove the signed, notarized, Hardened Runtime release bundle with its code-signed worker and helpers.
@@ -36,7 +36,7 @@ Build the proof before committing to a renderer, transport, storage layout, or f
 - First page display does not wait for indexing, OCR, thumbnails, signature validation, or attachment scans.
 - The form prototype either passes Preview and Acrobat round trips or the unsupported cases move to `Prove` with exact failures.
 - Exactly one local IPC route passes headless use, consent, app lifecycle, multiple-session, latency, and reply-size checks.
-- The app does not invoke the Python worker until the restricted-helper test passes.
+- The app does not invoke the Rust worker until the restricted-helper test passes.
 - Autosave and Versions never write the source URL; explicit Save and Replace pass crash and external-edit tests.
 - Standard PDFKit views cannot bypass revisions, transactions, receipts, or undo.
 - A document job performs no dependency install or network bootstrap.
@@ -134,14 +134,14 @@ Build the proof before committing to a renderer, transport, storage layout, or f
 ### Work
 
 1. Add redaction marking in the native app.
-2. Apply true redaction through the private Python worker until a native implementation passes the same checks.
+2. Apply true redaction through the private Rust worker until a native implementation passes the same checks.
 3. Verify redaction through text extraction, object inspection, raster comparison, re-OCR of every redacted page, and document reopen.
 4. Add dry-run previews for annotation and form flattening.
 5. Add encryption, decryption, permission flags, sanitization, compression, linearization, repair, PDF/A, JSON and XFDF form data, page boxes, headers, footers, watermarks, Bates numbering, n-up, and booklet jobs.
 6. Add Scanner and Continuity Camera import through reviewed page insertion.
 7. Add certificate signing and verification only after Keychain, byte-range, timestamp, chain, and later-change tests pass.
 8. Add accessibility checks and the metadata edits that preserve valid output.
-9. Run every transformer job through the worker boundary in [`SYSTEM.md`](SYSTEM.md#existing-python-transformer).
+9. Run every transformer job through the worker boundary in [`SYSTEM.md`](SYSTEM.md#existing-rust-transformer).
 
 ### Exit gate
 
@@ -288,11 +288,13 @@ license before the experiment. The primary renderer sources are listed in
 
 If a third-party C, C++, Rust, Zig, or other unsafe parser begins reading untrusted PDF bytes, move it to a separate XPC service with a tighter sandbox before it enters the product. The process boundary owns isolation. The implementation language does not.
 
-The existing Python transformer already runs out of process. App integration also requires the restricted-helper gate, because process separation alone does not limit file access. It continues to receive copies and produce new files.
+The existing Rust transformer already runs out of process. App integration also requires the restricted-helper gate, because process separation alone does not limit file access. It continues to receive copies and produce new files.
 
 ### Rust gate
 
-Rust enters only if all five conditions hold:
+The standalone `pdf-goat` CLI, which becomes the private worker, is Rust. The owner chose this on 2026-09-30 and set one rule for it: no PDF libraries. Parsing, encryption, text, rendering, writing, forms, and signatures are written in this repository; general building blocks such as compression, cryptographic primitives, image codecs, and argument parsing may come from crates. This decision covers the CLI and worker only.
+
+Rust enters app-owned code in `PDFGoat.app` only if all five conditions hold:
 
 1. An accepted p95 budget misses by at least 50 percent on two corpus files in two consecutive weekly runs on the M1 floor.
 2. Instruments assigns at least 60 percent of the missed time to PDF Goat code rather than Apple frameworks.

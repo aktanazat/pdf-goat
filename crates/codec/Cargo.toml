@@ -1,0 +1,20 @@
+[package]
+name = "pdf-codec"
+description = "Image codecs PDF needs: DCT, JPX, JBIG2, CCITT, and PNG/JPEG file encode and decode."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Codec-only crates (allowed by the port contract); no PDF-aware crate.
+jpeg-decoder = { version = "0.3.2", default-features = false }
+jpeg-encoder = { version = "0.7.1", default-features = false, features = ["std"] }
+hayro-jpeg2000 = { version = "0.4.0", default-features = false, features = ["std"] }
+# hayro-jbig2 0.3.0 vendored (Apache-2.0 OR MIT) with a per-decode bitmap budget.
+pdf-codec-jbig2 = { version = "0.3.0", path = "vendor/hayro-jbig2" }
+image-webp = "0.2.4"
+miniz_oxide = "0.9.1"

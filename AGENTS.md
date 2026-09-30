@@ -1,6 +1,6 @@
 # PDF Goat agent instructions
 
-This repository contains the Python CLI and the native AppKit viewer. The files
+This repository contains the Rust CLI and the native AppKit viewer. The files
 under `docs/` define the system and agent protocol.
 
 ## Documentation map

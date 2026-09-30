@@ -1,0 +1,12 @@
+[package]
+name = "pdf-raster"
+description = "Anti-aliased 2D rasterizer: paths, strokes, clips, images, and shaders."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

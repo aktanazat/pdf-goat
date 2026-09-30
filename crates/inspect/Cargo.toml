@@ -1,0 +1,26 @@
+[package]
+name = "pdf-inspect"
+description = "Document inspection and maintenance verbs: info, inspect, preflight, meta, get object/fonts/images/attachments, attach, detach, compare structure, accessibility, security, repair, compress, optimize reduce, convert pdfa."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+goat-common = { workspace = true }
+pdf-codec = { workspace = true }
+pdf-core = { workspace = true }
+pdf-crypt = { workspace = true }
+pdf-font = { workspace = true }
+pdf-text = { workspace = true }
+# Python dicts keep insertion order; every JSON object the CLI prints must too.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+goat-fixtures = { workspace = true }
+tempfile = "3.27.0"

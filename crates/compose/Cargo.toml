@@ -1,0 +1,34 @@
+[package]
+name = "pdf-compose"
+description = "PDF composition for pdf-goat: images to PDF, and an HTML/CSS and Markdown renderer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+goat-common = { workspace = true }
+html5ever = "0.40.1"
+fontdb = "0.24.0"
+pdf-codec = { workspace = true }
+pdf-core = { workspace = true }
+pdf-font = { workspace = true }
+pulldown-cmark = { version = "0.13.4", default-features = false }
+resvg = "0.48.1"
+rustybuzz = "0.20.1"
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+taffy = { version = "0.14.0", features = ["parse"] }
+unicode-bidi = "0.3.18"
+unicode-linebreak = "0.1.5"
+unicode-normalization = "0.1.25"
+unicode-script = "0.5.8"
+ureq = "3.4.2"
+url = "2.5.8"
+
+[dev-dependencies]
+pdf-text = { workspace = true }
+tempfile = "3.27.0"

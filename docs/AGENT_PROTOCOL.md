@@ -1,6 +1,6 @@
 # Agent protocol
 
-Status: the standalone Python commands described as current are implemented.
+Status: the standalone commands described as current are implemented.
 The nine-family live protocol, native CLI, MCP mapping, durable findings, and
 live job model are target contracts for later milestones.
 
@@ -52,7 +52,7 @@ uses canonical operation names such as `pages.reorder`,
 `security.apply_redactions`, and `edit.replace_text`. A capability record gives
 the equivalent standalone invocation when one exists.
 
-Milestone 2 moves the current Python command implementation behind the private
+Milestone 2 moves the current Rust command implementation behind the private
 `pdf-goat-worker` name. The public `pdf-goat` command remains one native
 executable.
 
@@ -136,7 +136,7 @@ Every `rect` a result carries is `[x0, y0, x1, y1]` in points on the page's crop
 
 `text` with `-o` and without `--layout` streams the page text to that file. The result then reports `page_count` and the file path in `outputs`, and carries no `pages` list. Without `-o` the result carries the per-page text in `pages`. `--layout` always returns the per-page layout in `pages`, with or without `-o`.
 
-`get images` writes each stored stream as it stands: `.jpg` for DCT, `.jp2` for JPX, `.tif` for CCITT, `.tiff` for CMYK rasters, `.png` otherwise. A stencil mask is written with the PDF's sample values, not its painted appearance. An image pikepdf cannot read falls back to MuPDF, which re-encodes it.
+`get images` preserves stored compression where possible: `.jpg` for DCT, `.jp2` for JPX, `.tif` for CCITT, `.tiff` for CMYK rasters, and `.png` otherwise. A stencil mask is written with the PDF's sample values, not its painted appearance. Other supported streams are decoded and re-encoded by the native codecs; an unsupported encoding returns an error.
 
 `split`, `extract`, `compress`, and `convert from-office` write through a sibling `.part` file and rename it over the destination. A failed run leaves neither file. An existing read-only destination is replaced, because the rename needs write access to the directory, not the file.
 

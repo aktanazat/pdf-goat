@@ -1,0 +1,19 @@
+[package]
+name = "pdf-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Page rasterisation on pdf-interp and pdf-raster, and the render and compare visual verbs"
+
+[dependencies]
+pdf-core = { workspace = true }
+pdf-interp = { workspace = true }
+pdf-raster = { workspace = true }
+pdf-codec = { workspace = true }
+goat-common = { workspace = true }
+clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+
+[lints]
+workspace = true

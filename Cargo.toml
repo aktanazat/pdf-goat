@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+rust-version = "1.98"
+
+[workspace.dependencies]
+pdf-core = { path = "crates/core" }
+pdf-crypt = { path = "crates/crypt" }
+pdf-codec = { path = "crates/codec" }
+pdf-font = { path = "crates/font" }
+pdf-raster = { path = "crates/raster" }
+pdf-ocr = { path = "crates/ocr" }
+pdf-meaning = { path = "crates/meaning" }
+goat-common = { path = "crates/common" }
+goat-fixtures = { path = "crates/fixtures" }
+pdf-sign = { path = "crates/sign" }
+pdf-interp = { path = "crates/interp" }
+pdf-render = { path = "crates/render" }
+pdf-compose = { path = "crates/compose" }
+pdf-text = { path = "crates/text" }
+pdf-inspect = { path = "crates/inspect" }
+pdf-edit = { path = "crates/edit" }
+pdf-organize = { path = "crates/organize" }
+pdf-forms = { path = "crates/forms" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
