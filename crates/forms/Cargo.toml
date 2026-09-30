@@ -14,11 +14,11 @@ goat-common = { workspace = true }
 pdf-core = { workspace = true }
 pdf-font = { workspace = true }
 pdf-interp = { workspace = true }
-pdf-render = { workspace = true }
 pdf-text = { workspace = true }
 
 [dev-dependencies]
 goat-fixtures = { workspace = true }
+pdf-render = { workspace = true }
 tempfile = "3.27.0"
 
 [lints]

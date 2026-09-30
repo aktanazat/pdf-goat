@@ -12,19 +12,15 @@
 //! [`flatten`] fits each selected normal appearance to its annotation rectangle,
 //! respecting the appearance matrix, visibility flags, and page rotation. It
 //! makes resources local, merges form defaults, and removes painted annotations.
-//! `pages flatten` regenerates appearances when `NeedAppearances` is set and
-//! replaces transparency-using page content with opaque RGB at 144 dpi. An
-//! embedded Unicode text layer preserves search and selection. Page geometry,
-//! links, and metadata survive; pages without active transparency keep their
-//! original content. A TrueType sans-serif system font is required for the
-//! searchable layer. High-zoom vector detail is limited by the raster resolution.
+//! `pages flatten` regenerates appearances when `NeedAppearances` is set.
+//! Page content, including transparency, stays vector and unchanged, so
+//! zooming keeps full detail.
 
 mod annots;
 mod appearance;
 mod clear;
 mod flatten;
 mod forms;
-mod transparency;
 
 pub use appearance::{set_field_value, update_widget_appearance};
 pub use clear::clear_field_value;

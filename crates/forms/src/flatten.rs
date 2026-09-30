@@ -372,20 +372,24 @@ fn pages(matches: &ArgMatches, _: &Ctx) -> Result<Map<String, Value>, GoatError>
     let (mut doc, source) = open(required::<String>(matches, "file")?, "pymupdf")?;
     let output = crate::forms::output(matches, &source, "flattened", "pdf")?;
     flatten_appearances(&mut doc, true, true)?;
-    let transparent = crate::transparency::flatten_transparency(&mut doc)?;
     crate::forms::save(&doc, &output, true)?;
-    let mut flattened = vec!["annotations", "form_fields"];
-    if transparent > 0 {
-        flattened.push("transparency");
-    }
     let mut output = result(
         "pages-flatten",
         &source,
         vec![output.to_string_lossy().into_owned()],
     );
-    output.insert("flattened".into(), json!(flattened));
+    output.insert("flattened".into(), json!(["annotations", "form_fields"]));
     Ok(output)
 }
 pub(crate) fn register(registry: &mut Registry) {
-    registry.family_verb("pages",Verb::new(crate::forms::out(crate::forms::base("flatten","flatten annotations and form appearances; flatten transparency when Ghostscript succeeds")),pages));
+    registry.family_verb(
+        "pages",
+        Verb::new(
+            crate::forms::out(crate::forms::base(
+                "flatten",
+                "flatten annotations and form appearances into page content",
+            )),
+            pages,
+        ),
+    );
 }

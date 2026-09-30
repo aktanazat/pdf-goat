@@ -31,223 +31,58 @@ fn contents(doc: &Document, page: usize) -> Vec<u8> {
 }
 
 #[test]
-fn transparent_pages_become_opaque_searchable_and_keep_geometry_links_metadata() {
+fn transparent_page_content_stays_vector_and_unchanged() {
     let home = tempfile::tempdir().expect("tempdir");
     let mut builder = PdfBuilder::new();
-    builder.info("Title", "Preserved transparency");
     builder
         .page(192.0, 256.0)
-        .rotate(90)
-        .entry("CropBox", Rect::new(10.0, 20.0, 182.0, 236.0).to_object())
-        .entry("UserUnit", Object::Real(1.25))
         .text(30.0, 60.0, "Searchable value")
-        .link_uri([30.0, 70.0, 130.0, 90.0], "https://example.com/kept")
         .raw_content(b"q /Fade gs 1 0 0 rg 25 35 80 40 re f Q\n");
-    builder
-        .page(192.0, 256.0)
-        .text(30.0, 60.0, "Untouched page");
     let mut doc = builder.build();
-    for index in 0..2 {
-        let page = doc.page(index).expect("page");
-        let mut resource = page.resources;
-        let mut states = Dict::new();
-        let mut state = Dict::new();
-        state.insert("ca", Object::Real(0.5));
-        states.insert("Fade", state);
-        resource.insert("ExtGState", states);
-        let mut dictionary = page.dict;
-        dictionary.insert("Resources", resource);
-        doc.set(page.id, dictionary);
-    }
+    let page = doc.page(0).expect("page");
+    let mut resources = page.resources;
+    let mut state = Dict::new();
+    state.insert("ca", Object::Real(0.5));
+    let mut states = Dict::new();
+    states.insert("Fade", state);
+    resources.insert("ExtGState", states);
+    let mut dictionary = page.dict;
+    dictionary.insert("Resources", resources);
+    doc.set(page.id, dictionary);
     let source = home.path().join("transparency.pdf");
     doc.save(&source, &SaveOptions::default())
         .expect("save fixture");
     let first = doc.page(0).expect("first page");
-    let before = render_page(
-        &doc,
-        &first,
-        &RenderOptions {
-            dpi: 144.0,
-            alpha: false,
-            annotations: false,
-        },
-    )
-    .expect("render source");
-    assert!(
-        before
-            .data()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .any(|pixel| pixel[0] == 255
-                && (126..=129).contains(&pixel[1])
-                && pixel[1] == pixel[2])
-    );
-    let text = pdf_text::extract_page(&doc, 0, pdf_text::TextFlags::TEXT)
-        .expect("source text")
-        .text();
-    let untouched = contents(&doc, 1);
-    let result = flatten(home.path(), source.to_str().expect("path"));
-    assert_eq!(
-        result["flattened"],
-        json!(["annotations", "form_fields", "transparency"])
-    );
-    let path = result["outputs"][0].as_str().expect("output");
-    let output = Document::open(path).expect("reopen");
-    let page = output.page(0).expect("output page");
-    for key in [b"MediaBox".as_slice(), b"CropBox", b"Rotate", b"UserUnit"] {
-        assert_eq!(page.dict.get(key), first.dict.get(key));
-    }
-    assert_eq!(
-        output
-            .info()
-            .expect("info")
-            .expect("dictionary")
-            .get_string(b"Title")
-            .expect("title")
-            .to_text(),
-        "Preserved transparency"
-    );
-    let annots = output.resolve_key(&page.dict, b"Annots").expect("links");
-    let link = output
-        .resolve_dict(&annots.as_array().expect("array")[0])
-        .expect("resolve")
-        .expect("dictionary");
-    assert_eq!(link.get_name(b"Subtype"), Some(b"Link".as_slice()));
-    let action = output
-        .resolve_dict(link.get(b"A").expect("action"))
-        .expect("resolve")
-        .expect("dictionary");
-    assert_eq!(
-        action.get_string(b"URI").expect("URI").to_text(),
-        "https://example.com/kept"
-    );
-    assert!(!page.dict.contains_key(b"Group"));
-    assert!(!page.resources.contains_key(b"ExtGState"));
-    let images = output
-        .resolve_key(&page.resources, b"XObject")
-        .expect("images");
-    for (_, object) in images.as_dict().expect("dictionary").iter() {
-        let image = output
-            .resolve_stream(object)
-            .expect("resolve")
-            .expect("image");
-        assert_eq!(image.dict.get_name(b"Subtype"), Some(b"Image".as_slice()));
-        assert_eq!(
-            image.dict.get_name(b"ColorSpace"),
-            Some(b"DeviceRGB".as_slice())
-        );
-        assert!(!image.dict.contains_key(b"SMask"));
-        assert!(!image.dict.contains_key(b"Mask"));
-    }
-    let after = render_page(
-        &output,
-        &page,
-        &RenderOptions {
-            dpi: 144.0,
-            alpha: false,
-            annotations: false,
-        },
-    )
-    .expect("render output");
-    assert_eq!(
-        (before.width(), before.height()),
-        (after.width(), after.height())
-    );
-    let max_difference = before
-        .data()
-        .iter()
-        .zip(after.data())
-        .map(|(a, b)| a.abs_diff(*b))
-        .max()
-        .expect("pixels");
-    assert!(
-        max_difference <= 1,
-        "raster appearance changed by {max_difference} channel levels"
-    );
-    assert_eq!(
-        pdf_text::extract_page(&output, 0, pdf_text::TextFlags::TEXT)
-            .expect("output text")
-            .text(),
-        text
-    );
-    assert_eq!(contents(&output, 1), untouched);
-    let second = flatten(home.path(), path);
-    assert_eq!(second["flattened"], json!(["annotations", "form_fields"]));
-}
+    let options = RenderOptions {
+        dpi: 600.0,
+        alpha: false,
+        annotations: false,
+    };
+    let before = render_page(&doc, &first, &options).expect("render source");
 
-#[test]
-fn intrinsic_image_masks_are_flattened_without_inventing_text() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let mut builder = PdfBuilder::new();
-    builder
-        .page(120.0, 80.0)
-        .raw_content(b"q 100 0 0 40 10 20 cm /Masked Do Q\n");
-    let mut doc = builder.build();
-    let mut mask = Dict::new();
-    mask.insert("Type", Object::name("XObject"));
-    mask.insert("Subtype", Object::name("Image"));
-    mask.insert("Width", 2_i64);
-    mask.insert("Height", 1_i64);
-    mask.insert("BitsPerComponent", 8_i64);
-    mask.insert("ColorSpace", Object::name("DeviceGray"));
-    let alpha = doc.add(pdf_core::Stream::new(mask.clone(), vec![128, 255]));
-    mask.insert("ColorSpace", Object::name("DeviceRGB"));
-    mask.insert("SMask", alpha);
-    let image = doc.add(pdf_core::Stream::new(mask, vec![255, 0, 0, 0, 0, 255]));
-    let mut page = doc.page(0).expect("page");
-    let mut objects = Dict::new();
-    objects.insert("Masked", image);
-    page.resources.insert("XObject", objects);
-    page.dict.insert("Resources", page.resources.clone());
-    doc.set(page.id, page.dict.clone());
-    let source = home.path().join("masked.pdf");
-    doc.save(&source, &SaveOptions::default()).expect("save");
-    let before = render_page(
-        &doc,
-        &page,
-        &RenderOptions {
-            dpi: 144.0,
-            alpha: false,
-            annotations: false,
-        },
-    )
-    .expect("source render");
     let result = flatten(home.path(), source.to_str().expect("path"));
-    assert_eq!(
-        result["flattened"],
-        json!(["annotations", "form_fields", "transparency"])
-    );
+
+    assert_eq!(result["flattened"], json!(["annotations", "form_fields"]));
     let output = Document::open(result["outputs"][0].as_str().expect("output")).expect("reopen");
-    let page = output.page(0).expect("page");
-    let after = render_page(
-        &output,
-        &page,
-        &RenderOptions {
-            dpi: 144.0,
-            alpha: false,
-            annotations: false,
-        },
-    )
-    .expect("output render");
-    assert_eq!(before.data(), after.data());
-    let objects = output
-        .resolve_key(&page.resources, b"XObject")
-        .expect("objects");
-    for (_, object) in objects.as_dict().expect("dictionary").iter() {
-        let image = output
-            .resolve_stream(object)
-            .expect("resolve")
-            .expect("image");
-        assert!(!image.dict.contains_key(b"SMask"));
-        assert!(!image.dict.contains_key(b"Mask"));
-    }
-    assert_eq!(
-        pdf_text::extract_page(&output, 0, pdf_text::TextFlags::TEXT)
-            .expect("text")
-            .text(),
-        ""
-    );
+    let page = output.page(0).expect("output page");
+    assert_eq!(contents(&output, 0), contents(&doc, 0));
+    let states = output
+        .resolve_key(&page.resources, b"ExtGState")
+        .expect("states");
+    let fade = output
+        .resolve_dict(
+            states
+                .as_dict()
+                .expect("dictionary")
+                .get(b"Fade")
+                .expect("Fade"),
+        )
+        .expect("resolve")
+        .expect("dictionary");
+    assert_eq!(fade.get(b"ca"), Some(&Object::Real(0.5)));
+    assert!(!page.resources.contains_key(b"XObject"));
+    let after = render_page(&output, &page, &options).expect("render output");
+    assert!(before.data() == after.data(), "high-zoom render changed");
 }
 
 #[test]
