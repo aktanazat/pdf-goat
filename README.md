@@ -119,6 +119,28 @@ pdf-goat --agent search report.pdf invoice --first
 pdf-goat --agent transcript read transcript.pdf --conferred 2026-06-12
 ```
 
+## MCP server
+
+`pdf-goat-mcp` serves the same commands to MCP clients over stdio. It has no
+PDF code of its own: each tool call runs the `pdf-goat` release binary built
+beside it, and the build in [Install](#install) produces both. Register the
+launcher in the clone with the client, by absolute path:
+
+```json
+{
+  "mcpServers": {
+    "pdf-goat": { "command": "/path/to/pdf-goat/pdf-goat-mcp" }
+  }
+}
+```
+
+Three tools cover every command. `capabilities` looks up commands and their
+arguments, `run` runs one command and returns its JSON, and `render` returns a
+page as an image, optionally clipped, with rectangles outlined to check
+positions. A large result comes back shortened, with the whole JSON saved to a
+file. [`docs/AGENT_PROTOCOL.md`](docs/AGENT_PROTOCOL.md#mcp-mapping) describes
+the mapping.
+
 ## Agent-driven Office editing
 
 Agents can create, inspect, and edit Writer documents, Calc spreadsheets, and

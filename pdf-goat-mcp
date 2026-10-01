@@ -1,0 +1,14 @@
+#!/bin/sh
+# Run the explicitly built MCP server; never install or build on first use. It speaks
+# MCP on stdio and runs the pdf-goat release binary built beside it for every call.
+set -eu
+# Self-locating: resolve the symlink in ~/.local/bin back to this launcher with
+# one readlink call so the project works no matter where it's cloned.
+self="$(readlink -f -- "$0")"
+dir="${self%/*}"
+binary="$dir/target/release/pdf-goat-mcp"
+if [ ! -x "$binary" ]; then
+  printf 'pdf-goat-mcp release binary is missing. build it with:\n  cargo build --release --manifest-path "%s/Cargo.toml" -p pdf-goat\n' "$dir" >&2
+  exit 1
+fi
+exec "$binary" "$@"

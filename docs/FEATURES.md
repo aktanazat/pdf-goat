@@ -197,7 +197,7 @@ and does not add an interactive office suite to the app.
 | Named selections and result sets | Native | 2 | Agents reuse server-side targets without resending large payloads |
 | Evidence-linked findings | Native | 4 | Stale evidence remains visible after source changes |
 | Built-in cross-document batch workflow engine | Excluded | None | Agents and scripts compose one-file commands without duplicate orchestration or false cross-file atomicity |
-| MCP adapter | Native | 4 | Thin mapping over the native `pdf-goat` protocol with no PDF logic or duplicate state |
+| MCP adapter | Native | 4 | Thin mapping over the native `pdf-goat` protocol with no PDF logic or duplicate state; [`pdf-goat-mcp`](AGENT_PROTOCOL.md#mcp-mapping) already serves the standalone commands |
 | Generic built-in AI chat, summarizer, or copilot | Excluded | None | The external agent already owns reasoning and natural-language control |
 
 ## Product exclusions

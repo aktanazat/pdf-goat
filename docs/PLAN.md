@@ -118,7 +118,7 @@ Build the proof before committing to a renderer, transport, storage layout, or f
 6. Add read aloud and page-linked audio export through system speech.
 7. Add finding and job-checkpoint records to the Milestone 2 workspace store.
 8. Implement the finding state transitions in [`AGENT_PROTOCOL.md`](AGENT_PROTOCOL.md#saved-workspace-records).
-9. Add the thin MCP adapter over the stable native `pdf-goat` protocol.
+9. Extend the MCP adapter, which already serves the standalone commands ([`AGENT_PROTOCOL.md`](AGENT_PROTOCOL.md#mcp-mapping)), to the stable native `pdf-goat` protocol.
 
 ### Exit gate
 

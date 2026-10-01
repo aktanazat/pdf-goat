@@ -1,8 +1,9 @@
 # Agent protocol
 
-Status: the standalone commands described as current are implemented.
-The nine-family live protocol, native CLI, MCP mapping, durable findings, and
-live job model are target contracts for later milestones.
+Status: the standalone commands described as current are implemented, and so is
+`pdf-goat-mcp`, the MCP adapter over them described under MCP mapping. The
+nine-family live protocol, native CLI, the live MCP mapping, durable findings,
+and live job model are target contracts for later milestones.
 
 ## Goal
 
@@ -60,7 +61,7 @@ executable.
 
 The current standalone command uses `pdf-goat --agent capabilities` to return root arguments, top-level family names, standalone command names, a command count, the requested selector, and schemas. Schemas stay empty until a selector is supplied. `pdf-goat --agent capabilities pages` returns the `pages` family schema. The nine-family live protocol below is a later milestone.
 
-The MCP adapter follows the same pattern. It exposes the nine family tools and serves detailed schemas as resources. It does not register one tool for every annotation shape, conversion target, or page operation.
+The MCP adapter follows the same pattern. Over the standalone commands it exposes three tools, `capabilities`, `run`, and `render`, and serves the same capability listings as resources; over the live protocol it will expose the nine family tools. It does not register one tool for every annotation shape, conversion target, or page operation.
 
 A capability record reports:
 
@@ -529,18 +530,36 @@ Worker-produced text first returns as a file-backed artifact with a digest and s
 
 ## MCP mapping
 
-The MCP adapter maps one-to-one to the nine command families. It adds no policy, state, retries, or PDF implementation.
+`pdf-goat-mcp` serves the standalone commands to MCP clients over stdio. It adds no PDF logic, policy, state, or retries: every call runs the `pdf-goat` binary in the directory of the server's own resolved executable as `pdf-goat --agent ...`, one child process per call, with no shell and an empty stdin. When that binary is missing, the server exits with status 1 and names the path it expected. `cargo build --release -p pdf-goat` builds both binaries, and the `pdf-goat-mcp` launcher in the repository root runs the release build.
 
-Resources expose:
+| Tool | Arguments | Runs | Annotations |
+| --- | --- | --- | --- |
+| `capabilities` | `selector?` | `capabilities [selector]` | read-only, idempotent, closed world |
+| `run` | `command`, `args?` | the words of `command`, then `args`, one token per item | destructive, not idempotent, open world |
+| `render` | `file`, `page?` (1), `dpi?` (96), `clip?`, `marks?` | `render FILE --pages PAGE --dpi DPI [--clip=CLIP] [--mark=MARK]... -o SESSION/render-N` | read-only, idempotent, closed world |
 
-- Capability family schemas.
-- Open document summaries.
-- Paged observations.
-- Job and receipt records.
-- Rendered artifact metadata.
+`run` is destructive because a command replaces an existing `-o` file and `office run` executes scripts, and open world because results carry timestamps and `setup` downloads. `clip` and each of `marks` are `"x0,y0,x1,y1"` strings in the frames given under [Rectangle coordinates](#rectangle-coordinates).
 
-The adapter returns concise results and paths. An agent can call `pdf-goat`
-directly without loading MCP schemas.
+The resource `pdf-goat://capabilities` and the template `pdf-goat://capabilities/{selector}` return the same JSON as the `capabilities` tool, typed `application/json`. A selector `pdf-goat` rejects returns a resource-not-found error carrying its message.
+
+A tool result holds, in order:
+
+- The command's JSON, compact, with the keys in `pdf-goat`'s order. Output that is not JSON, such as `--help`, comes back as text.
+- For a successful command, the PNG and JPEG files in `outputs` as images: the first four of at most 5 MiB each.
+- A note when the JSON was shortened, an image was left out, or a failed command printed no JSON.
+- The last 4,000 characters of stderr, when it is not empty.
+
+Compact JSON over 24,000 bytes comes back shortened: the same top-level keys in the same order, with each value over 1,000 bytes replaced by a marker such as `"[omitted: array of 312 items, 1180342 bytes]"` (`array of N items`, `object of N keys`, or `string of N characters`). The command's stdout is saved byte for byte as `result-N.json` in the session directory, and the note names that file.
+
+A command that exits nonzero or reports `"ok": false` returns a tool error (`isError: true`) with its JSON and stderr. An argument of the wrong type, a missing required argument, or an unknown argument name also returns a tool error, and nothing runs; a `page` or `dpi` below 1 reaches `pdf-goat`, which rejects it. An unknown tool name is a protocol error.
+
+Each server process keeps one session directory under the system temporary directory for renders and saved results, and removes it when it exits on a closed stdin, SIGTERM, or SIGINT. A cancelled request sends its child SIGTERM, then SIGKILL after three seconds, and reaps it. When stdin closes, running calls get the transport's five-second drain to finish before they are cancelled; SIGTERM or SIGINT cancels them at once. The server exits only after every child has been reaped. There are no other timeouts.
+
+The server instructions ask an agent to find commands with `capabilities`, read every written file back through another command, and look at the changed region with `render` before it reports a change.
+
+The live-protocol mapping remains a later milestone: one tool per live family, with resources for open document summaries, paged observations, job and receipt records, and rendered artifact metadata.
+
+An agent can call `pdf-goat` directly without loading MCP schemas.
 
 ## Protocol acceptance tests
 
