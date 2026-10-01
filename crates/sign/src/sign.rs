@@ -6,7 +6,8 @@
 //! invisible unless the request gives it a box to show. A certification signature also
 //! records its DocMDP permission, as pyhanko's `SigMDPSetup` does. With `--ltv`, later
 //! revisions keep what long-term validation needs in the document security store and,
-//! with `--tsa`, time-stamp the whole document over it (PAdES B-LTA).
+//! with `--tsa`, time-stamp the whole document over it: PAdES B-LTA once that store
+//! completes the signer's and the time-stamp authority's chains, else B-T.
 
 use goat_common::parse::selected_page;
 use pdf_core::{Dict, Document, ObjRef, Object, Page, PdfDate, PdfString, Rect};
@@ -115,6 +116,9 @@ pub struct Signed {
     pub ltv: Option<Material>,
     /// The time the document time-stamp attests, when `--ltv --tsa` added one.
     pub document_time_stamp: Option<PdfDate>,
+    /// The document time-stamp covers a store that completes the chains of the signer
+    /// and of the signature time-stamp's authority: PAdES B-LTA.
+    pub lta: bool,
 }
 
 /// The signed document.
@@ -218,12 +222,13 @@ pub fn sign_document(data: Vec<u8>, request: &Request<'_>) -> Result<Signed, Str
     for _ in 0..2 {
         match sign_revision(&doc, sig_ref, request)? {
             (Attempt::Sealed { data, contents }, time_stamp) => {
-                let (data, ltv, document_time_stamp) = match request.ltv {
+                let (data, ltv, document_time_stamp, lta) = match request.ltv {
                     Some(http) => {
-                        let (data, material, stamped) = long_term(data, &contents, http, request)?;
-                        (data, Some(material), stamped)
+                        let (data, material, stamped, lta) =
+                            long_term(data, &contents, http, request)?;
+                        (data, Some(material), stamped, lta)
                     }
-                    None => (data, None, None),
+                    None => (data, None, None, false),
                 };
                 return Ok(Signed {
                     data,
@@ -233,6 +238,7 @@ pub fn sign_document(data: Vec<u8>, request: &Request<'_>) -> Result<Signed, Str
                     permission: setup.permission,
                     ltv,
                     document_time_stamp,
+                    lta,
                 });
             }
             (Attempt::TooLarge(needed), _) => {
@@ -278,13 +284,14 @@ fn add_to_fields(doc: &mut Document, form: &mut Dict, widget_ref: ObjRef) -> Res
 /// `data` made verifiable long-term (`--ltv`): the certificate chains of the signature
 /// whose CMS is `cms` and of its time-stamp, with their revocation answers, in the
 /// document security store; then, with `--tsa`, a document time-stamp over that, and the
-/// material for the time-stamp's own chain when the store lacked it.
+/// material for the time-stamp's own chain when the store lacked it. The flag says the
+/// store the document time-stamp covers completes the first two chains.
 fn long_term(
     data: Vec<u8>,
     cms: &[u8],
     http: &Http,
     request: &Request<'_>,
-) -> Result<(Vec<u8>, Material, Option<PdfDate>), String> {
+) -> Result<(Vec<u8>, Material, Option<PdfDate>, bool), String> {
     let signature = Signature::parse(cms)?;
     let token = tsp::embedded_token(&signature).transpose()?;
     let mut leaves = vec![signature.certificate()];
@@ -297,8 +304,12 @@ fn long_term(
     ltv::gather(http, &leaves, &carried, &mut material)?;
     let data = ltv::add_dss(data, &material)?;
     let Some(tsa) = &request.tsa else {
-        return Ok((data, material, None));
+        return Ok((data, material, None, false));
     };
+    // B-LTA asks the store the document time-stamp covers to complete both chains.
+    let complete = token.as_ref().map_or(Ok(false), |token| {
+        ltv::completes(&material, &leaves, &carried, ltv::system_time(&token.time))
+    })?;
     let (data, stamp) = time_stamp_document(data, tsa, request.signer.digest())?;
     let held = material.held();
     // The pool for finding issuers keeps the certificates seen so far: a token often
@@ -315,7 +326,7 @@ fn long_term(
     } else {
         data
     };
-    Ok((data, material, Some(stamp.time)))
+    Ok((data, material, Some(stamp.time), complete))
 }
 
 /// `data` with a document time-stamp in a new revision: an invisible signature field on

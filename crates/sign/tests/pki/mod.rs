@@ -1,13 +1,13 @@
-//! An in-test public-key infrastructure: a root certificate authority, signing keys of
-//! each supported type, PKCS#12 files holding them in the modern (PBES2, AES-256,
-//! HMAC-SHA-256) and legacy (triple DES and RC2, HMAC-SHA-1) encodings, an RFC 3161
-//! time-stamp authority, and the root's OCSP responder and CRL, each served over HTTP on
-//! a loopback port.
+//! An in-test public-key infrastructure: a root certificate authority and the authorities
+//! it certifies, signing keys of each supported type, PKCS#12 files holding them in the
+//! modern (PBES2, AES-256, HMAC-SHA-256) and legacy (triple DES and RC2, HMAC-SHA-1)
+//! encodings, an RFC 3161 time-stamp authority, and the root's OCSP responder and CRL or
+//! an OCSP responder it delegated, each served over HTTP on a loopback port.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -19,8 +19,8 @@ use cms::content_info::{CmsVersion, ContentInfo};
 use cms::encrypted_data::EncryptedData;
 use cms::enveloped_data::EncryptedContentInfo;
 use cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier};
-use const_oid::ObjectIdentifier;
 use const_oid::db::{rfc5280, rfc5911, rfc5912, rfc6268};
+use const_oid::{AssociatedOid, ObjectIdentifier};
 use der::asn1::{Ia5String, Int, OctetString};
 use der::{Any, DateTime, Decode, Encode, Sequence, Tag};
 use hmac::{Hmac, Mac};
@@ -50,6 +50,7 @@ use x509_cert::ext::pkix::name::{DistributionPointName, GeneralName};
 use x509_cert::ext::pkix::{
     AccessDescription, AuthorityInfoAccessSyntax, CrlDistributionPoints, ExtendedKeyUsage,
 };
+use x509_cert::ext::{AsExtension, Extension};
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::time::{Time, Validity};
@@ -117,7 +118,11 @@ impl Key {
     }
 }
 
-/// A self-signed root certificate authority with an RSA-2048 key.
+/// A certificate an in-test authority is issuing; tests add extensions through it.
+pub type CertBuilder<'a> = CertificateBuilder<'a, rsa::pkcs1v15::SigningKey<Sha256>>;
+
+/// A certificate authority with an RSA-2048 key: a self-signed root, or an intermediate
+/// authority a root certified.
 #[derive(Clone)]
 pub struct Ca {
     pub cert: Certificate,
@@ -149,7 +154,7 @@ impl Ca {
         &self,
         subject: &str,
         key: &Key,
-        extend: impl FnOnce(&mut CertificateBuilder<'_, rsa::pkcs1v15::SigningKey<Sha256>>),
+        extend: impl FnOnce(&mut CertBuilder<'_>),
     ) -> Certificate {
         let profile = Profile::Leaf {
             issuer: self.cert.tbs_certificate.subject.clone(),
@@ -172,37 +177,31 @@ impl Ca {
             .expect("leaf certificate")
     }
 
-    /// The OCSP response, signed by the root itself, to the DER request `query`: each
-    /// certificate asked about is good unless `revoked` holds its serial. The answer is
-    /// current from a minute ago for a day and echoes the request's nonce.
-    fn ocsp(&self, query: &[u8], revoked: &[SerialNumber]) -> Vec<u8> {
-        let request = OcspRequest::from_der(query).expect("OCSP request");
-        let now = SystemTime::now();
-        let mut builder = OcspResponseBuilder::new(self.cert.tbs_certificate.subject.clone());
-        for single in &request.tbs_request.request_list {
-            let id = single.req_cert.clone();
-            let status = if revoked.contains(&id.serial_number) {
-                CertStatus::revoked(RevokedInfo {
-                    revocation_time: ocsp_time(now - REVOKED_AGO),
-                    revocation_reason: None,
-                })
-            } else {
-                CertStatus::good()
-            };
-            builder = builder.with_single_response(
-                SingleResponse::new(id, status, ocsp_time(now - MINUTE))
-                    .with_next_update(ocsp_time(now + DAY)),
-            );
+    /// A certificate authority named `subject` that this one certifies, holding the same
+    /// key, with `extend` adding extensions beyond the authority profile's basic
+    /// constraints and key usage.
+    pub fn intermediate(&self, subject: &str, extend: impl FnOnce(&mut CertBuilder<'_>)) -> Ca {
+        let profile = Profile::SubCA {
+            issuer: self.cert.tbs_certificate.subject.clone(),
+            path_len_constraint: None,
+        };
+        let mut builder = CertificateBuilder::new(
+            profile,
+            serial(),
+            validity(),
+            name(subject),
+            self.cert.tbs_certificate.subject_public_key_info.clone(),
+            &self.key,
+        )
+        .expect("intermediate builder");
+        extend(&mut builder);
+        let cert = builder
+            .build::<rsa::pkcs1v15::Signature>()
+            .expect("intermediate certificate");
+        Ca {
+            cert,
+            key: self.key.clone(),
         }
-        if let Some(nonce) = request.nonce() {
-            builder = builder.with_extension(nonce).expect("nonce echo");
-        }
-        let mut key = self.key.clone();
-        builder
-            .sign::<_, rsa::pkcs1v15::Signature>(&mut key, None, ocsp_time(now))
-            .expect("OCSP response")
-            .to_der()
-            .expect("OCSP response DER")
     }
 
     /// The root's CRL, listing the serials in `revoked`, current from a minute ago for a
@@ -243,12 +242,60 @@ impl Ca {
     }
 }
 
+/// Who signs a revocation service's OCSP answers: a certificate authority, or a responder
+/// it delegated, whose answers carry the responder's certificate.
+#[derive(Clone)]
+struct Responder {
+    cert: Certificate,
+    key: rsa::pkcs1v15::SigningKey<Sha256>,
+    delegated: bool,
+}
+
+impl Responder {
+    /// The OCSP response to the DER request `query`: each certificate asked about is good
+    /// unless `revoked` holds its serial. The answer is current from a minute ago for a
+    /// day and echoes the request's nonce.
+    fn answer(&self, query: &[u8], revoked: &[SerialNumber]) -> Vec<u8> {
+        let request = OcspRequest::from_der(query).expect("OCSP request");
+        let now = SystemTime::now();
+        let mut builder = OcspResponseBuilder::new(self.cert.tbs_certificate.subject.clone());
+        for single in &request.tbs_request.request_list {
+            let id = single.req_cert.clone();
+            let status = if revoked.contains(&id.serial_number) {
+                CertStatus::revoked(RevokedInfo {
+                    revocation_time: ocsp_time(now - REVOKED_AGO),
+                    revocation_reason: None,
+                })
+            } else {
+                CertStatus::good()
+            };
+            builder = builder.with_single_response(
+                SingleResponse::new(id, status, ocsp_time(now - MINUTE))
+                    .with_next_update(ocsp_time(now + DAY)),
+            );
+        }
+        if let Some(nonce) = request.nonce() {
+            builder = builder.with_extension(nonce).expect("nonce echo");
+        }
+        let mut key = self.key.clone();
+        builder
+            .sign::<_, rsa::pkcs1v15::Signature>(
+                &mut key,
+                self.delegated.then(|| vec![self.cert.clone()]),
+                ocsp_time(now),
+            )
+            .expect("OCSP response")
+            .to_der()
+            .expect("OCSP response DER")
+    }
+}
+
 fn ocsp_time(time: SystemTime) -> OcspGeneralizedTime {
     OcspGeneralizedTime::try_from(time).expect("OCSP time")
 }
 
-/// The root's revocation services on a loopback port: an OCSP responder at `/ocsp` and a
-/// CRL at `/crl`. They report as revoked two hours ago each certificate
+/// Revocation services on a loopback port: an OCSP responder at `/ocsp` and, for a root's
+/// own services, its CRL at `/crl`. They report as revoked two hours ago each certificate
 /// [`Services::revoke`] names.
 pub struct Services {
     url: String,
@@ -260,15 +307,60 @@ impl Services {
         let revoked = Arc::new(Mutex::new(Vec::new()));
         let listed = Arc::clone(&revoked);
         let ca = ca.clone();
+        let responder = Responder {
+            cert: ca.cert.clone(),
+            key: ca.key.clone(),
+            delegated: false,
+        };
         let url = serve(move |path, body| {
             let revoked = listed.lock().expect("revoked serials").clone();
             match path {
-                "/ocsp" => ca.ocsp(body, &revoked),
+                "/ocsp" => responder.answer(body, &revoked),
                 "/crl" => ca.crl(&revoked),
                 _ => Vec::new(),
             }
         });
         Services { url, revoked }
+    }
+
+    /// An OCSP responder at `/ocsp` whose answers a delegate signs: a certificate `issuer`
+    /// issued for OCSP signing to a key of its own, `extend` adding extensions beyond that
+    /// usage. `extend` gets these services, which the certificate may name.
+    pub fn delegated(
+        issuer: &Ca,
+        extend: impl FnOnce(&mut CertBuilder<'_>, &Services),
+    ) -> Services {
+        static KEY: LazyLock<RsaPrivateKey> = LazyLock::new(generate_rsa);
+        let revoked = Arc::new(Mutex::new(Vec::new()));
+        let listed = Arc::clone(&revoked);
+        // The certificate names the services, so the responder is set once they listen.
+        let slot = Arc::new(OnceLock::<Responder>::new());
+        let signer = Arc::clone(&slot);
+        let url = serve(move |path, body| {
+            let revoked = listed.lock().expect("revoked serials").clone();
+            match (path, signer.get()) {
+                ("/ocsp", Some(responder)) => responder.answer(body, &revoked),
+                _ => Vec::new(),
+            }
+        });
+        let services = Services { url, revoked };
+        let cert = issuer.issue(
+            "CN=Goat OCSP Responder,O=Goat Test",
+            &Key::Rsa(Box::new(KEY.clone())),
+            |builder| {
+                builder
+                    .add_extension(&ExtendedKeyUsage(vec![rfc5280::ID_KP_OCSP_SIGNING]))
+                    .expect("OCSP-signing usage");
+                extend(builder, &services);
+            },
+        );
+        let responder = Responder {
+            cert,
+            key: rsa::pkcs1v15::SigningKey::new(KEY.clone()),
+            delegated: true,
+        };
+        assert!(slot.set(responder).is_ok(), "the responder is set once");
+        services
     }
 
     /// Makes every later answer report `cert` as revoked.
@@ -302,6 +394,55 @@ impl Services {
         )
     }
 }
+
+/// Defines `$name`, the certificate extension `$oid` with a NULL value, critical when
+/// `$critical` is.
+macro_rules! null_extension {
+    ($(#[$doc:meta])* $name:ident, $oid:literal, $critical:literal) => {
+        $(#[$doc])*
+        pub struct $name;
+
+        impl AssociatedOid for $name {
+            const OID: ObjectIdentifier = ObjectIdentifier::new_unwrap($oid);
+        }
+
+        impl der::FixedTag for $name {
+            const TAG: Tag = Tag::Null;
+        }
+
+        impl der::EncodeValue for $name {
+            fn value_len(&self) -> der::Result<der::Length> {
+                Ok(der::Length::ZERO)
+            }
+
+            fn encode_value(&self, _writer: &mut impl der::Writer) -> der::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl AsExtension for $name {
+            fn critical(&self, _subject: &Name, _extensions: &[Extension]) -> bool {
+                $critical
+            }
+        }
+    };
+}
+
+null_extension!(
+    /// `noRevAvail` (RFC 9608): the issuer publishes no revocation information for the
+    /// certificate.
+    NoRevAvail, "2.5.29.56", false
+);
+null_extension!(
+    /// An extension no validator knows, marked critical: RFC 5280 makes a path through a
+    /// certificate that carries it invalid.
+    UnknownCritical, "1.2.3.4", true
+);
+null_extension!(
+    /// `id-pkix-ocsp-nocheck` (RFC 6960 §4.2.2.2.1): no revocation check for an OCSP
+    /// responder's certificate.
+    OcspNoCheck, "1.3.6.1.5.5.7.48.1.5", false
+);
 
 fn name(subject: &str) -> Name {
     Name::from_str(subject).expect("subject name")
@@ -430,10 +571,7 @@ impl Tsa {
 
     /// An authority whose certificate `extend` adds extensions to beyond time-stamping
     /// usage.
-    pub fn issued(
-        ca: &Ca,
-        extend: impl FnOnce(&mut CertificateBuilder<'_, rsa::pkcs1v15::SigningKey<Sha256>>),
-    ) -> Tsa {
+    pub fn issued(ca: &Ca, extend: impl FnOnce(&mut CertBuilder<'_>)) -> Tsa {
         static KEY: LazyLock<RsaPrivateKey> = LazyLock::new(generate_rsa);
         let cert = ca.issue(
             "CN=Goat TSA,O=Goat Test",

@@ -28,6 +28,7 @@ use x509_ocsp::{
 };
 
 use crate::net::Http;
+use crate::path::{self, self_issued};
 use crate::pkcs7::{Hash, human_friendly, verify_signed};
 use crate::tsp;
 
@@ -37,6 +38,31 @@ const CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
 const NO_NEXT_UPDATE: Duration = Duration::from_secs(30 * 60);
 /// The most certificates a chain may hold.
 const MAX_CHAIN: usize = 10;
+/// `id-ce-noRevAvail` (RFC 9608 §2): the issuer publishes no revocation information for
+/// the certificate.
+const ID_CE_NO_REV_AVAIL: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.56");
+/// The extensions path validation here processes: the constraints and key usages it
+/// checks, the name constraints and certificate policies [`path::constrain`] applies, and
+/// the revocation pointers and exemptions it follows. RFC 5280 §6.1.4 (o) and §6.1.5 (f)
+/// make a path through any other critical extension invalid.
+const PROCESSED: &[ObjectIdentifier] = &[
+    rfc5280::ID_CE_BASIC_CONSTRAINTS,
+    rfc5280::ID_CE_KEY_USAGE,
+    rfc5280::ID_CE_EXT_KEY_USAGE,
+    rfc5280::ID_CE_SUBJECT_KEY_IDENTIFIER,
+    rfc5280::ID_CE_AUTHORITY_KEY_IDENTIFIER,
+    rfc5280::ID_CE_SUBJECT_ALT_NAME,
+    rfc5280::ID_CE_ISSUER_ALT_NAME,
+    rfc5280::ID_CE_CERTIFICATE_POLICIES,
+    rfc5280::ID_CE_POLICY_MAPPINGS,
+    rfc5280::ID_CE_POLICY_CONSTRAINTS,
+    rfc5280::ID_CE_INHIBIT_ANY_POLICY,
+    rfc5280::ID_CE_NAME_CONSTRAINTS,
+    rfc5280::ID_CE_CRL_DISTRIBUTION_POINTS,
+    rfc5280::ID_PE_AUTHORITY_INFO_ACCESS,
+    rfc6960::ID_PKIX_OCSP_NOCHECK,
+    ID_CE_NO_REV_AVAIL,
+];
 
 /// The trust anchors and the network one judgement uses.
 pub struct Context<'a> {
@@ -73,7 +99,8 @@ impl Material {
 /// signature or time-stamp carries; a missing issuer comes from the address its
 /// certificate names, else from the system's roots, and revocation from each
 /// certificate's OCSP responder, else its CRL. A revoked certificate is an error, as is
-/// a certificate that names a responder or CRL none of which answers.
+/// a certificate that names a responder or CRL none of which answers; one that names
+/// neither yet needs a check (RFC 9608 §4 exempts some) goes in `unchecked`.
 pub fn gather(
     http: &Http,
     leaves: &[&Certificate],
@@ -106,6 +133,10 @@ pub fn gather(
                 continue;
             }
             material.looked_up.push(cert.clone());
+            // RFC 9608 §4: no revocation check for a certificate that needs none.
+            if exempt(cert) {
+                continue;
+            }
             let live = fetch_status(http, cert, issuer, now, now).map_err(|error| {
                 format!(
                     "--ltv found no revocation status for {}: {error}",
@@ -223,6 +254,27 @@ impl Store {
                 .collect(),
         })
     }
+
+    /// The store `material` alone makes.
+    fn of(material: &Material) -> Store {
+        Store {
+            certs: material
+                .certs
+                .iter()
+                .filter_map(|der| Certificate::from_der(der).ok())
+                .collect(),
+            ocsps: material
+                .ocsps
+                .iter()
+                .filter_map(|der| basic_response(der).ok())
+                .collect(),
+            crls: material
+                .crls
+                .iter()
+                .filter_map(|der| CertificateList::from_der(der).ok())
+                .collect(),
+        }
+    }
 }
 
 /// The decoded streams the `/DSS` array `key` refers to.
@@ -245,12 +297,13 @@ fn streams(doc: &Document, dss: &Dict, key: &[u8]) -> Vec<Vec<u8>> {
 /// A revocation verdict over a chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Revocation {
-    /// Every certificate below the root that names a responder or CRL was shown not
+    /// Every certificate below the root that needs a revocation check was shown not
     /// revoked.
     Good,
     /// Some certificate was revoked by the time judged.
     Revoked,
-    /// Some certificate names a responder or CRL, but no usable answer was found.
+    /// Some certificate needs a check that no usable answer settles; naming no
+    /// responder or CRL is no answer.
     Unknown,
 }
 
@@ -269,15 +322,17 @@ pub struct Judgement {
     /// Why the chain does not reach a trust anchor with each link within the policy at
     /// the time judged; `None` when it does.
     pub trust_error: Option<String>,
-    /// `None` when no certificate below the root names an OCSP responder or CRL.
+    /// `None` when no certificate below the root needs a revocation check (RFC 9608 §4).
     pub revocation: Option<Revocation>,
     /// What made the verdict revoked or unknown.
     pub revocation_error: Option<String>,
     /// Where the answers behind the verdict came from: `online` when any was fetched
     /// live, else `dss`; `None` without a verdict or an answer.
     pub source: Option<&'static str>,
-    /// The store completes the chain and holds a good answer for every certificate that
-    /// names a responder or CRL: the validation data PAdES B-LT asks for.
+    /// The store completes the chain and holds a good answer for every certificate below
+    /// the root that needs a revocation check; the root is the trust anchor, an input to
+    /// RFC 5280's path validation rather than part of the path. This is the validation
+    /// data PAdES B-LT asks for (ETSI EN 319 142-1 V1.2.1, 6.3 (t)).
     pub complete: bool,
 }
 
@@ -307,7 +362,11 @@ pub fn judge(
     let mut revoked = None;
     let mut unknown = None;
     for (cert, issuer) in links(&walk.path) {
-        match answer(cert, issuer, &pool, store, context, time) {
+        // RFC 9608 §4 skips RFC 5280's revocation step, §6.1.3 (a)(3), for these.
+        if exempt(cert) {
+            continue;
+        }
+        match answer(cert, issuer, &pool, store, context, time, true) {
             Answer::Good { online } => {
                 checked = true;
                 answered_online |= online;
@@ -324,11 +383,10 @@ pub fn judge(
                 complete = false;
                 unknown.get_or_insert_with(|| format!("{}: {why}", name(cert)));
             }
-            Answer::Undeclared => {}
         }
     }
     if walk.end == End::Missing
-        && let Some(last) = walk.path.last().filter(|cert| declares(cert))
+        && let Some(last) = walk.path.last().filter(|cert| !exempt(cert))
     {
         unknown.get_or_insert_with(|| {
             format!("{}: the certificate that issued it is missing", name(last))
@@ -351,6 +409,27 @@ pub fn judge(
         source,
         complete,
     }
+}
+
+/// Whether `material` alone completes the chain of each of `leaves` for `time`, as
+/// [`judge`] decides offline: what PAdES B-LTA asks of the store a document time-stamp
+/// covers (ETSI EN 319 142-1 V1.2.1, 6.3 (t) and (x)).
+pub fn completes(
+    material: &Material,
+    leaves: &[&Certificate],
+    carried: &[Certificate],
+    time: SystemTime,
+) -> Result<bool, String> {
+    let anchors = system_roots()?;
+    let context = Context {
+        anchors: &anchors,
+        online: None,
+        now: SystemTime::now(),
+    };
+    let store = Store::of(material);
+    Ok(leaves
+        .iter()
+        .all(|leaf| judge(leaf, carried, Some(&store), &context, time).complete))
 }
 
 /// The trust anchors of the macOS system keychain (`SecTrustCopyAnchorCertificates`);
@@ -476,10 +555,13 @@ fn walk(leaf: &Certificate, pool: &mut Vec<Certificate>, context: &Context<'_>) 
 }
 
 /// Why `walk` does not make its leaf trusted at `time`: the chain must end at an anchor,
-/// each certificate below it valid then and signed within the policy, and each issuer
-/// below the anchor a certificate authority.
+/// each certificate below it valid then, signed within the policy, free of critical
+/// extensions left unprocessed (RFC 5280 §6.1.4 (o), §6.1.5 (f)) and of a `noRevAvail`
+/// RFC 9608 §3 forbids, each issuer below the anchor a certificate authority, and the
+/// path below the anchor within the name constraints and policy requirements its
+/// authorities set ([`path::constrain`]).
 fn trust(walk: &Walk, time: SystemTime) -> Result<(), String> {
-    let last = walk.path.last().ok_or("the chain is empty")?;
+    let (last, below) = walk.path.split_last().ok_or("the chain is empty")?;
     match walk.end {
         End::Missing => {
             return Err(format!(
@@ -500,6 +582,18 @@ fn trust(walk: &Walk, time: SystemTime) -> Result<(), String> {
         if !valid_at(cert, time) {
             return Err(format!("{} was not valid at {}", name(cert), iso(time)));
         }
+        if let Some(id) = unprocessed(cert) {
+            return Err(format!(
+                "{} carries critical extension {id}, which is not processed here",
+                name(cert)
+            ));
+        }
+        if let Some(misuse) = no_rev_avail_misuse(cert) {
+            return Err(format!(
+                "{} is invalid: it says its issuer publishes no revocation information, yet {misuse} (RFC 9608 section 3)",
+                name(cert)
+            ));
+        }
         if let Some(reason) = signed_by(cert, issuer)? {
             return Err(format!("{}: {reason}", name(cert)));
         }
@@ -507,7 +601,7 @@ fn trust(walk: &Walk, time: SystemTime) -> Result<(), String> {
             authority(issuer, index)?;
         }
     }
-    Ok(())
+    path::constrain(below)
 }
 
 /// Whether `cert` may issue the chain below it: a certificate authority allowed to sign
@@ -556,10 +650,8 @@ enum Answer {
         at: SystemTime,
         online: bool,
     },
-    /// It names a responder or CRL, but nothing usable answered; why.
+    /// Nothing usable shows it was not revoked; why.
     Unknown(String),
-    /// It names no responder or CRL, and nothing at hand speaks for it.
-    Undeclared,
 }
 
 impl Answer {
@@ -573,7 +665,9 @@ impl Answer {
 
 /// The revocation answer for `cert`, issued by `issuer`, at `time`: the store's OCSP
 /// responses, then its CRLs, then, when online, the certificate's own responders.
-/// `others` may hold a delegated OCSP responder's certificate.
+/// `others` may hold a delegated OCSP responder's certificate; an answer a delegated
+/// responder signed counts once [`vouch`] accepts the responder, which it never does
+/// with `delegates` false, for the answer about a responder itself.
 fn answer(
     cert: &Certificate,
     issuer: &Certificate,
@@ -581,6 +675,7 @@ fn answer(
     store: Option<&Store>,
     context: &Context<'_>,
     time: SystemTime,
+    delegates: bool,
 ) -> Answer {
     let mut failures = Vec::new();
     if let Some(store) = store {
@@ -593,8 +688,22 @@ fn answer(
             if !about {
                 continue;
             }
-            match ocsp_status(response, cert, issuer, others, time, context.now) {
-                Ok((status, _)) => return Answer::of(status, false),
+            let vouched = ocsp_status(response, cert, issuer, others, time, context.now).and_then(
+                |(status, responder)| {
+                    let online = vouch(
+                        responder.as_ref(),
+                        issuer,
+                        others,
+                        Some(store),
+                        context,
+                        time,
+                        delegates,
+                    )?;
+                    Ok((status, online))
+                },
+            );
+            match vouched {
+                Ok((status, online)) => return Answer::of(status, online),
                 Err(error) => failures.push(format!("the stored OCSP response: {error}")),
             }
         }
@@ -610,22 +719,75 @@ fn answer(
         }
     }
     if let Some(http) = context.online {
-        match fetch_status(http, cert, issuer, time, context.now) {
-            Ok(Some(live)) => return Answer::of(live.status, true),
+        let fetched = fetch_status(http, cert, issuer, time, context.now).and_then(|live| {
+            let Some(live) = live else {
+                return Ok(None);
+            };
+            if let Evidence::Ocsp(_, responder) = &live.evidence {
+                vouch(
+                    responder.as_deref(),
+                    issuer,
+                    others,
+                    store,
+                    context,
+                    time,
+                    delegates,
+                )?;
+            }
+            Ok(Some(live.status))
+        });
+        match fetched {
+            Ok(Some(status)) => return Answer::of(status, true),
             Ok(None) => {}
             Err(error) => failures.push(error),
         }
     }
-    if !declares(cert) {
-        return Answer::Undeclared;
-    }
     if failures.is_empty() {
-        failures.push(
+        let why = if declares(cert) {
             "the document holds no OCSP response or CRL for it; --online asks its responder"
-                .to_owned(),
-        );
+        } else {
+            "it names no OCSP responder or CRL, and nothing at hand shows it was not revoked"
+        };
+        failures.push(why.to_owned());
     }
     Answer::Unknown(failures.join("; "))
+}
+
+/// Whether the delegated OCSP `responder` that signed an answer for `issuer`, if one
+/// did, may vouch for it; `Ok(true)` when what shows that was fetched live. One that
+/// needs no check may (RFC 9608 §4); another only once an answer no delegate signed, or
+/// its issuer's CRL, shows it was not revoked at `time` (RFC 6960 §4.2.2.2.1), which
+/// `delegates` false refuses to look for.
+fn vouch(
+    responder: Option<&Certificate>,
+    issuer: &Certificate,
+    others: &[Certificate],
+    store: Option<&Store>,
+    context: &Context<'_>,
+    time: SystemTime,
+    delegates: bool,
+) -> Result<bool, String> {
+    let Some(responder) = responder.filter(|responder| !exempt(responder)) else {
+        return Ok(false);
+    };
+    if !delegates {
+        return Err(format!(
+            "it comes from the delegated responder {}, which nothing here checks",
+            name(responder)
+        ));
+    }
+    match answer(responder, issuer, others, store, context, time, false) {
+        Answer::Good { online } => Ok(online),
+        Answer::Revoked { at, .. } => Err(format!(
+            "its responder {} was revoked at {}",
+            name(responder),
+            iso(at)
+        )),
+        Answer::Unknown(why) => Err(format!(
+            "nothing shows its responder {} was not revoked: {why}",
+            name(responder)
+        )),
+    }
 }
 
 /// A live answer about one certificate.
@@ -804,13 +966,19 @@ fn responder(
         .chain(others)
         .find(|cert| identifies(id, cert))
         .ok_or("the OCSP response is signed by a responder it does not include")?;
+    // A signature that verifies yet falls short of the policy authorises nothing.
     let authorised = delegate.tbs_certificate.issuer == issuer.tbs_certificate.subject
-        && signed_by(delegate, issuer).is_ok();
+        && matches!(signed_by(delegate, issuer), Ok(None));
     if !authorised {
         return Err("the OCSP responder was not authorised by the certificate's issuer".to_owned());
     }
     if !extended_usage(delegate).contains(&rfc5280::ID_KP_OCSP_SIGNING) {
         return Err("the OCSP responder's certificate does not allow OCSP signing".to_owned());
+    }
+    if let Some(id) = unprocessed(delegate) {
+        return Err(format!(
+            "the OCSP responder's certificate carries critical extension {id}, which is not processed here"
+        ));
     }
     if !valid_at(
         delegate,
@@ -966,10 +1134,6 @@ fn same_key(anchor: &Certificate, cert: &Certificate) -> bool {
             == cert.tbs_certificate.subject_public_key_info
 }
 
-fn self_issued(cert: &Certificate) -> bool {
-    cert.tbs_certificate.subject == cert.tbs_certificate.issuer
-}
-
 fn valid_at(cert: &Certificate, time: SystemTime) -> bool {
     let validity = &cert.tbs_certificate.validity;
     validity.not_before.to_system_time() <= time && time <= validity.not_after.to_system_time()
@@ -980,14 +1144,66 @@ fn declares(cert: &Certificate) -> bool {
     !access_urls(cert, rfc5280::ID_AD_OCSP).is_empty() || !crl_urls(cert).is_empty()
 }
 
-/// The certificate carries `id-pkix-ocsp-nocheck`: as an OCSP responder, it needs no
-/// revocation check of its own.
+/// RFC 9608 §4: a certificate that carries `id-pkix-ocsp-nocheck` (RFC 6960 §4.2.2.2.1),
+/// or a `noRevAvail` that §3 allows, needs no revocation check.
 fn exempt(cert: &Certificate) -> bool {
+    has_extension(cert, rfc6960::ID_PKIX_OCSP_NOCHECK)
+        || (has_extension(cert, ID_CE_NO_REV_AVAIL) && no_rev_avail_misuse(cert).is_none())
+}
+
+/// What makes the `noRevAvail` of `cert`, when it carries one, invalid under RFC 9608
+/// §3: a certificate authority may not carry it, nor may a certificate that names CRLs or
+/// an OCSP responder.
+fn no_rev_avail_misuse(cert: &Certificate) -> Option<&'static str> {
+    if !has_extension(cert, ID_CE_NO_REV_AVAIL) {
+        return None;
+    }
+    let authority = cert
+        .tbs_certificate
+        .get::<BasicConstraints>()
+        .ok()
+        .flatten()
+        .is_some_and(|(_, constraints)| constraints.ca);
+    let responder = cert
+        .tbs_certificate
+        .get::<AuthorityInfoAccessSyntax>()
+        .ok()
+        .flatten()
+        .is_some_and(|(_, access)| {
+            access
+                .0
+                .iter()
+                .any(|description| description.access_method == rfc5280::ID_AD_OCSP)
+        });
+    if authority {
+        Some("it is a certificate authority")
+    } else if has_extension(cert, rfc5280::ID_CE_CRL_DISTRIBUTION_POINTS)
+        || has_extension(cert, rfc5280::ID_CE_FRESHEST_CRL)
+    {
+        Some("it names CRLs")
+    } else if responder {
+        Some("it names an OCSP responder")
+    } else {
+        None
+    }
+}
+
+/// The first critical extension of `cert` outside [`PROCESSED`].
+fn unprocessed(cert: &Certificate) -> Option<ObjectIdentifier> {
     cert.tbs_certificate
         .extensions
         .iter()
         .flatten()
-        .any(|extension| extension.extn_id == rfc6960::ID_PKIX_OCSP_NOCHECK)
+        .find(|extension| extension.critical && !PROCESSED.contains(&extension.extn_id))
+        .map(|extension| extension.extn_id)
+}
+
+fn has_extension(cert: &Certificate, id: ObjectIdentifier) -> bool {
+    cert.tbs_certificate
+        .extensions
+        .iter()
+        .flatten()
+        .any(|extension| extension.extn_id == id)
 }
 
 /// The HTTP addresses the certificate's authority information access gives for `method`.

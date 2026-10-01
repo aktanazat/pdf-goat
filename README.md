@@ -203,10 +203,16 @@ PDF before replacing an original. The native PDF viewer does not edit Office fil
   signing, or also annotations; it must be the document's first signature.
   `--ltv` (with `--p12`) also stores the certificate chain and each certificate's OCSP
   or CRL answer in the document, so the signature can be checked offline later; with
-  `--tsa` it then adds a document time-stamp over them (PAdES B-LTA).
+  `--tsa` it then adds a document time-stamp over them. That makes PAdES B-LTA only
+  when every certificate below the root has an answer or, by RFC 9608, needs none; a
+  certificate that names no OCSP responder or CRL is listed in `dss.unchecked` and
+  leaves the signature at B-T. Without `--tsa` the level stays B-B.
   In `security verify`, `trusted` checks the local signature policy. `chain_trusted`
-  checks the certificate chain against the system's roots and any `--trust` files, and
-  `revocation` reports the answers the document stores, or those `--online` fetches.
+  checks the certificate chain against the system's roots and any `--trust` files,
+  holds it to the name constraints and certificate policies its authorities set
+  (RFC 5280), and fails on any other critical extension it does not process;
+  `revocation` reports the answers the document stores, or those `--online` fetches,
+  and is `unknown` for a certificate nothing answers for.
   `timestamp`, `timestamp_valid`, and `pades_level` report the signature time-stamp and
   the PAdES level reached, up to B-LTA.
   `certified`, `docmdp_level`, and `changes_allowed` report whether the signature

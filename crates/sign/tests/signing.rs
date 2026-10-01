@@ -6,13 +6,15 @@
 //! chains and the answers of the authority's loopback OCSP responder and CRL in the
 //! document security store and, with a time-stamp, stamps the document to B-LTA;
 //! certification and field locks decide which later changes `security verify` allows;
-//! prepared signature fields are signed in place.
+//! `security verify --trust` holds a chain to the name constraints and certificate
+//! policies its authorities set; prepared signature fields are signed in place.
 
 mod pki;
 
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use cms::cert::{CertificateChoices, IssuerAndSerialNumber};
@@ -23,7 +25,7 @@ use cms::signed_data::{
 };
 use const_oid::ObjectIdentifier;
 use const_oid::db::{rfc5911, rfc5912};
-use der::asn1::{OctetString, SetOfVec};
+use der::asn1::{Ia5String, OctetString, SetOfVec};
 use der::{Any, Decode, Encode, SliceReader};
 use goat_common::{Ctx, GoatError, Registry};
 use goat_fixtures::{PdfBuilder, incremental_update};
@@ -37,9 +39,21 @@ use signature::{SignatureEncoding, Signer};
 use spki::AlgorithmIdentifierOwned;
 use x509_cert::Certificate;
 use x509_cert::attr::Attribute;
+use x509_cert::ext::AsExtension;
+use x509_cert::ext::pkix::certpolicy::PolicyInformation;
+use x509_cert::ext::pkix::constraints::name::GeneralSubtree;
+use x509_cert::ext::pkix::name::GeneralName;
+use x509_cert::ext::pkix::{
+    CertificatePolicies, InhibitAnyPolicy, NameConstraints, PolicyConstraints, PolicyMapping,
+    PolicyMappings, SubjectAltName,
+};
+use x509_cert::name::Name;
 use x509_ocsp::{BasicOcspResponse, CertStatus, OcspResponse};
 
-use pki::{Ca, Imprint, Key, Sealing, Services, Tsa, serve};
+use pki::{
+    Ca, CertBuilder, Imprint, Key, NoRevAvail, OcspNoCheck, Sealing, Services, Tsa,
+    UnknownCritical, serve,
+};
 
 /// Cargo sets this for every test run; its value is the password of the test identities.
 const PASSWORD_ENV: &str = "CARGO_PKG_NAME";
@@ -770,22 +784,30 @@ fn a_document_time_stamp_is_checked_against_its_revision_and_is_an_archival_upda
     );
 }
 
-/// A PKCS#12 file with a fresh P-256 certificate issued by `ca` that names the OCSP
-/// responder of `services`, and the certificate.
-fn revocable_identity(dir: &Path, ca: &Ca, services: &Services) -> (String, Certificate) {
+/// A PKCS#12 file with a fresh P-256 certificate issued by `ca`, `extend` adding its
+/// extensions, and the certificate.
+fn identity_with(
+    dir: &Path,
+    ca: &Ca,
+    extend: impl FnOnce(&mut CertBuilder<'_>),
+) -> (String, Certificate) {
     let key = Key::p256();
-    let cert = ca.issue(SIGNER, &key, |builder| {
-        builder
-            .add_extension(&services.ocsp_pointer())
-            .expect("OCSP pointer");
-    });
-    let path = dir.join("revocable.p12");
+    let cert = ca.issue(SIGNER, &key, extend);
+    let path = dir.join("extended.p12");
     fs::write(
         &path,
         pki::p12(&key, &cert, &[&ca.cert], &password(), Sealing::Modern),
     )
     .expect("p12");
     (path.to_string_lossy().into_owned(), cert)
+}
+
+/// A PKCS#12 file with a fresh P-256 certificate issued by `ca` that carries `extension`,
+/// and the certificate.
+fn extended_identity(dir: &Path, ca: &Ca, extension: &impl AsExtension) -> (String, Certificate) {
+    identity_with(dir, ca, |builder| {
+        builder.add_extension(extension).expect("extension");
+    })
 }
 
 /// The decoded streams the document security store of `file` lists under `key`.
@@ -815,7 +837,7 @@ fn ltv_keeps_the_chain_and_the_signers_ocsp_answer_in_an_allowed_update() {
     let src = plain_pdf(dir.path());
     let ca = Ca::new("CN=Goat Test Root");
     let services = Services::new(&ca);
-    let (p12, cert) = revocable_identity(dir.path(), &ca, &services);
+    let (p12, cert) = extended_identity(dir.path(), &ca, &services.ocsp_pointer());
     let signed = sign(dir.path(), &src, &p12, &["--ltv"]);
     assert_eq!(signed["pades_level"], "B-B");
     assert_eq!(
@@ -869,7 +891,7 @@ fn ltv_with_a_time_stamp_stamps_the_document_over_the_store() {
             .expect("CRL pointer");
     });
     let (tsa, url) = serve_tsa(tsa, Imprint::Asked);
-    let (p12, _) = revocable_identity(dir.path(), &ca, &services);
+    let (p12, _) = extended_identity(dir.path(), &ca, &services.ocsp_pointer());
     let signed = sign(dir.path(), &src, &p12, &["--tsa", &url, "--ltv"]);
     assert_eq!(signed["pades_level"], "B-LTA");
     assert_eq!(signed["timestamp"], tsa.iso_time());
@@ -892,6 +914,16 @@ fn ltv_with_a_time_stamp_stamps_the_document_over_the_store() {
     assert_eq!(stamp["coverage"], "SignatureCoverageLevel.ENTIRE_FILE");
 }
 
+/// The row `security verify --trust` gives the only signature in `file`, with the
+/// certificate of `root` as the trust anchor.
+fn verified_trusting(dir: &Path, root: &Ca, file: &str) -> Value {
+    let anchor = path_in(dir, "root.der");
+    fs::write(&anchor, root.cert.to_der().expect("root DER")).expect("root file");
+    let verified =
+        run(dir, &["security", "verify", file, "--trust", &anchor]).expect("verify succeeds");
+    verified["signatures"][0].clone()
+}
+
 #[test]
 fn verify_trusts_a_chain_only_once_its_root_is_an_anchor() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -902,11 +934,7 @@ fn verify_trusts_a_chain_only_once_its_root_is_an_anchor() {
     let untrusted = only_signature(dir.path(), &out);
     assert_eq!(untrusted["chain_trusted"], false, "{untrusted}");
 
-    let root = path_in(dir.path(), "root.der");
-    fs::write(&root, ca.cert.to_der().expect("root DER")).expect("root file");
-    let verified =
-        run(dir.path(), &["security", "verify", &out, "--trust", &root]).expect("verify succeeds");
-    let trusted = &verified["signatures"][0];
+    let trusted = verified_trusting(dir.path(), &ca, &out);
     assert_eq!(trusted["chain_trusted"], true, "{trusted}");
     assert_eq!(trusted.get("trust_error"), None, "{trusted}");
 }
@@ -917,7 +945,7 @@ fn verify_online_asks_the_responder_what_the_document_lacks() {
     let src = plain_pdf(dir.path());
     let ca = Ca::new("CN=Goat Test Root");
     let services = Services::new(&ca);
-    let (p12, cert) = revocable_identity(dir.path(), &ca, &services);
+    let (p12, cert) = extended_identity(dir.path(), &ca, &services.ocsp_pointer());
     let out = output(&sign(dir.path(), &src, &p12, &[]));
     services.revoke(&cert);
     let offline = only_signature(dir.path(), &out);
@@ -948,7 +976,7 @@ fn verify_reads_the_store_offline_and_reaches_b_lt_then_b_lta() {
             .expect("CRL pointer");
     });
     let (_tsa, url) = serve_tsa(tsa, Imprint::Asked);
-    let (p12, cert) = revocable_identity(dir.path(), &ca, &services);
+    let (p12, cert) = extended_identity(dir.path(), &ca, &services.ocsp_pointer());
     let out = output(&sign(dir.path(), &src, &p12, &["--tsa", &url, "--ltv"]));
     // The responder now disagrees with the store; offline verification must not ask it.
     services.revoke(&cert);
@@ -984,7 +1012,7 @@ fn ltv_refuses_a_revoked_signer() {
     let src = plain_pdf(dir.path());
     let ca = Ca::new("CN=Goat Test Root");
     let services = Services::new(&ca);
-    let (p12, cert) = revocable_identity(dir.path(), &ca, &services);
+    let (p12, cert) = extended_identity(dir.path(), &ca, &services.ocsp_pointer());
     services.revoke(&cert);
     let out = path_in(dir.path(), "revoked.pdf");
     let error = try_sign(dir.path(), &src, &p12, &["--ltv", "-o", &out])
@@ -995,6 +1023,417 @@ fn ltv_refuses_a_revoked_signer() {
         "{error}"
     );
     assert!(!Path::new(&out).exists(), "no output is written");
+}
+
+/// A time-stamp authority issued by `ca` whose certificate names the OCSP responder of
+/// `services`, which answers for that certificate alone, and its URL.
+fn answered_tsa(ca: &Ca, services: &Services) -> (Arc<Tsa>, String) {
+    let tsa = Tsa::issued(ca, |builder| {
+        builder
+            .add_extension(&services.ocsp_pointer())
+            .expect("OCSP pointer");
+    });
+    serve_tsa(tsa, Imprint::Asked)
+}
+
+#[test]
+fn ltv_stays_at_b_t_while_nothing_shows_the_signer_was_not_revoked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = plain_pdf(dir.path());
+    let ca = Ca::new("CN=Goat Test Root");
+    let services = Services::new(&ca);
+    let (_tsa, url) = answered_tsa(&ca, &services);
+    // The signer's certificate names no OCSP responder or CRL, and no CRL of the root
+    // reaches the store to cover it.
+    let (p12, _) = identity(dir.path(), &ca, &Key::p256(), Sealing::Modern);
+    let signed = sign(dir.path(), &src, &p12, &["--tsa", &url, "--ltv"]);
+    assert_eq!(signed["pades_level"], "B-T", "{signed:?}");
+    assert_eq!(signed["dss"]["unchecked"], json!([SIGNER_SUBJECT]));
+
+    let signature = &signature_rows(dir.path(), &output(&signed))[0];
+    assert_eq!(signature["revocation"], "unknown", "{signature}");
+    assert_eq!(signature["pades_level"], "B-T");
+}
+
+#[test]
+fn ltv_reaches_b_lta_for_a_signer_whose_issuer_publishes_no_revocation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = plain_pdf(dir.path());
+    let ca = Ca::new("CN=Goat Test Root");
+    let services = Services::new(&ca);
+    let (_tsa, url) = answered_tsa(&ca, &services);
+    let (p12, _) = extended_identity(dir.path(), &ca, &NoRevAvail);
+    let signed = sign(dir.path(), &src, &p12, &["--tsa", &url, "--ltv"]);
+    assert_eq!(signed["pades_level"], "B-LTA", "{signed:?}");
+    assert_eq!(signed["dss"]["unchecked"], json!([]));
+
+    let signature = &signature_rows(dir.path(), &output(&signed))[0];
+    assert_eq!(signature["revocation"], Value::Null, "{signature}");
+    assert_eq!(signature["pades_level"], "B-LTA");
+}
+
+#[test]
+fn verify_does_not_trust_a_chain_with_an_unprocessed_critical_extension() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = plain_pdf(dir.path());
+    let ca = Ca::new("CN=Goat Test Root");
+    let (p12, _) = extended_identity(dir.path(), &ca, &UnknownCritical);
+    let out = output(&sign(dir.path(), &src, &p12, &[]));
+    let signature = verified_trusting(dir.path(), &ca, &out);
+    assert_eq!(signature["chain_trusted"], false, "{signature}");
+    let error = signature["trust_error"].as_str().unwrap_or_default();
+    assert!(error.contains("1.2.3.4"), "{signature}");
+}
+
+#[test]
+fn verify_online_refuses_an_ocsp_answer_from_a_responder_another_root_certified() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = plain_pdf(dir.path());
+    let ca = Ca::new("CN=Goat Test Root");
+    // Every in-test root holds the same key, so the responder's certificate verifies under
+    // this root's key too: only its issuer's name shows another root certified it.
+    let other = Ca::new("CN=Goat Other Root");
+    let services = Services::delegated(&other, |builder, _| {
+        builder.add_extension(&OcspNoCheck).expect("ocsp-nocheck");
+    });
+    let (p12, _) = extended_identity(dir.path(), &ca, &services.ocsp_pointer());
+    let out = output(&sign(dir.path(), &src, &p12, &[]));
+
+    let verified =
+        run(dir.path(), &["security", "verify", &out, "--online"]).expect("verify succeeds");
+    let signature = &verified["signatures"][0];
+    assert_eq!(signature["revocation"], "unknown", "{signature}");
+    let error = signature["revocation_error"].as_str().unwrap_or_default();
+    assert!(
+        error.ends_with("the OCSP responder was not authorised by the certificate's issuer"),
+        "{signature}"
+    );
+}
+
+#[test]
+fn ltv_reaches_b_lta_through_a_delegated_responder_that_needs_no_check() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = plain_pdf(dir.path());
+    let ca = Ca::new("CN=Goat Test Root");
+    let services = Services::delegated(&ca, |builder, _| {
+        builder.add_extension(&OcspNoCheck).expect("ocsp-nocheck");
+    });
+    let (_tsa, url) = answered_tsa(&ca, &services);
+    let (p12, _) = extended_identity(dir.path(), &ca, &services.ocsp_pointer());
+    let signed = sign(dir.path(), &src, &p12, &["--tsa", &url, "--ltv"]);
+    assert_eq!(signed["pades_level"], "B-LTA", "{signed:?}");
+    assert_eq!(signed["dss"]["unchecked"], json!([]));
+}
+
+#[test]
+fn a_delegated_responder_cannot_vouch_for_itself() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = plain_pdf(dir.path());
+    let ca = Ca::new("CN=Goat Test Root");
+    // The responder's certificate names the responder itself, so the only answer about it
+    // is one it signed.
+    let services = Services::delegated(&ca, |builder, services| {
+        builder
+            .add_extension(&services.ocsp_pointer())
+            .expect("OCSP pointer");
+    });
+    let (p12, _) = extended_identity(dir.path(), &ca, &services.ocsp_pointer());
+    let out = output(&sign(dir.path(), &src, &p12, &["--ltv"]));
+
+    let signature = only_signature(dir.path(), &out);
+    assert_eq!(signature["revocation"], "unknown", "{signature}");
+    let error = signature["revocation_error"].as_str().unwrap_or_default();
+    assert!(
+        error.ends_with(
+            "it comes from the delegated responder Common Name: Goat OCSP Responder, Organization: Goat Test, which nothing here checks"
+        ),
+        "{signature}"
+    );
+}
+
+#[test]
+fn verify_does_not_trust_a_no_revocation_certificate_that_names_an_ocsp_responder() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = plain_pdf(dir.path());
+    let ca = Ca::new("CN=Goat Test Root");
+    let services = Services::new(&ca);
+    let (p12, _) = identity_with(dir.path(), &ca, |builder| {
+        builder.add_extension(&NoRevAvail).expect("noRevAvail");
+        builder
+            .add_extension(&services.ocsp_pointer())
+            .expect("OCSP pointer");
+    });
+    let out = output(&sign(dir.path(), &src, &p12, &[]));
+    let signature = verified_trusting(dir.path(), &ca, &out);
+    assert_eq!(signature["chain_trusted"], false, "{signature}");
+    let error = signature["trust_error"].as_str().unwrap_or_default();
+    assert!(
+        error.ends_with("yet it names an OCSP responder (RFC 9608 section 3)"),
+        "{signature}"
+    );
+}
+
+#[test]
+fn verify_does_not_trust_a_no_revocation_certificate_that_names_a_crl() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = plain_pdf(dir.path());
+    let ca = Ca::new("CN=Goat Test Root");
+    let services = Services::new(&ca);
+    let (p12, _) = identity_with(dir.path(), &ca, |builder| {
+        builder.add_extension(&NoRevAvail).expect("noRevAvail");
+        builder
+            .add_extension(&services.crl_pointer())
+            .expect("CRL pointer");
+    });
+    let out = output(&sign(dir.path(), &src, &p12, &[]));
+    let signature = verified_trusting(dir.path(), &ca, &out);
+    assert_eq!(signature["chain_trusted"], false, "{signature}");
+    let error = signature["trust_error"].as_str().unwrap_or_default();
+    assert!(
+        error.ends_with("yet it names CRLs (RFC 9608 section 3)"),
+        "{signature}"
+    );
+}
+
+const INTERMEDIATE: &str = "CN=Goat Intermediate,O=Goat Test";
+const INTERMEDIATE_SUBJECT: &str = "Common Name: Goat Intermediate, Organization: Goat Test";
+/// Test certificate policies, on the arc of the time-stamp policy.
+const POLICY: &str = "1.3.6.1.4.1.57264.2";
+const OTHER_POLICY: &str = "1.3.6.1.4.1.57264.3";
+const ANY_POLICY: &str = "2.5.29.32.0";
+
+/// The row `security verify --trust` gives a signature by a fresh P-256 certificate for
+/// `SIGNER` that `intermediate`, certified by `root`, issued with `extend` adding its
+/// extensions, `root` the trust anchor.
+fn verified_below(
+    root: &Ca,
+    intermediate: &Ca,
+    extend: impl FnOnce(&mut CertBuilder<'_>),
+) -> Value {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = plain_pdf(dir.path());
+    let key = Key::p256();
+    let cert = intermediate.issue(SIGNER, &key, extend);
+    let p12 = path_in(dir.path(), "chained.p12");
+    fs::write(
+        &p12,
+        pki::p12(
+            &key,
+            &cert,
+            &[&intermediate.cert, &root.cert],
+            &password(),
+            Sealing::Modern,
+        ),
+    )
+    .expect("p12");
+    let out = output(&sign(dir.path(), &src, &p12, &[]));
+    verified_trusting(dir.path(), root, &out)
+}
+
+/// Name constraints with these permitted and excluded subtrees.
+fn name_constraints(permitted: Vec<GeneralName>, excluded: Vec<GeneralName>) -> NameConstraints {
+    let subtrees = |names: Vec<GeneralName>| {
+        (!names.is_empty()).then(|| {
+            names
+                .into_iter()
+                .map(|base| GeneralSubtree {
+                    base,
+                    minimum: 0,
+                    maximum: None,
+                })
+                .collect()
+        })
+    };
+    NameConstraints {
+        permitted_subtrees: subtrees(permitted),
+        excluded_subtrees: subtrees(excluded),
+    }
+}
+
+fn ia5(text: &str) -> Ia5String {
+    Ia5String::new(text).expect("IA5 string")
+}
+
+/// Certificate policies naming each of `ids`.
+fn policies(ids: &[&str]) -> CertificatePolicies {
+    CertificatePolicies(
+        ids.iter()
+            .map(|id| PolicyInformation {
+                policy_identifier: ObjectIdentifier::new_unwrap(id),
+                policy_qualifiers: None,
+            })
+            .collect(),
+    )
+}
+
+/// Policy constraints that require an explicit policy from the next certificate on.
+fn explicit_policy_required() -> PolicyConstraints {
+    PolicyConstraints {
+        require_explicit_policy: Some(0),
+        inhibit_policy_mapping: None,
+    }
+}
+
+#[test]
+fn verify_does_not_trust_a_signer_whose_name_its_issuer_excludes() {
+    let root = Ca::new("CN=Goat Test Root");
+    let intermediate = root.intermediate(INTERMEDIATE, |builder| {
+        let goat_test = Name::from_str("O=Goat Test").expect("name");
+        let constraints = name_constraints(vec![], vec![GeneralName::DirectoryName(goat_test)]);
+        builder
+            .add_extension(&constraints)
+            .expect("name constraints");
+    });
+    let signature = verified_below(&root, &intermediate, |_| {});
+    assert_eq!(signature["chain_trusted"], false, "{signature}");
+    assert_eq!(
+        signature["trust_error"],
+        format!(
+            "{SIGNER_SUBJECT}: its subject name is excluded by the name constraints of {INTERMEDIATE_SUBJECT} (RFC 5280 section 4.2.1.10)"
+        )
+    );
+}
+
+#[test]
+fn verify_trusts_a_signer_whose_email_address_its_issuer_permits() {
+    let root = Ca::new("CN=Goat Test Root");
+    let intermediate = root.intermediate(INTERMEDIATE, |builder| {
+        let constraints =
+            name_constraints(vec![GeneralName::Rfc822Name(ia5("goat.example"))], vec![]);
+        builder
+            .add_extension(&constraints)
+            .expect("name constraints");
+    });
+    let signature = verified_below(&root, &intermediate, |builder| {
+        let address = GeneralName::Rfc822Name(ia5("signer@goat.example"));
+        builder
+            .add_extension(&SubjectAltName(vec![address]))
+            .expect("alternative name");
+    });
+    assert_eq!(signature["chain_trusted"], true, "{signature}");
+}
+
+#[test]
+fn verify_does_not_trust_a_dns_name_outside_the_domain_its_issuer_permits() {
+    let root = Ca::new("CN=Goat Test Root");
+    let intermediate = root.intermediate(INTERMEDIATE, |builder| {
+        let constraints = name_constraints(vec![GeneralName::DnsName(ia5("goat.example"))], vec![]);
+        builder
+            .add_extension(&constraints)
+            .expect("name constraints");
+    });
+    // The name ends in the permitted domain's text but not on a label boundary.
+    let signature = verified_below(&root, &intermediate, |builder| {
+        let host = GeneralName::DnsName(ia5("signer.badgoat.example"));
+        builder
+            .add_extension(&SubjectAltName(vec![host]))
+            .expect("alternative name");
+    });
+    assert_eq!(signature["chain_trusted"], false, "{signature}");
+    assert_eq!(
+        signature["trust_error"],
+        format!(
+            "{SIGNER_SUBJECT}: its DNS name signer.badgoat.example is outside the names the name constraints of {INTERMEDIATE_SUBJECT} permit (RFC 5280 section 4.2.1.10)"
+        )
+    );
+}
+
+#[test]
+fn verify_trusts_a_signer_under_the_explicit_policy_its_issuer_requires() {
+    let root = Ca::new("CN=Goat Test Root");
+    let intermediate = root.intermediate(INTERMEDIATE, |builder| {
+        builder
+            .add_extension(&policies(&[POLICY]))
+            .expect("policies");
+        builder
+            .add_extension(&explicit_policy_required())
+            .expect("policy constraints");
+    });
+    let signature = verified_below(&root, &intermediate, |builder| {
+        builder
+            .add_extension(&policies(&[POLICY]))
+            .expect("policies");
+    });
+    assert_eq!(signature["chain_trusted"], true, "{signature}");
+}
+
+#[test]
+fn verify_does_not_trust_a_signer_outside_the_explicit_policy_its_issuer_requires() {
+    let root = Ca::new("CN=Goat Test Root");
+    let intermediate = root.intermediate(INTERMEDIATE, |builder| {
+        builder
+            .add_extension(&policies(&[POLICY]))
+            .expect("policies");
+        builder
+            .add_extension(&explicit_policy_required())
+            .expect("policy constraints");
+    });
+    let signature = verified_below(&root, &intermediate, |builder| {
+        builder
+            .add_extension(&policies(&[OTHER_POLICY]))
+            .expect("policies");
+    });
+    assert_eq!(signature["chain_trusted"], false, "{signature}");
+    assert_eq!(
+        signature["trust_error"],
+        format!(
+            "{SIGNER_SUBJECT} names no certificate policy the certificates above it accept, yet the policy constraints of {INTERMEDIATE_SUBJECT} require an explicit policy (RFC 5280 section 6.1)"
+        )
+    );
+}
+
+#[test]
+fn verify_trusts_a_signer_under_a_policy_its_issuer_maps_to() {
+    let root = Ca::new("CN=Goat Test Root");
+    let intermediate = root.intermediate(INTERMEDIATE, |builder| {
+        builder
+            .add_extension(&policies(&[POLICY]))
+            .expect("policies");
+        let mapping = PolicyMapping {
+            issuer_domain_policy: ObjectIdentifier::new_unwrap(POLICY),
+            subject_domain_policy: ObjectIdentifier::new_unwrap(OTHER_POLICY),
+        };
+        builder
+            .add_extension(&PolicyMappings(vec![mapping]))
+            .expect("policy mappings");
+        builder
+            .add_extension(&explicit_policy_required())
+            .expect("policy constraints");
+    });
+    let signature = verified_below(&root, &intermediate, |builder| {
+        builder
+            .add_extension(&policies(&[OTHER_POLICY]))
+            .expect("policies");
+    });
+    assert_eq!(signature["chain_trusted"], true, "{signature}");
+}
+
+#[test]
+fn verify_does_not_count_any_policy_its_issuer_inhibits() {
+    let root = Ca::new("CN=Goat Test Root");
+    let intermediate = root.intermediate(INTERMEDIATE, |builder| {
+        builder
+            .add_extension(&policies(&[POLICY]))
+            .expect("policies");
+        builder
+            .add_extension(&explicit_policy_required())
+            .expect("policy constraints");
+        builder
+            .add_extension(&InhibitAnyPolicy(0))
+            .expect("inhibitAnyPolicy");
+    });
+    let signature = verified_below(&root, &intermediate, |builder| {
+        builder
+            .add_extension(&policies(&[ANY_POLICY]))
+            .expect("policies");
+    });
+    assert_eq!(signature["chain_trusted"], false, "{signature}");
+    assert_eq!(
+        signature["trust_error"],
+        format!(
+            "{SIGNER_SUBJECT} names no certificate policy the certificates above it accept, and the inhibitAnyPolicy of {INTERMEDIATE_SUBJECT} keeps its anyPolicy from counting, yet the policy constraints of {INTERMEDIATE_SUBJECT} require an explicit policy (RFC 5280 section 6.1)"
+        )
+    );
 }
 
 /// A one-page form with text fields `Name` and `Note` and an empty signature field

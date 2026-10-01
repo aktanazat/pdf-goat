@@ -32,6 +32,7 @@ mod mdp;
 mod net;
 mod ocr;
 mod p12;
+mod path;
 mod pkcs7;
 mod sign;
 mod tsp;
@@ -107,7 +108,7 @@ pub fn register(registry: &mut Registry) {
                         .long("ltv")
                         .action(ArgAction::SetTrue)
                         .requires("p12")
-                        .help("keep what long-term validation needs: the certificate chains with OCSP responses and CRLs fetched from the addresses they name, PAdES B-LT; with --tsa, also time-stamp the document, B-LTA"),
+                        .help("keep what long-term validation needs: the certificate chains with OCSP responses and CRLs fetched from the addresses they name; with --tsa, also time-stamp the document over them, PAdES B-LTA once every certificate below the root has a revocation answer or needs none (RFC 9608), else B-T; without --tsa the level stays B-B"),
                 )
                 .arg(
                     Arg::new("timeout")
@@ -293,7 +294,7 @@ fn sec_sign(matches: &ArgMatches, _ctx: &Ctx) -> Result<Map<String, Value>, Goat
     };
     let signed = sign::sign_document(read_source(&src)?, &request).map_err(GoatError::message)?;
     write_output(&out, &signed.data)?;
-    let pades_level = match (&signer, request.tsa.is_some(), ltv) {
+    let pades_level = match (&signer, request.tsa.is_some(), signed.lta) {
         (Signer::Demo(_), _, _) => Value::Null,
         (Signer::Pades(_), false, _) => "B-B".into(),
         (Signer::Pades(_), true, false) => "B-T".into(),
