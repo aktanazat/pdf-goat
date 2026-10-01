@@ -1,0 +1,53 @@
+name: Copilot setup steps
+
+# Copilot cloud agent runs the copilot-setup-steps job before each session.
+# A change to this file also runs it as an ordinary workflow, so a broken
+# setup shows up as a failed check.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: pdf-goat-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: pdf-goat-release-${{ runner.os }}-
+
+      - name: Build pdf-goat and pdf-goat-mcp
+        run: cargo build --release --locked -p pdf-goat
+
+      # Copies, not links: the installed tools stay as built even while the
+      # agent changes and rebuilds the source.
+      - name: Install both on PATH
+        run: sudo install -m 0755 target/release/pdf-goat target/release/pdf-goat-mcp /usr/local/bin/
+
+      - name: Check that both answer
+        run: |
+          pdf-goat --agent capabilities | jq -e '.command_count > 0'
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"setup-check","version":"1"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | pdf-goat-mcp \
+            | jq -s -e '[.[] | select(.id == 2) | .result.tools[].name] | sort == ["capabilities", "render", "run"]'

@@ -111,7 +111,10 @@ uncached run.
 
 For agents, the CLI writes JSON when its output is piped, and `--agent` forces
 JSON on a TTY. Start with `pdf-goat --agent capabilities` for the family list,
-then ask one family for its argument schema.
+then ask one family for its argument schema. Coding agents working in this
+repository start from [AGENTS.md](AGENTS.md); the
+[PDF skill](.agents/skills/pdf/SKILL.md) gives tested commands for each
+workflow and the fields to check after each step.
 
 ```bash
 pdf-goat --agent capabilities pages
