@@ -247,42 +247,26 @@ fn ocr_keeps_its_result_and_names_the_reason_when_pdfa_conversion_fails() {
     );
 }
 
+/// `convert ocr` on `builder`'s file with `extra` arguments: the JSON result
+/// and the conformance level the output's XMP declares, once the file's
+/// PDF/A-2 structure is checked. The result's warnings are left unchecked:
+/// they report the state of the machine's recognizer models.
 #[cfg(target_os = "macos")]
-#[test]
-fn ocr_saves_a_pdfa_2b_candidate() {
+fn ocr_pdfa(builder: &PdfBuilder, extra: &[&str]) -> (Map<String, Value>, String) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut builder = PdfBuilder::new();
-    builder.page(200.0, 200.0);
-    let src = builder.save(dir.path().join("blank.pdf"));
-    let out = dir.path().join("blank-ocr.pdf");
-    let result = run(
-        dir.path(),
-        &[
-            "convert",
-            "ocr",
-            &src.to_string_lossy(),
-            "-o",
-            &out.to_string_lossy(),
-        ],
-    )
-    .expect("OCR succeeds");
-    assert_eq!(result["standard"], "PDF/A-2b");
-    assert_eq!(result["warnings"], Value::Array(Vec::new()));
+    let src = builder
+        .save(dir.path().join("in.pdf"))
+        .to_string_lossy()
+        .into_owned();
+    let out = dir.path().join("in-ocr.pdf");
+    let out_text = out.to_string_lossy().into_owned();
+    let mut args = vec!["convert", "ocr", src.as_str(), "-o", out_text.as_str()];
+    args.extend_from_slice(extra);
+    let result = run(dir.path(), &args).expect("OCR succeeds");
     let bytes = fs::read(&out).expect("the OCR result is written");
     assert!(bytes.starts_with(b"%PDF-1.7"), "PDF/A-2 files are PDF 1.7");
     let doc = pdf_core::Document::load(bytes).expect("reopen");
     let catalog = doc.catalog().expect("catalog");
-    let metadata = doc
-        .resolve_stream(catalog.get(b"Metadata").expect("catalog Metadata"))
-        .expect("resolve Metadata")
-        .expect("Metadata is a stream");
-    let xmp = doc.decode_stream(&metadata).expect("decode Metadata");
-    let xmp = String::from_utf8_lossy(&xmp.data);
-    assert!(
-        xmp.contains("<pdfaid:part>2</pdfaid:part>")
-            && xmp.contains("<pdfaid:conformance>B</pdfaid:conformance>"),
-        "{xmp}"
-    );
     let intents = doc
         .resolve_array(catalog.get(b"OutputIntents").expect("OutputIntents"))
         .expect("resolve OutputIntents")
@@ -292,4 +276,44 @@ fn ocr_saves_a_pdfa_2b_candidate() {
         .expect("resolve the intent")
         .expect("the intent is a dictionary");
     assert_eq!(intent.get_name(b"S"), Some(&b"GTS_PDFA1"[..]));
+    let metadata = doc
+        .resolve_stream(catalog.get(b"Metadata").expect("catalog Metadata"))
+        .expect("resolve Metadata")
+        .expect("Metadata is a stream");
+    let xmp = doc.decode_stream(&metadata).expect("decode Metadata");
+    let xmp = String::from_utf8_lossy(&xmp.data);
+    assert!(xmp.contains("<pdfaid:part>2</pdfaid:part>"), "{xmp}");
+    let level = xmp
+        .split("<pdfaid:conformance>")
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .expect("a conformance level");
+    (result, level.to_owned())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ocr_claims_pdfa_2u_when_every_font_maps_to_unicode() {
+    // Forced OCR replaces the page's own font by the OCR fonts, which map
+    // every glyph to Unicode.
+    let mut builder = PdfBuilder::new();
+    builder
+        .page(612.0, 792.0)
+        .text(72.0, 700.0, "Quarterly report for the northern region");
+    let (result, level) = ocr_pdfa(&builder, &["--force"]);
+    assert_eq!(result["standard"], "PDF/A-2u");
+    assert_eq!(level, "U");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ocr_claims_only_pdfa_2b_when_a_kept_font_has_no_unicode_map() {
+    // The first page keeps its standard font, which has no ToUnicode map;
+    // OCR reads only the blank second page.
+    let mut builder = PdfBuilder::new();
+    builder.page(612.0, 792.0).text(72.0, 700.0, "Kept text");
+    builder.page(612.0, 792.0);
+    let (result, level) = ocr_pdfa(&builder, &[]);
+    assert_eq!(result["standard"], "PDF/A-2b");
+    assert_eq!(level, "B");
 }

@@ -3,15 +3,28 @@
 //! [`recognize`] runs Vision's accurate text recognizer, with language
 //! correction on, over an 8-bit gray or RGBA bitmap and returns the lines it
 //! read with per-word corner quads. Vision can leave whole lines of a page
-//! unread while its text detector still finds them; those regions are read
-//! again on their own. Coordinates are pixels of the bitmap with a top-left
-//! origin. On every other target the crate builds and [`recognize`] returns
+//! unread while its text detector still finds them; that ink is read again
+//! in narrow pieces. [`repair_model_cache`] moves aside the recognizer
+//! models macOS compiled wrongly for this program, so they are compiled
+//! again. Coordinates are pixels of the bitmap with a top-left origin. On
+//! every other target the crate builds and [`recognize`] returns
 //! [`OcrError::Unsupported`].
 
 use std::fmt;
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::sync::{Mutex, PoisonError};
 
 #[cfg(target_os = "macos")]
+mod model_cache;
+#[cfg(target_os = "macos")]
 mod vision;
+
+/// Whether this process has loaded the recognizer models, or decided to
+/// leave them be: set by the first [`repair_model_cache`], which holds it
+/// while it moves models, and by every [`recognize`].
+#[cfg(target_os = "macos")]
+static MODELS_IN_USE: Mutex<bool> = Mutex::new(false);
 
 /// Sample layout of a [`Bitmap`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +160,17 @@ pub struct Line {
     pub words: Vec<Word>,
 }
 
+/// What [`repair_model_cache`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelRepair {
+    /// Model folders compiled wrongly, each moved to the second path; the
+    /// next request compiles each again.
+    pub moved: Vec<(PathBuf, PathBuf)>,
+    /// Model folders compiled wrongly that could not be moved, each with
+    /// why.
+    pub stuck: Vec<(PathBuf, String)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OcrError {
     /// This target has no Vision framework.
@@ -195,6 +219,45 @@ pub fn supported_languages() -> Result<Vec<String>, OcrError> {
     }
 }
 
+/// Moves to the temporary folder each recognizer model macOS compiled
+/// wrongly for this program, so the next recognition compiles it again; a
+/// model compiled wrongly skips or misreads long lines on every run until
+/// then. Looks only in `~/Library/Caches/<program>/com.apple.e5rt.e5bundlecache`,
+/// `<program>` being the name of the file the process was started from,
+/// and moves only a model whose descriptor names one compiled function
+/// twice while a width has none. Runs once per process, before its first
+/// [`recognize`], which waits for it; `None` once either has run, as the
+/// models are then in use, and on every other target.
+pub fn repair_model_cache() -> Option<ModelRepair> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut in_use = MODELS_IN_USE.lock().unwrap_or_else(PoisonError::into_inner);
+        if std::mem::replace(&mut *in_use, true) {
+            return None;
+        }
+        Some(model_cache::repair_own())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// The recognizer models macOS compiled wrongly for this program, found as
+/// [`repair_model_cache`] finds them but left in place: after a repair and
+/// a recognition, the models compiled wrongly while it ran. Empty on every
+/// other target.
+pub fn damaged_models() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        model_cache::damaged_own()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Recognize the text in `bitmap`.
 ///
 /// RGBA bitmaps are composited over white first, as page pixels over paper;
@@ -211,6 +274,7 @@ pub fn recognize(bitmap: &Bitmap<'_>, options: &OcrOptions) -> Result<Vec<Line>,
             return Ok(Vec::new());
         }
         check_layout(bitmap)?;
+        *MODELS_IN_USE.lock().unwrap_or_else(PoisonError::into_inner) = true;
         vision::recognize(bitmap, options)
     }
     #[cfg(not(target_os = "macos"))]

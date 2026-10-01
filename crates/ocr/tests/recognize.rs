@@ -131,6 +131,15 @@ mod macos {
     }
 
     #[test]
+    fn the_model_cache_is_left_alone_once_a_recognition_has_run() {
+        // Whatever else runs in this process, a recognition has loaded the
+        // models by the time the repair is asked for.
+        let pixels = vec![255u8; WIDTH * HEIGHT];
+        pdf_ocr::recognize(&gray(&pixels), &OcrOptions::default()).unwrap();
+        assert_eq!(pdf_ocr::repair_model_cache(), None);
+    }
+
+    #[test]
     fn zero_sized_image_has_no_lines() {
         let bitmap = Bitmap {
             width: 0,

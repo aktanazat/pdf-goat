@@ -456,10 +456,20 @@ fn normalize_annotation_flags(document: &mut Document) -> Result<(), GoatError> 
     Ok(())
 }
 
-/// PDF/A-2b candidate: embedded fonts, identification XMP, an sRGB output intent,
-/// no encryption, and no document-level actions or JavaScript. Callers save the
-/// result without encryption, as PDF 1.7.
-pub fn make_pdfa(document: &mut Document) -> Result<(), GoatError> {
+/// The PDF/A-2 conformance level [`make_pdfa`] declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PdfaLevel {
+    /// Level B: every page keeps its appearance.
+    B,
+    /// Level U: level B, and every glyph maps to Unicode. The caller checks
+    /// that the file's fonts allow it.
+    U,
+}
+
+/// PDF/A-2 candidate at `level`: embedded fonts, identification XMP, an sRGB
+/// output intent, no encryption, and no document-level actions or JavaScript.
+/// Callers save the result without encryption, as PDF 1.7.
+pub fn make_pdfa(document: &mut Document, level: PdfaLevel) -> Result<(), GoatError> {
     embed_missing(document)?;
     normalize_annotation_flags(document)?;
     let root = document.catalog_ref().map_err(doc::pdf_error)?;
@@ -472,13 +482,19 @@ pub fn make_pdfa(document: &mut Document) -> Result<(), GoatError> {
         .and_then(|info| info.get(b"Title").and_then(|t| document.resolve(t).ok()))
         .and_then(|t| t.as_string().map(|s| s.to_text()))
         .filter(|title| !title.is_empty());
-    let extra = "   <pdfaid:part>2</pdfaid:part>\n   <pdfaid:conformance>B</pdfaid:conformance>\n";
+    let letter = match level {
+        PdfaLevel::B => "B",
+        PdfaLevel::U => "U",
+    };
+    let extra = format!(
+        "   <pdfaid:part>2</pdfaid:part>\n   <pdfaid:conformance>{letter}</pdfaid:conformance>\n"
+    );
     let mut metadata_dict = Dict::new();
     metadata_dict.insert("Type", Object::name("Metadata"));
     metadata_dict.insert("Subtype", Object::name("XML"));
     let metadata = document.add(Stream::new(
         metadata_dict,
-        xmp_packet(title.as_deref(), extra),
+        xmp_packet(title.as_deref(), &extra),
     ));
     catalog.insert("Metadata", Object::Reference(metadata));
     let mut profile_dict = Dict::new();
@@ -515,7 +531,7 @@ fn pdfa(matches: &ArgMatches, _ctx: &Ctx) -> Result<Map<String, Value>, GoatErro
         ));
     }
     let out = doc::output_path(matches, &opened.display(), "pdfa")?;
-    make_pdfa(&mut opened.doc)?;
+    make_pdfa(&mut opened.doc, PdfaLevel::B)?;
     let options = SaveOptions {
         compress_streams: true,
         object_streams: true,

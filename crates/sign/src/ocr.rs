@@ -2,12 +2,16 @@
 //! content by its raster, so neither visible nor hidden old text survives twice.
 //! A page that is one scanned image is read at the scan's own resolution, each
 //! word's invisible text is fitted to its ink (see [`layout`]), and the result
-//! is saved as a PDF/A-2b candidate the way `convert pdfa` saves one.
+//! is saved as a PDF/A-2 candidate the way `convert pdfa` saves one: level U
+//! when every font maps its glyphs to Unicode, else level B. Before the first
+//! page is read, recognizer models macOS compiled wrongly for this program
+//! are moved aside to be compiled again, each named in the warnings.
 
 use pdf_core::{
     Dict, Document, Encryption, Matrix, Object, Operation, Page, Rect, SaveOptions, Stream,
     parse_content,
 };
+use pdf_inspect::PdfaLevel;
 use pdf_interp::{Device, ImageEvent, ImageMaskEvent, RunOptions};
 use pdf_ocr::{Bitmap, OcrOptions, PixelFormat};
 use pdf_raster::Pixmap;
@@ -29,13 +33,14 @@ const MAX_SCAN_PIXELS: f64 = 67_108_864.0;
 /// An image covering this share of the page is the page's scan.
 const SCAN_COVER: f64 = 0.5;
 const MAX_XOBJECT_DEPTH: usize = 8;
-const STANDARD: &str = "PDF/A-2b";
+/// Nesting walked when looking for fonts inside one object.
+const MAX_NESTING: usize = 32;
 
 /// The OCR result and the standard it was saved to.
 pub struct OcrOutput {
     pub data: Vec<u8>,
-    /// [`STANDARD`], or `None` when the PDF/A conversion failed and the
-    /// plain OCR result was kept.
+    /// "PDF/A-2u" or "PDF/A-2b", or `None` when the PDF/A conversion failed
+    /// and the plain OCR result was kept.
     pub standard: Option<&'static str>,
     pub warnings: Vec<String>,
 }
@@ -47,10 +52,13 @@ pub fn ocr_document(data: Vec<u8>, force: bool) -> Result<OcrOutput, String> {
     }
     let mut fonts = font::Fonts::default();
     let ocr = OcrOptions::default();
+    let mut repair = None;
     for page in doc.pages().map_err(|e| e.to_string())? {
         if !force && page_has_text(&doc, &page) {
             continue;
         }
+        // Before the first page is read, while no recognizer model is loaded.
+        repair.get_or_insert_with(pdf_ocr::repair_model_cache);
         let dpi = page_dpi(&doc, &page);
         let options = RenderOptions {
             dpi,
@@ -74,6 +82,10 @@ pub fn ocr_document(data: Vec<u8>, force: bool) -> Result<OcrOutput, String> {
         };
         apply_page(&mut doc, &page, &scan, &lines, force, &mut fonts)?;
     }
+    let mut warnings = match repair.flatten() {
+        Some(repair) => model_warnings(&repair, &pdf_ocr::damaged_models()),
+        None => Vec::new(),
+    };
     let plain = doc
         .save_to_bytes(&SaveOptions {
             compress_streams: true,
@@ -82,33 +94,117 @@ pub fn ocr_document(data: Vec<u8>, force: bool) -> Result<OcrOutput, String> {
         })
         .map_err(|e| e.to_string())?;
     Ok(match pdfa(&plain) {
-        Ok(data) => OcrOutput {
+        Ok((data, standard)) => OcrOutput {
             data,
-            standard: Some(STANDARD),
-            warnings: Vec::new(),
+            standard: Some(standard),
+            warnings,
         },
-        Err(reason) => OcrOutput {
-            data: plain,
-            standard: None,
-            warnings: vec![format!("saved without {STANDARD}: {reason}")],
-        },
+        Err(warning) => {
+            warnings.push(warning);
+            OcrOutput {
+                data: plain,
+                standard: None,
+                warnings,
+            }
+        }
     })
 }
 
-/// The OCR result as a PDF/A-2b candidate. The conversion runs on a reloaded
-/// copy, so a failure leaves the plain result intact.
-fn pdfa(plain: &[u8]) -> Result<Vec<u8>, String> {
-    let mut doc = Document::load(plain.to_vec()).map_err(|e| e.to_string())?;
-    pdf_inspect::make_pdfa(&mut doc).map_err(|e| e.to_string())?;
-    doc.save_to_bytes(&SaveOptions {
-        compress_streams: true,
-        object_streams: true,
-        garbage_collect: true,
-        encryption: Encryption::Remove,
-        version: Some((1, 7)),
-        ..SaveOptions::default()
+/// One warning per recognizer model [`pdf_ocr::repair_model_cache`] found
+/// compiled wrongly before the pages were read, and one per model of
+/// `damaged` it could not have seen, compiled wrongly while they were read.
+fn model_warnings(repair: &pdf_ocr::ModelRepair, damaged: &[std::path::PathBuf]) -> Vec<String> {
+    let moved = repair.moved.iter().map(|(model, to)| {
+        format!(
+            "macOS had compiled part of the text recognizer wrongly, which skips or misreads \
+             long lines; moved {} to {} so macOS compiles it again, which adds about 15 seconds \
+             to this run",
+            model.display(),
+            to.display()
+        )
+    });
+    let stuck = repair.stuck.iter().map(|(model, error)| {
+        format!(
+            "macOS has compiled part of the text recognizer wrongly, which skips or misreads \
+             long lines, and {} could not be moved aside: {error}",
+            model.display()
+        )
+    });
+    let compiled = damaged
+        .iter()
+        .filter(|model| !repair.stuck.iter().any(|(stuck, _)| stuck == *model))
+        .map(|model| {
+            format!(
+                "macOS compiled part of the text recognizer wrongly while this file was read, \
+                 so long lines may be skipped or misread; running OCR again moves {} aside so \
+                 macOS compiles it again",
+                model.display()
+            )
+        });
+    moved.chain(stuck).chain(compiled).collect()
+}
+
+/// The OCR result as a PDF/A-2 candidate and the standard it meets, or a
+/// warning naming why it could not become one. The conversion runs on a
+/// reloaded copy, so a failure leaves the plain result intact.
+fn pdfa(plain: &[u8]) -> Result<(Vec<u8>, &'static str), String> {
+    let skipped = |standard: &str, reason: String| format!("saved without {standard}: {reason}");
+    let mut doc = Document::load(plain.to_vec()).map_err(|e| skipped("PDF/A", e.to_string()))?;
+    let (level, standard) = if fonts_map_to_unicode(&doc) {
+        (PdfaLevel::U, "PDF/A-2u")
+    } else {
+        (PdfaLevel::B, "PDF/A-2b")
+    };
+    pdf_inspect::make_pdfa(&mut doc, level).map_err(|e| skipped(standard, e.to_string()))?;
+    let data = doc
+        .save_to_bytes(&SaveOptions {
+            compress_streams: true,
+            object_streams: true,
+            garbage_collect: true,
+            encryption: Encryption::Remove,
+            version: Some((1, 7)),
+            ..SaveOptions::default()
+        })
+        .map_err(|e| skipped(standard, e.to_string()))?;
+    Ok((data, standard))
+}
+
+/// Level U needs a Unicode mapping for every glyph. The OCR fonts always
+/// carry a ToUnicode map; a font kept from the source may not, and then the
+/// file stays at level B.
+fn fonts_map_to_unicode(doc: &Document) -> bool {
+    doc.object_ids().into_iter().all(|id| {
+        doc.get(id)
+            .is_ok_and(|object| object_maps_to_unicode(&object, 0))
     })
-    .map_err(|e| e.to_string())
+}
+
+/// Whether every font dictionary in `object` that shows text has a
+/// ToUnicode map. CIDFonts show text through their Type0 parent.
+fn object_maps_to_unicode(object: &Object, depth: usize) -> bool {
+    if depth >= MAX_NESTING {
+        return false;
+    }
+    let dict = match object {
+        Object::Dict(dict) => dict,
+        Object::Stream(stream) => &stream.dict,
+        Object::Array(items) => {
+            return items
+                .iter()
+                .all(|item| object_maps_to_unicode(item, depth + 1));
+        }
+        _ => return true,
+    };
+    let font = dict.get_name(b"Type") == Some(b"Font") || dict.get(b"BaseFont").is_some();
+    let descendant = matches!(
+        dict.get_name(b"Subtype"),
+        Some(b"CIDFontType0" | b"CIDFontType2")
+    );
+    if font && !descendant && dict.get(b"ToUnicode").is_none() {
+        return false;
+    }
+    dict.iter()
+        .all(|(_, value)| object_maps_to_unicode(value, depth + 1))
 }
 
 /// The resolution to read `page` at: its scan's own, clamped to
