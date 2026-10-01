@@ -2,8 +2,8 @@
 //! collection and an installed face covering Japanese; missing assets fail.
 
 use pdf_font::{
-    BaseEncoding, CMap, CharCode, CidCollection, Encoding, Font, FontKind, FontLocator,
-    FontRequest, MatchQuality, PathOp, Rect, Script, Standard14, ToUnicodeMap,
+    BaseEncoding, CMap, CharCode, CidCollection, EmbedGlyph, Encoding, Font, FontKind, FontLocator,
+    FontRequest, MatchQuality, PathOp, Rect, Script, Standard14, ToUnicodeMap, embed_font,
     glyph_name_to_unicode, subset_truetype, write_to_unicode_cmap,
 };
 
@@ -179,6 +179,85 @@ fn t1_pfb() -> Vec<u8> {
         vec![0x80, 3],
     ]
     .concat()
+}
+
+/// Embeds `wanted` from the Type 1 fixture twice over, then checks that code 1 names
+/// and draws it, reads back as "x", and that the subset program holds exactly `kept`.
+fn assert_type1_subset(wanted: &str, kept: &[&str]) {
+    let font = Font::parse(t1_pfb()).expect("Type 1");
+    let glyph = |name: &str| font.glyph_by_name(name).expect(name);
+    let mut doc = pdf_core::Document::new();
+    let request = EmbedGlyph {
+        glyph_id: glyph(wanted),
+        unicode: "x",
+    };
+    let embedded = embed_font(&mut doc, &font, &[request, request]).expect("embed");
+    assert_eq!(
+        embedded.codes,
+        vec![vec![1u8], vec![1u8]],
+        "one glyph, one code"
+    );
+
+    let dict = doc
+        .get(embedded.font)
+        .expect("font")
+        .as_dict()
+        .cloned()
+        .expect("dict");
+    let resolve = |key: &[u8]| doc.resolve(dict.get(key).expect("key")).expect("resolve");
+    let encoding = resolve(b"Encoding");
+    let differences = encoding
+        .as_dict()
+        .and_then(|e| e.get(b"Differences"))
+        .and_then(|d| d.as_array())
+        .expect("Differences");
+    assert_eq!(differences[0].as_f64(), Some(1.0));
+    assert_eq!(differences[1].as_name(), Some(wanted.as_bytes()));
+    let to_unicode = resolve(b"ToUnicode");
+    let to_unicode = doc
+        .decode_stream(to_unicode.as_stream().expect("ToUnicode stream"))
+        .expect("decode");
+    let map = ToUnicodeMap::parse(&to_unicode.data).expect("ToUnicode parses");
+    assert_eq!(map.lookup(1).as_deref(), Some("x"));
+
+    let descriptor = resolve(b"FontDescriptor");
+    let file = doc
+        .resolve(
+            descriptor
+                .as_dict()
+                .and_then(|d| d.get(b"FontFile"))
+                .expect("FontFile"),
+        )
+        .expect("font file");
+    let file = file.as_stream().expect("font file stream");
+    let length = |key: &[u8]| file.dict.get(key).and_then(|v| v.as_f64()).expect("length");
+    let program = doc.decode_stream(file).expect("decode").data;
+    assert_eq!(
+        length(b"Length1") + length(b"Length2") + length(b"Length3"),
+        program.len() as f64
+    );
+    let subset = Font::parse(program).expect("the subset parses");
+    let mut names: Vec<String> = (0..subset.num_glyphs())
+        .filter_map(|id| subset.glyph_name(id))
+        .collect();
+    names.sort();
+    assert_eq!(names, kept);
+    let drawn = subset.glyph_by_name(wanted).expect("kept glyph");
+    assert_eq!(
+        subset.glyph_bounds(drawn).expect("subset bounds"),
+        font.glyph_bounds(glyph(wanted)).expect("bounds"),
+        "{wanted} draws as in the full font"
+    );
+}
+
+#[test]
+fn type1_embedding_keeps_an_accented_glyph_with_its_seac_parts() {
+    assert_type1_subset("Aacute", &[".notdef", "A", "Aacute", "acute"]);
+}
+
+#[test]
+fn type1_embedding_drops_the_glyphs_no_request_draws() {
+    assert_type1_subset("acute", &[".notdef", "acute"]);
 }
 
 fn rect(x_min: f32, y_min: f32, x_max: f32, y_max: f32) -> Rect {

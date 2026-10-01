@@ -7,10 +7,10 @@ use crate::error::{FontError, Result};
 use crate::outline::{Outline, OutlineBuilder};
 use crate::ps::{Lexer, Token};
 
-const EEXEC_KEY: u16 = 55665;
-const CHARSTRING_KEY: u16 = 4330;
-const C1: u16 = 52845;
-const C2: u16 = 22719;
+pub(crate) const EEXEC_KEY: u16 = 55665;
+pub(crate) const CHARSTRING_KEY: u16 = 4330;
+pub(crate) const C1: u16 = 52845;
+pub(crate) const C2: u16 = 22719;
 
 /// Most subroutines accepted in `/Subrs`.
 const MAX_SUBRS: usize = 65_536;
@@ -38,12 +38,12 @@ fn is_hex(b: u8) -> bool {
     b.is_ascii_hexdigit()
 }
 
-fn is_space(b: u8) -> bool {
+pub(crate) fn is_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0C | 0)
 }
 
 /// Cleartext part and decrypted private part of a Type 1 program.
-fn split_program(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn split_program(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     if data.first() == Some(&0x80) {
         return split_pfb(data);
     }
@@ -125,7 +125,7 @@ fn decode_hex(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 

@@ -118,7 +118,9 @@ impl Collector<'_> {
     }
 }
 
-pub(crate) fn unrotated_transform(page: &Page) -> Matrix {
+/// Maps PDF user space to unrotated page space: origin at the crop box's top
+/// left, y down, in points scaled by UserUnit (the frame `search` reports).
+pub fn unrotated_transform(page: &Page) -> Matrix {
     let mut crop = page.crop_box();
     if crop.width() < 1.0 || crop.height() < 1.0 {
         crop = Rect::new(0.0, 0.0, 1.0, 1.0);

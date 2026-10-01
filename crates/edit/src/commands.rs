@@ -3,9 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::ArgMatches;
+use clap::parser::ValueSource;
 use goat_common::args::{optional, required};
-use goat_common::parse::{parse_color, parse_point, parse_rect, selected_page};
+use goat_common::parse::{parse_color, parse_pages, parse_point, parse_rect, selected_page};
 use goat_common::paths::{default_out, ensure_parent, out_dir, resolve};
+use goat_common::py::parse_float;
 use goat_common::{Ctx, GoatError};
 use pdf_core::{Document, Point, Rect, SaveOptions};
 use pdf_forms::WidgetType;
@@ -305,6 +307,29 @@ fn page_index(matches: &ArgMatches, doc: &Document) -> Result<usize, GoatError> 
     )
 }
 
+/// `--pages` in the order given without repeats, else the one `--page`.
+fn page_list(matches: &ArgMatches, doc: &Document) -> Result<Vec<usize>, GoatError> {
+    let Some(spec) = optional::<String>(matches, "pages")? else {
+        return Ok(vec![page_index(matches, doc)?]);
+    };
+    let mut seen = HashSet::new();
+    Ok(
+        parse_pages(spec, doc.page_count().map_err(EditError::from)?)?
+            .into_iter()
+            .filter(|index| seen.insert(*index))
+            .collect(),
+    )
+}
+
+/// `--rect` as a normalized rectangle.
+fn rect_arg(matches: &ArgMatches) -> Result<Rect, GoatError> {
+    let values = parse_rect(required::<String>(matches, "rect")?)?;
+    let &[x0, y0, x1, y1] = values.as_slice() else {
+        return Err(GoatError::value_error("Rect: bad seq len"));
+    };
+    Ok(Rect::new(x0, y0, x1, y1).normalized())
+}
+
 /// A `search`-frame box rounded to 0.1 pt, as `search` reports rectangles.
 fn frame_box(rect: Rect) -> Value {
     let round = |v: f64| format!("{v:.1}").parse::<f64>().unwrap_or(v);
@@ -316,29 +341,83 @@ fn frame_box(rect: Rect) -> Value {
     ])
 }
 
+/// add-text `--color`: `#rrggbb` as `parse_color` reads it, otherwise every comma-separated
+/// number. `parse_color` keeps three numbers, which would read a CMYK colour as RGB.
+fn text_color(spec: Option<&str>) -> Result<Option<Vec<f64>>, GoatError> {
+    match spec {
+        Some(spec) if !spec.is_empty() && !spec.trim_start().starts_with('#') => spec
+            .split(',')
+            .map(parse_float)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        spec => parse_color(spec),
+    }
+}
+
+/// `page` and `bbox` of the first placement, and every placement.
+fn insert_placements(result: &mut Map<String, Value>, placements: &[(usize, Rect)]) {
+    if let Some(&(index, bbox)) = placements.first() {
+        result.insert("page".into(), (index + 1).into());
+        result.insert("bbox".into(), frame_box(bbox));
+    }
+    result.insert(
+        "placements".into(),
+        placements
+            .iter()
+            .map(|&(index, bbox)| serde_json::json!({"page": index + 1, "bbox": frame_box(bbox)}))
+            .collect(),
+    );
+}
+
 pub(crate) fn add_text(matches: &ArgMatches, _ctx: &Ctx) -> Result<Map<String, Value>, GoatError> {
     let src = source(matches)?;
     let out = output(matches, &src, "edited", "pdf")?;
-    let (x, y) = parse_point(required::<String>(matches, "at")?)?;
-    let color = parse_color(optional::<String>(matches, "color")?.map(String::as_str))?;
+    let anchor = if matches.get_flag("fit") {
+        place::Anchor::Fit {
+            rect: rect_arg(matches)?,
+            capped: matches.value_source("size") == Some(ValueSource::CommandLine),
+        }
+    } else {
+        let (x, y) = parse_point(required::<String>(matches, "at")?)?;
+        place::Anchor::At {
+            point: Point::new(x, y),
+            width: optional::<f64>(matches, "width")?.copied(),
+        }
+    };
+    let align = match required::<String>(matches, "align")?.as_str() {
+        "center" => place::Align::Center,
+        "right" => place::Align::Right,
+        _ => place::Align::Left,
+    };
+    let color = text_color(optional::<String>(matches, "color")?.map(String::as_str))?;
     let mut doc = open(&src)?;
-    let index = page_index(matches, &doc)?;
+    let pages = page_list(matches, &doc)?;
     let drawn = place::add_text(
         &mut doc,
-        index,
+        &pages,
         &place::Text {
             text: required::<String>(matches, "text")?,
-            at: Point::new(x, y),
+            anchor,
             font: required::<String>(matches, "font")?,
+            face: optional::<String>(matches, "face")?.map(String::as_str),
             size: *required::<f64>(matches, "size")?,
             color: color.as_deref().unwrap_or(&[0.0]),
+            align,
+            rotate: *required::<f64>(matches, "rotate")?,
+            opacity: *required::<f64>(matches, "opacity")?,
         },
     )?;
     save(&doc, &out)?;
     let mut result = receipt("edit-add-text", &src, &[out]);
-    result.insert("page".into(), (index + 1).into());
-    result.insert("bbox".into(), frame_box(drawn.bbox));
+    insert_placements(&mut result, &drawn.placements);
     result.insert("font".into(), drawn.font.into());
+    result.insert(
+        "size".into(),
+        format!("{:.2}", drawn.size)
+            .parse::<f64>()
+            .unwrap_or(drawn.size)
+            .into(),
+    );
     Ok(result)
 }
 
@@ -346,21 +425,22 @@ pub(crate) fn add_image(matches: &ArgMatches, _ctx: &Ctx) -> Result<Map<String, 
     let src = source(matches)?;
     let image = resolve(required::<String>(matches, "image")?)?;
     let out = output(matches, &src, "edited", "pdf")?;
-    let values = parse_rect(required::<String>(matches, "rect")?)?;
-    let &[x0, y0, x1, y1] = values.as_slice() else {
-        return Err(GoatError::value_error("Rect: bad seq len"));
+    let picture = place::Picture {
+        rect: rect_arg(matches)?,
+        rotate: *required::<f64>(matches, "rotate")?,
+        opacity: *required::<f64>(matches, "opacity")?,
+        stretch: matches.get_flag("stretch"),
     };
     let data = fs::read(&image).map_err(|e| GoatError::os(&e, &image))?;
     let mut doc = open(&src)?;
-    let index = page_index(matches, &doc)?;
-    let bbox = place::add_image(&mut doc, index, &data, Rect::new(x0, y0, x1, y1))?;
+    let pages = page_list(matches, &doc)?;
+    let placements = place::add_image(&mut doc, &pages, &data, &picture)?;
     save(&doc, &out)?;
     let mut result = receipt("edit-add-image", &src, &[out]);
     result.insert(
         "inputs".into(),
         serde_json::json!([src.to_string_lossy(), image.to_string_lossy()]),
     );
-    result.insert("page".into(), (index + 1).into());
-    result.insert("bbox".into(), frame_box(bbox));
+    insert_placements(&mut result, &placements);
     Ok(result)
 }

@@ -727,7 +727,7 @@ fn parse_charset(cff: &[u8], offset: usize, num_glyphs: u16, cid: bool) -> Resul
     Ok(out)
 }
 
-fn parse_fd_select(cff: &[u8], offset: usize, num_glyphs: usize) -> Result<Vec<u8>> {
+pub(crate) fn parse_fd_select(cff: &[u8], offset: usize, num_glyphs: usize) -> Result<Vec<u8>> {
     let format = *cff
         .get(offset)
         .ok_or(FontError::Truncated("CFF FDSelect"))?;

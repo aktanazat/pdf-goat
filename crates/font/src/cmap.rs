@@ -769,23 +769,38 @@ const BFCHAR_BLOCK: usize = 100;
 /// A ToUnicode CMap stream for two-byte codes (Identity-H): one bfchar entry per (code, text),
 /// sorted by code; later duplicates of a code and empty texts are dropped.
 pub fn write_to_unicode_cmap(entries: &[(u16, &str)]) -> Vec<u8> {
-    let mut entries: Vec<(u16, &str)> = entries
-        .iter()
-        .copied()
-        .filter(|(_, t)| !t.is_empty())
-        .collect();
+    unicode_cmap(entries.to_vec(), 2)
+}
+
+/// A ToUnicode CMap stream for the one-byte codes of a simple font, with the same rules as
+/// [`write_to_unicode_cmap`].
+pub fn write_simple_to_unicode_cmap(entries: &[(u8, &str)]) -> Vec<u8> {
+    unicode_cmap(
+        entries
+            .iter()
+            .map(|&(code, text)| (u16::from(code), text))
+            .collect(),
+        1,
+    )
+}
+
+fn unicode_cmap(mut entries: Vec<(u16, &str)>, code_bytes: usize) -> Vec<u8> {
+    entries.retain(|(_, t)| !t.is_empty());
     entries.sort_by_key(|(code, _)| *code);
     entries.dedup_by_key(|(code, _)| *code);
-    let mut out = String::from(
+    let digits = code_bytes * 2;
+    let mut out = format!(
         "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
          /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
          /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
-         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+         1 begincodespacerange\n<{:0digits$X}> <{:0digits$X}>\nendcodespacerange\n",
+        0,
+        (1u32 << (8 * code_bytes)) - 1,
     );
     for block in entries.chunks(BFCHAR_BLOCK) {
         out.push_str(&format!("{} beginbfchar\n", block.len()));
         for (code, text) in block {
-            out.push_str(&format!("<{code:04X}> <"));
+            out.push_str(&format!("<{code:0digits$X}> <"));
             for unit in text.encode_utf16() {
                 out.push_str(&format!("{unit:04X}"));
             }

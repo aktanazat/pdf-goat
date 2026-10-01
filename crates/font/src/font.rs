@@ -238,10 +238,19 @@ impl Font {
         }
     }
 
-    fn cff_bytes(&self) -> &[u8] {
+    pub(crate) fn cff_bytes(&self) -> &[u8] {
         match &self.inner {
             Inner::OpenTypeCff(_, _, (off, len)) => &self.data[*off..*off + *len],
             _ => &self.data,
+        }
+    }
+
+    /// The bytes of sfnt table `tag` of this face; `None` for bare CFF and Type 1 programs
+    /// and for a table the face lacks.
+    pub fn table(&self, tag: &[u8; 4]) -> Option<&[u8]> {
+        match &self.inner {
+            Inner::TrueType(f) | Inner::OpenTypeCff(f, _, _) => f.sfnt.table(&self.data, tag),
+            Inner::Cff(_) | Inner::Type1(_) => None,
         }
     }
 

@@ -19,6 +19,7 @@
 mod commands;
 mod edit_text;
 mod image_redact;
+mod kern;
 mod ooxml;
 mod path_redact;
 mod place;
@@ -27,9 +28,12 @@ mod pyfmt;
 mod redact;
 mod word;
 
+pub use place::{Image, image_matrix, image_xobject};
+pub use redact::unrotated_transform;
+
 use std::fmt;
 
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use goat_common::args::{float_value, int_value};
 use goat_common::{GoatError, Registry, Verb};
 
@@ -73,14 +77,15 @@ impl From<EditError> for GoatError {
 
 const ADD_TEXT_HELP: &str = "\
 Use this to put a typed signature, a date or a check mark on a flat form (one without fillable
-fields). Find the label with `search`, pass a point beside its rectangle to --at, then check the
-result with `render --clip`. Each run writes a new file.
+fields). Find the label with `search`, pass a point beside its rectangle to --at (or the box to
+fill to --fit --rect), then check the result with `render --clip`. Each run writes a new file.
 
 Examples:
   pdf-goat search form.pdf 'MEMBER SIGNATURE'
-  pdf-goat edit add-text form.pdf --text 'Jane Q. Member' --font 'Brush Script MT' --size 20 --at 90,612 -o step1.pdf
+  pdf-goat edit add-text form.pdf --text 'Jane Q. Member' --font 'Snell Roundhand' --fit --rect 72,200,300,230 -o step1.pdf
   pdf-goat edit add-text step1.pdf --text 09/30/2026 --at 420,612 -o step2.pdf
-  pdf-goat edit add-text step2.pdf --text ✔ --font ZapfDingbats --at 74,660 -o signed.pdf
+  pdf-goat edit add-text step2.pdf --text ✔ --font ZapfDingbats --at 74,660 -o step3.pdf
+  pdf-goat edit add-text step3.pdf --text 'Jane Q. Member\\n12 Main St' --pages 1-3 --at 400,760 -o signed.pdf
   pdf-goat render signed.pdf --pages 1 --clip 60,560,560,680 --dpi 200 -o check";
 
 /// Registers the crate's verbs; the CLI calls this once.
@@ -118,6 +123,27 @@ pub fn register(registry: &mut Registry) {
             .default_value("1")
             .help("1-based page number")
     };
+    let pages = || {
+        Arg::new("pages")
+            .long("pages")
+            .conflicts_with("page")
+            .help("pages to draw on, such as 1,3-5; replaces --page")
+    };
+    let rotate = || {
+        Arg::new("rotate")
+            .long("rotate")
+            .value_parser(float_value)
+            .default_value("0")
+            .allow_negative_numbers(true)
+            .help("degrees counter-clockwise")
+    };
+    let opacity = || {
+        Arg::new("opacity")
+            .long("opacity")
+            .value_parser(float_value)
+            .default_value("1")
+            .help("0 (invisible) to 1 (opaque)")
+    };
     registry.family_verb(
         "edit",
         Verb::new(
@@ -125,14 +151,34 @@ pub fn register(registry: &mut Registry) {
                 .about("draw text into the page content: a typed signature, date or check mark on a flat form")
                 .after_help(ADD_TEXT_HELP)
                 .arg(file())
-                .arg(Arg::new("text").long("text").required(true).help("one line of text"))
-                .arg(Arg::new("at").long("at").required(true).help(
+                .arg(Arg::new("text").long("text").required(true).help(
+                    "the text; a line break or \\n starts a new line, \\\\ is a backslash",
+                ))
+                .arg(Arg::new("at").long("at").required_unless_present("fit").help(
                     "x,y start of the baseline, in search's frame: points from the crop box's top-left, y down",
                 ))
+                .arg(
+                    Arg::new("fit")
+                        .long("fit")
+                        .action(ArgAction::SetTrue)
+                        .requires("rect")
+                        .conflicts_with_all(["at", "width"])
+                        .help("draw at the largest size that fits --rect (at most --size when given), centred vertically and placed across by --align"),
+                )
+                .arg(
+                    Arg::new("rect")
+                        .long("rect")
+                        .requires("fit")
+                        .help("x0,y0,x1,y1 box for --fit, in search's frame"),
+                )
                 .arg(page())
+                .arg(pages())
                 .arg(Arg::new("font").long("font").default_value("Helvetica").help(
-                    "a Standard 14 name, an installed font such as 'Brush Script MT', or a .ttf/.ttc path; \
-                     other than Standard 14, the font is embedded as a subset",
+                    "a Standard 14 name, an installed font such as 'Snell Roundhand', or a font file \
+                     (.ttf .otf .ttc .otc .pfb .pfa); other than Standard 14, the font is embedded as a subset",
+                ))
+                .arg(Arg::new("face").long("face").help(
+                    "the face of a .ttc/.otc file: an index from 0, or a PostScript or 'Family Style' name",
                 ))
                 .arg(
                     Arg::new("size")
@@ -141,7 +187,24 @@ pub fn register(registry: &mut Registry) {
                         .default_value("12")
                         .help("font size in points"),
                 )
-                .arg(Arg::new("color").long("color").help("#rrggbb, a gray level, or r,g,b from 0 to 1; default black"))
+                .arg(
+                    Arg::new("width")
+                        .long("width")
+                        .value_parser(float_value)
+                        .help("wrap lines at spaces to this many points"),
+                )
+                .arg(
+                    Arg::new("align")
+                        .long("align")
+                        .value_parser(["left", "center", "right"])
+                        .default_value("left")
+                        .help("line alignment: on the --at point, inside --width, or inside --rect"),
+                )
+                .arg(rotate())
+                .arg(opacity())
+                .arg(Arg::new("color").long("color").help(
+                    "#rrggbb, a gray level, r,g,b or c,m,y,k from 0 to 1; default black",
+                ))
                 .arg(output()),
             commands::add_text,
         ),
@@ -166,7 +229,16 @@ pub fn register(registry: &mut Registry) {
                         .required(true)
                         .help("x0,y0,x1,y1 in search's frame; the image keeps its aspect ratio"),
                 )
+                .arg(
+                    Arg::new("stretch")
+                        .long("stretch")
+                        .action(ArgAction::SetTrue)
+                        .help("fill --rect, ignoring the image's aspect ratio"),
+                )
+                .arg(rotate())
+                .arg(opacity())
                 .arg(page())
+                .arg(pages())
                 .arg(output()),
             commands::add_image,
         ),
