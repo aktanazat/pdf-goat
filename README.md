@@ -210,7 +210,8 @@ PDF before replacing an original. The native PDF viewer does not edit Office fil
   reads a yen sign as a dot and skips a lone digit in a table cell. A page that is
   one scanned image is read at the scan's own resolution (150 to 600 dpi). The
   hidden text is fitted to each word's ink, so search highlights and selection
-  sit on the scanned words. The output is PDF/A-2b and passes veraPDF. When the
+  sit on the scanned words. The output is PDF/A-2u, or PDF/A-2b when some text
+  has no Unicode mapping, and passes veraPDF. When the
   source holds something PDF/A cannot carry, such as a font that cannot be
   embedded, the plain OCR file is written instead, `standard` is null and
   `warnings` says why.
