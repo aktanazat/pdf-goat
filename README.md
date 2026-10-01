@@ -191,16 +191,21 @@ PDF before replacing an original. The native PDF viewer does not edit Office fil
   Installed fonts affect PDFs that omit font programs. HTML conversion rasterizes
   SVG artwork at twice CSS resolution and adds a positioned, searchable text
   layer for its visible labels.
-- Shadings (axial, radial, function-based, triangle meshes, Coons and tensor
-  patches) and tiling patterns are rasterized the way MuPDF does: the same
-  256-entry color table, triangle tessellation and fixed-point fill, MuPDF's
-  Background, BBox and clipping rules, and tiling cells copied at MuPDF's pixel
-  offsets. On 54 synthetic shading pages at 72, 144 and 300 dpi, 153 of 162
-  renders are within one level per channel of PyMuPDF and 135 are identical.
-  Remaining differences: DeviceCMYK colors can differ by up to 8 levels, in
-  plain fills as well, because PyMuPDF converts them through an ICC profile; a
-  45 degree axial gradient can differ by up to 3 levels on a few hundred pixels;
-  antialiased edges of strokes and non-rectangular clips are not pixel-matched.
+- Pages are rasterized the way MuPDF does. Glyphs come from a port of
+  FreeType's smooth rasterizer with MuPDF's subpixel placement, and stroked or
+  very large text from the bundled FreeType. Path edges, strokes, clips and
+  transparency groups follow MuPDF's rasterizer. Shadings (axial, radial,
+  function-based, triangle meshes, Coons and tensor patches) and tiling
+  patterns use MuPDF's 256-entry color table, tessellation and fixed-point
+  fill, its Background, BBox and clipping rules, and its tiling cell offsets.
+  Colors convert through the ICC profiles, rendering intents and black point
+  compensation MuPDF uses. On 96 synthetic pages (fills, strokes, clips, text,
+  shadings, patterns and transparency groups) at 72, 144 and 300 dpi, 285 of
+  288 renders are within one level per channel of PyMuPDF and 262 are
+  identical; the other three, transparency groups at 300 dpi, differ by two
+  levels on one edge pixel each. 850 random fills in DeviceCMYK, Lab, CalRGB,
+  CalGray and ICC-based spaces match PyMuPDF exactly. Transparency groups that
+  name a CMYK or gray blending space are still blended in RGB.
 - `pages flatten` bakes annotations and form fields into page content. Page
   content, including transparency, stays vector and unchanged, so it keeps full
   detail at any zoom.
