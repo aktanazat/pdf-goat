@@ -41,6 +41,104 @@ fn fixture(home: &Path) -> String {
 fn output(result: &Map<String, Value>) -> &str {
     result["outputs"][0].as_str().expect("output path")
 }
+/// A lone check box `agree` with the states `Yes` and `Off`.
+fn checkbox_fixture(home: &Path, checked: bool) -> String {
+    let mut builder = PdfBuilder::new();
+    builder
+        .page(595.0, 842.0)
+        .checkbox("agree", [72.0, 200.0, 92.0, 220.0], checked);
+    builder
+        .save(home.join("checkbox.pdf"))
+        .to_string_lossy()
+        .into_owned()
+}
+/// A radio group `size` whose separate parent holds two kids with the on states
+/// `S` and `L`; `S` is selected.
+fn radio_fixture(home: &Path) -> String {
+    let mut builder = PdfBuilder::new();
+    builder
+        .page(595.0, 842.0)
+        .checkbox("size", [72.0, 72.0, 92.0, 92.0], true)
+        .checkbox("size", [112.0, 72.0, 132.0, 92.0], false);
+    let source = builder
+        .save(home.join("radio.pdf"))
+        .to_string_lossy()
+        .into_owned();
+    let mut doc = Document::open(&source).expect("fixture");
+    let mut parent_id = None;
+    for (widget, state) in pdf_forms::page_widgets(&doc, 0)
+        .expect("widgets")
+        .into_iter()
+        .zip(["S", "L"])
+    {
+        let mut kid = doc
+            .get(widget)
+            .expect("kid")
+            .as_dict()
+            .expect("dict")
+            .clone();
+        let mut ap = doc
+            .resolve_key(&kid, b"AP")
+            .expect("appearance")
+            .as_dict()
+            .expect("dict")
+            .clone();
+        let mut normal = doc
+            .resolve_key(&ap, b"N")
+            .expect("states")
+            .as_dict()
+            .expect("dict")
+            .clone();
+        let on = normal.remove(b"Yes").expect("on appearance");
+        normal.insert(state, on);
+        ap.insert("N", normal);
+        kid.insert("AP", ap);
+        kid.insert("AS", Object::name(if state == "S" { "S" } else { "Off" }));
+        parent_id = kid.get_ref(b"Parent");
+        doc.set(widget, kid);
+    }
+    let parent_id = parent_id.expect("separate parent field");
+    let mut parent = doc
+        .get(parent_id)
+        .expect("parent")
+        .as_dict()
+        .expect("dict")
+        .clone();
+    parent.insert("Ff", 49152_i64);
+    parent.insert("V", Object::name("S"));
+    doc.set(parent_id, parent);
+    doc.save(&source, &pdf_core::SaveOptions::default())
+        .expect("save");
+    source
+}
+fn fill_json(home: &Path, source: &str, data: &str) -> Result<Map<String, Value>, GoatError> {
+    let path = home.join("data.json");
+    std::fs::write(&path, data).expect("data");
+    run(
+        home,
+        &[
+            "form",
+            "fill",
+            source,
+            "--data",
+            path.to_str().expect("path"),
+        ],
+    )
+}
+/// The listed widgets' `checked` flags, and the exported field values, of a filled file.
+fn button_states(home: &Path, filled: &Map<String, Value>) -> (Vec<Value>, Value) {
+    let listed = run(home, &["form", "list", output(filled)]).expect("list");
+    let checked = listed["fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .map(|field| field["checked"].clone())
+        .collect();
+    let export = run(home, &["form", "export", output(filled)]).expect("export");
+    let exported = serde_json::from_slice(&std::fs::read(output(&export)).expect("export file"))
+        .expect("json");
+    (checked, exported)
+}
 
 #[test]
 fn list_preserves_widget_instances_and_inherited_values() {
@@ -133,26 +231,100 @@ fn fill_updates_both_shared_widgets_and_keeps_values_after_flattening() {
     assert!(drawn.contains("(Blue) Tj"));
 }
 
+/// Each case fills `agree` from a box that starts `checked` and expects the box's
+/// state and its exported value: a name object, never a text string.
+macro_rules! checkbox_fill_cases {
+    ($($test:ident: $checked:expr, $data:expr => $now:expr, $exported:expr;)*) => {$(
+        #[test]
+        fn $test() {
+            let home = tempfile::tempdir().expect("tempdir");
+            let source = checkbox_fixture(home.path(), $checked);
+            let filled = fill_json(home.path(), &source, $data).expect("fill");
+            assert_eq!(
+                button_states(home.path(), &filled),
+                (vec![json!($now)], json!({ "agree": $exported }))
+            );
+        }
+    )*};
+}
+checkbox_fill_cases! {
+    checkbox_fill_with_a_bare_state_name_checks_the_box: false, r#"{"agree":"Yes"}"# => true, "/Yes";
+    checkbox_fill_with_a_slashed_state_name_checks_the_box: false, r#"{"agree":"/Yes"}"# => true, "/Yes";
+    checkbox_fill_with_true_checks_the_box: false, r#"{"agree":true}"# => true, "/Yes";
+    checkbox_fill_with_off_clears_the_box: true, r#"{"agree":"Off"}"# => false, "/Off";
+    checkbox_fill_with_false_clears_the_box: true, r#"{"agree":false}"# => false, "/Off";
+}
+
 #[test]
-fn checkbox_fill_distinguishes_name_objects_from_bare_strings() {
+fn checkbox_fill_with_an_unknown_state_fails_and_names_the_states() {
     let home = tempfile::tempdir().expect("tempdir");
-    let source = fixture(home.path());
-    let data = home.path().join("data.json");
-    std::fs::write(&data, br#"{"agree":"Yes"}"#).expect("data");
+    let source = checkbox_fixture(home.path(), false);
+    let error = fill_json(home.path(), &source, r#"{"agree":"On"}"#).expect_err("unknown state");
+    assert_eq!(
+        error.to_string(),
+        "form field 'agree' has no state 'On'; its states are: Yes, Off"
+    );
+}
+
+#[test]
+fn radio_fill_selects_one_kid_and_stores_the_state_on_the_parent() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let source = radio_fixture(home.path());
+    let filled = fill_json(home.path(), &source, r#"{"size":"L"}"#).expect("fill");
+    assert_eq!(
+        button_states(home.path(), &filled),
+        (vec![json!(false), json!(true)], json!({"size": "/L"}))
+    );
+}
+
+#[test]
+fn radio_fill_refuses_true_as_ambiguous() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let source = radio_fixture(home.path());
+    let error = fill_json(home.path(), &source, r#"{"size":true}"#).expect_err("ambiguous");
+    assert_eq!(
+        error.to_string(),
+        "form field 'size' is a radio group, so true is ambiguous; give one of its states: S, L, Off"
+    );
+}
+
+#[test]
+fn xfdf_import_checks_a_box_from_a_state_without_a_slash() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let source = checkbox_fixture(home.path(), false);
+    let data = home.path().join("data.xfdf");
+    std::fs::write(&data, r#"<xfdf xmlns="http://ns.adobe.com/xfdf/"><fields><field name="agree"><value>Yes</value></field></fields></xfdf>"#).expect("data");
     let filled = run(
         home.path(),
         &[
             "form",
-            "fill",
+            "import",
             &source,
             "--data",
             data.to_str().expect("path"),
         ],
     )
-    .expect("fill");
-    let listed = run(home.path(), &["form", "list", output(&filled)]).expect("list");
-    assert_eq!(listed["fields"][3]["value"], "Off");
-    assert_eq!(listed["fields"][3]["checked"], false);
+    .expect("import");
+    assert_eq!(
+        button_states(home.path(), &filled),
+        (vec![json!(true)], json!({"agree": "/Yes"}))
+    );
+}
+
+#[test]
+fn fill_reports_misspelled_field_names_apart_from_the_fields_it_set() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let source = fixture(home.path());
+    let filled = fill_json(
+        home.path(),
+        &source,
+        r#"{"nmae":"Bob","color":"Red","agre":true}"#,
+    )
+    .expect("fill still succeeds");
+    assert_eq!(
+        (&filled["fields_set"], &filled["unknown_fields"]),
+        (&json!(["color"]), &json!(["nmae", "agre"]))
+    );
 }
 
 #[test]
@@ -172,7 +344,10 @@ fn xfdf_import_decodes_entities_and_last_duplicate_wins() {
         ],
     )
     .expect("import");
-    assert_eq!(filled["fields_set"], json!(["name", "color"]));
+    assert_eq!(
+        (&filled["fields_set"], &filled["unknown_fields"]),
+        (&json!(["name", "color"]), &json!([]))
+    );
     let listed = run(home.path(), &["form", "list", output(&filled)]).expect("list");
     assert_eq!(listed["fields"][0]["value"], "A & B");
     assert_eq!(listed["fields"][4]["value"], "Blue");

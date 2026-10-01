@@ -156,10 +156,19 @@ fn data(matches: &ArgMatches, xml: bool) -> Result<Map<String, Value>, GoatError
     }
 }
 
-pub(crate) fn fill_values(
+/// A check box or radio field and the widgets and value one input name gives it.
+struct ButtonFill<'a> {
+    field: ObjRef,
+    name: &'a str,
+    value: &'a Value,
+    widgets: Vec<ObjRef>,
+}
+
+/// Fills every field an input name matches and returns the names that matched.
+pub(crate) fn fill_values<'a>(
     doc: &mut Document,
-    values: &Map<String, Value>,
-) -> Result<(), GoatError> {
+    values: &'a Map<String, Value>,
+) -> Result<HashSet<&'a str>, GoatError> {
     let acro_id = acroform(doc, false)?;
     let mut acro = dict(doc, &Object::Reference(acro_id))?;
     if !acro.contains_key(b"Fields") {
@@ -167,9 +176,11 @@ pub(crate) fn fill_values(
     }
     acro.insert("NeedAppearances", false);
     doc.set(acro_id, acro);
+    let mut matched = HashSet::new();
+    let mut buttons: Vec<ButtonFill<'a>> = Vec::new();
     for page_index in 0..doc.page_count().map_err(error)? {
         for widget in crate::page_widgets(doc, page_index)? {
-            let mut annotation = dict(doc, &Object::Reference(widget))?;
+            let annotation = dict(doc, &Object::Reference(widget))?;
             let parent_id = if annotation.contains_key(b"FT") && annotation.contains_key(b"T") {
                 widget
             } else {
@@ -178,8 +189,26 @@ pub(crate) fn fill_values(
             let mut parent = dict(doc, &Object::Reference(parent_id))?;
             let qualified = qualified_name(doc, &parent)?;
             let local = text(&doc.resolve_key(&parent, b"T").map_err(error)?);
+            let button = crate::inherited(doc, &parent, b"FT")?.as_name() == Some(b"Btn");
             for (name, value) in values {
                 if name != &qualified && name != &local {
+                    continue;
+                }
+                matched.insert(name.as_str());
+                if button {
+                    // A button's state is decided once per field, across all its widgets.
+                    match buttons
+                        .iter_mut()
+                        .find(|fill| fill.field == parent_id && fill.name == name)
+                    {
+                        Some(fill) => fill.widgets.push(widget),
+                        None => buttons.push(ButtonFill {
+                            field: parent_id,
+                            name,
+                            value,
+                            widgets: vec![widget],
+                        }),
+                    }
                     continue;
                 }
                 if parent.get_name(b"FT") == Some(b"Ch") {
@@ -197,30 +226,107 @@ pub(crate) fn fill_values(
                 };
                 parent.insert("V", field_value);
                 doc.set(parent_id, parent.clone());
-                match parent.get_name(b"FT") {
-                    Some(b"Btn") => {
-                        annotation = dict(doc, &Object::Reference(widget))?;
-                        let ap = child_dict(doc, &annotation, b"AP")?;
-                        let normal = child_dict(doc, &ap, b"N")?;
-                        let candidate = goat_common::py::str_value(value);
-                        let state = candidate
-                            .strip_prefix('/')
-                            .filter(|s| normal.contains_key(s.as_bytes()))
-                            .unwrap_or("Off");
-                        annotation.insert("AS", Object::name(state));
-                        annotation.insert("V", Object::name(state));
-                        doc.set(widget, annotation.clone());
-                        if parent_id == widget {
-                            parent = annotation.clone();
-                        }
-                    }
-                    Some(b"Tx" | b"Ch") => pypdf_text(doc, widget, &parent, acro_id)?,
-                    _ => {}
+                if matches!(parent.get_name(b"FT"), Some(b"Tx" | b"Ch")) {
+                    pypdf_text(doc, widget, &parent, acro_id)?;
                 }
             }
         }
     }
+    for fill in &buttons {
+        fill_button(doc, fill)?;
+    }
+    Ok(matched)
+}
+
+/// Sets each widget's `/AS` and the field's `/V` to the state `fill` asks for.
+fn fill_button(doc: &mut Document, fill: &ButtonFill) -> Result<(), GoatError> {
+    let mut widget_states = Vec::with_capacity(fill.widgets.len());
+    let mut states: Vec<String> = Vec::new();
+    for &widget in &fill.widgets {
+        let annotation = dict(doc, &Object::Reference(widget))?;
+        let ap = child_dict(doc, &annotation, b"AP")?;
+        let normal = child_dict(doc, &ap, b"N")?;
+        let own: Vec<String> = normal
+            .keys()
+            .map(|key| String::from_utf8_lossy(key.as_bytes()).into_owned())
+            .filter(|state| state != "Off")
+            .collect();
+        for state in &own {
+            if !states.contains(state) {
+                states.push(state.clone());
+            }
+        }
+        widget_states.push((widget, annotation, own));
+    }
+    let field = dict(doc, &Object::Reference(fill.field))?;
+    let chosen = button_state(fill, crate::widget_type(doc, &field)?, &states)?;
+    for (widget, mut annotation, own) in widget_states {
+        let state = if own.contains(&chosen) {
+            chosen.as_str()
+        } else {
+            "Off"
+        };
+        annotation.insert("AS", Object::name(state));
+        doc.set(widget, annotation);
+    }
+    // Re-read: the field may be one of the widgets just updated.
+    let mut field = dict(doc, &Object::Reference(fill.field))?;
+    field.insert("V", Object::name(chosen.as_str()));
+    doc.set(fill.field, field);
     Ok(())
+}
+
+/// The state a check box or radio value selects: a state name with or without its
+/// leading slash, `true` for a check box's only on state, or `false`, `"Off"` and
+/// `""` for off. Anything else names no state of the field and is refused.
+fn button_state(
+    fill: &ButtonFill,
+    kind: crate::WidgetType,
+    states: &[String],
+) -> Result<String, GoatError> {
+    let field = fill.name;
+    let listed = || {
+        states
+            .iter()
+            .map(String::as_str)
+            .chain(["Off"])
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if kind == crate::WidgetType::Button {
+        return Err(GoatError::message(format!(
+            "form field '{field}' is a push button and holds no value"
+        )));
+    }
+    let requested = match fill.value {
+        Value::Bool(false) => return Ok("Off".to_owned()),
+        Value::Bool(true) => {
+            return match states {
+                [on] if kind == crate::WidgetType::CheckBox => Ok(on.clone()),
+                _ => Err(GoatError::message(format!(
+                    "form field '{field}' {}, so true is ambiguous; give one of its states: {}",
+                    if kind == crate::WidgetType::RadioButton {
+                        "is a radio group"
+                    } else {
+                        "has no single on state"
+                    },
+                    listed()
+                ))),
+            };
+        }
+        Value::String(text) => text.strip_prefix('/').unwrap_or(text).to_owned(),
+        other => goat_common::py::str_value(other),
+    };
+    if requested.is_empty() || requested == "Off" {
+        return Ok("Off".to_owned());
+    }
+    if states.contains(&requested) {
+        return Ok(requested);
+    }
+    Err(GoatError::message(format!(
+        "form field '{field}' has no state '{requested}'; its states are: {}",
+        listed()
+    )))
 }
 
 fn fill(matches: &ArgMatches, _: &Ctx) -> Result<Map<String, Value>, GoatError> {
@@ -236,7 +342,7 @@ fn fill_or_import(matches: &ArgMatches, importing: bool) -> Result<Map<String, V
     let values = data(matches, importing)?;
     let output = output(matches, &source, "filled", "pdf")?;
     let (mut doc, _) = open(&source, "pypdf")?;
-    fill_values(&mut doc, &values)?;
+    let matched = fill_values(&mut doc, &values)?;
     let flattened = flag(matches, "flatten")?;
     if flattened {
         crate::flatten::flatten(&mut doc, false)?;
@@ -251,10 +357,11 @@ fn fill_or_import(matches: &ArgMatches, importing: bool) -> Result<Map<String, V
         &source,
         vec![output.to_string_lossy().into_owned()],
     );
-    result.insert(
-        "fields_set".into(),
-        json!(values.keys().collect::<Vec<_>>()),
-    );
+    let (set, unknown): (Vec<&String>, Vec<&String>) = values
+        .keys()
+        .partition(|name| matched.contains(name.as_str()));
+    result.insert("fields_set".into(), json!(set));
+    result.insert("unknown_fields".into(), json!(unknown));
     result.insert("flattened".into(), json!(flattened));
     Ok(result)
 }
