@@ -279,6 +279,19 @@ fn invalid_mask_is_rejected_before_reading_or_releasing_text() {
 }
 
 #[test]
+fn mask_phrase_with_a_plain_space_also_masks_it_across_a_line_break() {
+    let work = work();
+    let dir = work.path();
+    let source = document(dir, "input.pdf", &[&["paid to Acme", "Corp today"]]);
+    let value =
+        run(dir, &["text", &source, "--mask", "Acme Corp", "--no-cache"]).expect("masked text");
+    assert_eq!(
+        value["pages"],
+        json!([{"page":1,"text":"paid to [REDACTED] today\n"}])
+    );
+}
+
+#[test]
 fn layout_preserves_physical_gaps_but_caps_empty_vertical_space() {
     let work = work();
     let dir = work.path();

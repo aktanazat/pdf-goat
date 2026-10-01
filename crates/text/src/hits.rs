@@ -15,8 +15,15 @@ impl HitPattern {
     }
 }
 
-/// `_hit_pattern`: expand presentation ligatures in the pattern, then
-/// Python `re.compile(pattern, IGNORECASE | MULTILINE)`.
+/// `_hit_pattern`: expand presentation ligatures in the pattern, let each run of
+/// literal spaces match any whitespace run, then Python
+/// `re.compile(pattern, IGNORECASE | MULTILINE)`.
+///
+/// Page words reach the matcher one per line, so a typed space must also cross a
+/// line break: `Acme Corp` finds the two words wherever the page breaks them. For
+/// `text --mask` and `compare text --mask` this widens a phrase to match across
+/// lines as well. Escaped spaces, spaces in a character class or lookbehind, and
+/// patterns that turn on verbose mode inline keep Python's meaning.
 pub fn hit_pattern(pattern: &str) -> Result<HitPattern, GoatError> {
     let mut expanded = String::with_capacity(pattern.len());
     for c in pattern.chars() {
@@ -30,7 +37,114 @@ pub fn hit_pattern(pattern: &str) -> Result<HitPattern, GoatError> {
             _ => expanded.push(c),
         }
     }
-    pyre::compile(&expanded, pyre::IGNORECASE | pyre::MULTILINE).map(HitPattern)
+    let flags = pyre::IGNORECASE | pyre::MULTILINE;
+    match spaces_as_whitespace(&expanded) {
+        Some(widened) => pyre::compile(&widened, flags)
+            // Report a malformed pattern at the positions the caller typed.
+            .map_err(|widened_error| {
+                pyre::compile(&expanded, flags)
+                    .err()
+                    .unwrap_or(widened_error)
+            }),
+        None => pyre::compile(&expanded, flags),
+    }
+    .map(HitPattern)
+}
+
+/// Rewrites each run of unescaped literal spaces outside character classes and
+/// lookbehinds to `(?:\s+)`. `None` when the pattern has no such space or turns
+/// on verbose mode with an inline flag, where spaces carry no meaning.
+fn spaces_as_whitespace(pattern: &str) -> Option<String> {
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut chars = pattern.chars().peekable();
+    let mut class = false;
+    // One entry per open group: whether it sits inside a lookbehind, which
+    // must keep a fixed width.
+    let mut groups: Vec<bool> = Vec::new();
+    let mut rewrote = false;
+    while let Some(c) = chars.next() {
+        out.push(c);
+        match c {
+            '\\' => {
+                let Some(escaped) = chars.next() else { break };
+                out.push(escaped);
+                if escaped == 'N' && chars.peek() == Some(&'{') {
+                    for named in chars.by_ref() {
+                        out.push(named);
+                        if named == '}' {
+                            break;
+                        }
+                    }
+                }
+            }
+            '[' if !class => {
+                class = true;
+                if let Some(negate) = chars.next_if_eq(&'^') {
+                    out.push(negate);
+                }
+                if let Some(bracket) = chars.next_if_eq(&']') {
+                    out.push(bracket);
+                }
+            }
+            ']' if class => class = false,
+            _ if class => {}
+            ' ' if !groups.last().copied().unwrap_or(false) => {
+                while chars.next_if_eq(&' ').is_some() {}
+                out.pop();
+                out.push_str(r"(?:\s+)");
+                rewrote = true;
+            }
+            ')' => {
+                groups.pop();
+            }
+            '(' => {
+                let outer = groups.last().copied().unwrap_or(false);
+                if chars.next_if_eq(&'?').is_none() {
+                    groups.push(outer);
+                    continue;
+                }
+                out.push('?');
+                match chars.peek() {
+                    Some('#') => {
+                        while let Some(comment) = chars.next() {
+                            out.push(comment);
+                            if comment == '\\' {
+                                out.extend(chars.next());
+                            } else if comment == ')' {
+                                break;
+                            }
+                        }
+                    }
+                    Some('<') => {
+                        out.push('<');
+                        chars.next();
+                        let behind = matches!(chars.peek(), Some('=' | '!'));
+                        groups.push(outer || behind);
+                    }
+                    _ => {
+                        let mut enabling = true;
+                        while let Some(&flag) = chars.peek() {
+                            match flag {
+                                'x' if enabling => return None,
+                                '-' => enabling = false,
+                                'a' | 'i' | 'L' | 'm' | 's' | 'u' | 'x' => {}
+                                _ => break,
+                            }
+                            out.push(flag);
+                            chars.next();
+                        }
+                        if chars.next_if_eq(&')').is_some() {
+                            out.push(')');
+                        } else {
+                            groups.push(outer);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    rewrote.then_some(out)
 }
 
 /// `_page_hits`: matching word spans, coalesced once per source line.

@@ -187,6 +187,41 @@ fn repeated_matches_count_a_word_once_and_join_matches_leave_the_previous_word()
 }
 
 #[test]
+fn a_plain_space_in_the_pattern_matches_the_break_between_words() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = fixture(dir.path(), "paid Acme Corp today");
+    let result = run(dir.path(), &["redact", &src, "--find", "Acme Corp"]).expect("redact");
+    let doc = Document::open(output(&result)).expect("output");
+    assert_eq!(
+        (&result["redactions"], words(&doc)),
+        (&Value::from(1), vec!["paid".to_owned(), "today".to_owned()])
+    );
+}
+
+#[test]
+fn an_anchored_pattern_still_matches_one_whole_word() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = fixture(dir.path(), "SSN 123-45-6789 and 123-45-67890");
+    let result = run(
+        dir.path(),
+        &["redact", &src, "--find", r"^\d{3}-\d{2}-\d{4}$"],
+    )
+    .expect("redact");
+    let doc = Document::open(output(&result)).expect("output");
+    assert_eq!(
+        (&result["redactions"], words(&doc)),
+        (
+            &Value::from(1),
+            vec![
+                "SSN".to_owned(),
+                "and".to_owned(),
+                "123-45-67890".to_owned()
+            ]
+        )
+    );
+}
+
+#[test]
 fn tj_spacing_and_multibyte_string_segments_preserve_kept_text_positions() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut builder = PdfBuilder::new();
