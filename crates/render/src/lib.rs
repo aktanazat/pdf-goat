@@ -69,7 +69,7 @@ pub fn render_page(
     page: &Page,
     options: &RenderOptions,
 ) -> Result<Pixmap, RenderError> {
-    render_area(doc, &Interpreter::new(), page, options, None, true)
+    render_area(doc, &Interpreter::new(), page, options, None, true).map(|(pixmap, _)| pixmap)
 }
 
 /// Renders page graphics without painting editable body text. Text clipping
@@ -80,9 +80,11 @@ pub fn render_page_graphics(
     page: &Page,
     options: &RenderOptions,
 ) -> Result<Pixmap, RenderError> {
-    render_area(doc, &Interpreter::new(), page, options, None, false)
+    render_area(doc, &Interpreter::new(), page, options, None, false).map(|(pixmap, _)| pixmap)
 }
 
+/// The page, or its part inside `clip`, with the matrix that maps points on the page as
+/// displayed (the frame of `clip` and of `pdf_interp::page_bounds`) to the pixmap's pixels.
 fn render_area(
     doc: &Document,
     interpreter: &Interpreter,
@@ -90,7 +92,7 @@ fn render_area(
     options: &RenderOptions,
     clip: Option<Rect>,
     draw_text: bool,
-) -> Result<Pixmap, RenderError> {
+) -> Result<(Pixmap, Matrix), RenderError> {
     if !options.dpi.is_finite() || options.dpi <= 0.0 {
         return Err(InterpError::Limit("dpi must be positive and finite".to_owned()).into());
     }
@@ -108,17 +110,18 @@ fn render_area(
     let y1 = (bounds.y1 * scale - 0.001).ceil();
     let mut device =
         device::RasterDevice::new((x1 - x0) as u32, (y1 - y0) as u32, options.alpha, draw_text)?;
+    let to_pixels = Matrix::scale(scale, scale).concat(&Matrix::translate(-x0, -y0));
     interpreter.run_page(
         doc,
         page,
         &mut device,
         &RunOptions {
-            transform: Matrix::scale(scale, scale).concat(&Matrix::translate(-x0, -y0)),
+            transform: to_pixels,
             annotations: options.annotations,
             ..RunOptions::default()
         },
     )?;
-    device.finish()
+    Ok((device.finish()?, to_pixels))
 }
 
 /// Registers `render` and `compare visual`.

@@ -10,7 +10,7 @@
 
 use goat_common::parse::selected_page;
 use pdf_core::{Dict, Document, ObjRef, Object, Page, PdfDate, PdfString, Rect};
-use pdf_edit::unrotated_transform;
+use pdf_interp::unrotated_transform;
 
 use crate::appearance::{self, Face};
 use crate::cades::CadesSigner;

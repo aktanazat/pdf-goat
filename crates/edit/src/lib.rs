@@ -29,7 +29,6 @@ mod redact;
 mod word;
 
 pub use place::{Image, image_matrix, image_xobject};
-pub use redact::unrotated_transform;
 
 use std::fmt;
 

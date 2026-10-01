@@ -22,12 +22,12 @@ use pdf_font::{
     BaseEncoding, EmbedGlyph, Font, FontLocator, FontRequest, MatchQuality, Script, Standard14,
     embed_font, write_simple_to_unicode_cmap,
 };
-use pdf_interp::ContentSource;
+use pdf_interp::{ContentSource, unrotated_transform};
 use pdf_text::{Block, TextFlags};
 
 use crate::EditError;
 use crate::kern::Kerning;
-use crate::redact::{num, numbers, op, unrotated_transform};
+use crate::redact::{num, numbers, op};
 
 /// Font files `--font` takes as paths.
 const FONT_FILES: [&str; 6] = [".ttf", ".otf", ".ttc", ".otc", ".pfb", ".pfa"];

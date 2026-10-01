@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 
-use clap::{Arg, ArgMatches, Command};
-use goat_common::args::{int_value, optional, required};
+use clap::{Arg, ArgAction, ArgMatches, Command};
+use goat_common::args::{int_value, many, optional, required};
 use goat_common::parse::{page_indices, parse_rect};
 use goat_common::paths::{self, AtomicOutput};
 use goat_common::pool::{PageTask, map_pages};
 use goat_common::{Ctx, GoatError, Registry, Verb};
 use pdf_core::{Document, Rect};
-use pdf_interp::Interpreter;
+use pdf_interp::{Interpreter, page_transform, unrotated_transform};
 use pdf_raster::Pixmap;
 use serde_json::{Map, Value, json};
 
@@ -36,7 +36,13 @@ pub(crate) fn register(registry: &mut Registry) {
                     .long("clip")
                     .help("render only x0,y0,x1,y1 in PDF points"),
             )
-            .arg(Arg::new("outdir").short('o').long("outdir")),
+            .arg(Arg::new("outdir").short('o').long("outdir"))
+            .arg(
+                Arg::new("mark")
+                    .long("mark")
+                    .action(ArgAction::Append)
+                    .help("outline x0,y0,x1,y1 in the frame search reports; repeat for more"),
+            ),
         render,
     ));
     registry.family_verb(
@@ -79,9 +85,17 @@ impl RenderDoc {
         })
     }
 
-    fn page(&self, index: usize, dpi: f64, clip: Option<Rect>) -> Result<Pixmap, GoatError> {
+    /// Page `index` at `dpi`, cut to `clip` (points on the page as displayed), with each
+    /// of `marks` outlined where it shows. Marks are in the frame `search` reports.
+    fn page(
+        &self,
+        index: usize,
+        dpi: f64,
+        clip: Option<Rect>,
+        marks: &[Rect],
+    ) -> Result<Pixmap, GoatError> {
         let page = self.doc.page(index).map_err(error)?;
-        render_area(
+        let (mut pixmap, to_pixels) = render_area(
             &self.doc,
             &self.interpreter,
             &page,
@@ -92,7 +106,18 @@ impl RenderDoc {
             clip,
             true,
         )
-        .map_err(error)
+        .map_err(error)?;
+        // The search frame ignores /Rotate; the pixmap shows the page as displayed.
+        let to_pixels = unrotated_transform(&page)
+            .invert()
+            .ok_or_else(|| GoatError::message("page has a singular transform"))?
+            .concat(&page_transform(&page))
+            .concat(&to_pixels);
+        let width = (dpi / 72.0 * 1.5).round().max(2.0) as i64;
+        for mark in marks {
+            outline(&mut pixmap, mark.transform(&to_pixels), width);
+        }
+        Ok(pixmap)
     }
 }
 
@@ -103,6 +128,7 @@ struct RenderTask {
     format: String,
     dpi: f64,
     clip: Option<Rect>,
+    marks: Vec<Rect>,
 }
 
 impl PageTask for RenderTask {
@@ -114,7 +140,7 @@ impl PageTask for RenderTask {
     }
 
     fn page(&self, doc: &mut Self::Doc, index: usize) -> Result<Self::Value, GoatError> {
-        let pixmap = doc.page(index, self.dpi, self.clip)?;
+        let pixmap = doc.page(index, self.dpi, self.clip, &self.marks)?;
         let output =
             self.directory
                 .join(format!("{}_p{:03}.{}", self.stem, index + 1, self.format));
@@ -160,24 +186,75 @@ fn save_bytes(path: &Path, data: &[u8]) -> Result<(), GoatError> {
     output.commit()
 }
 
+/// Opaque magenta, premultiplied.
+const MARK: [u8; 4] = [255, 0, 255, 255];
+
+/// Paints a ring `width` pixels wide just outside `area` (pixels), so whatever the area
+/// holds stays visible. Parts off the image are dropped.
+fn outline(pixmap: &mut Pixmap, area: Rect, width: i64) {
+    let (x0, y0) = (area.x0.floor() as i64, area.y0.floor() as i64);
+    let (x1, y1) = (area.x1.ceil() as i64, area.y1.ceil() as i64);
+    for band in [
+        [x0 - width, y0 - width, x1 + width, y0],
+        [x0 - width, y1, x1 + width, y1 + width],
+        [x0 - width, y0, x0, y1],
+        [x1, y0, x1 + width, y1],
+    ] {
+        paint(pixmap, band);
+    }
+}
+
+/// Fills pixels `[left, top, right, bottom)` that fall on the image with [`MARK`].
+fn paint(pixmap: &mut Pixmap, [left, top, right, bottom]: [i64; 4]) {
+    let (width, height) = (i64::from(pixmap.width()), i64::from(pixmap.height()));
+    let (left, right) = (
+        left.clamp(0, width) as usize,
+        right.clamp(0, width) as usize,
+    );
+    let (top, bottom) = (
+        top.clamp(0, height) as usize,
+        bottom.clamp(0, height) as usize,
+    );
+    let stride = pixmap.stride();
+    let data = pixmap.data_mut();
+    for row in top..bottom {
+        let start = row * stride;
+        for pixel in data[start + left * 4..start + right * 4]
+            .as_chunks_mut::<4>()
+            .0
+        {
+            *pixel = MARK;
+        }
+    }
+}
+
+/// An `x0,y0,x1,y1` option value as a rectangle with positive area.
+fn area(value: &str, flag: &str) -> Result<Rect, GoatError> {
+    let numbers = parse_rect(value)?;
+    let [x0, y0, x1, y1] = numbers.as_slice() else {
+        return Err(GoatError::value_error("Rect: bad seq len"));
+    };
+    let area = Rect::new(*x0, *y0, *x1, *y1).normalized();
+    if area.is_empty() {
+        return Err(GoatError::message(format!(
+            "{flag} must have positive area"
+        )));
+    }
+    Ok(area)
+}
+
 fn render(args: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError> {
     let source = paths::resolve(required::<String>(args, "file")?)?;
     let mut doc = RenderDoc::open(&source)?;
     let dpi = *required::<i64>(args, "dpi")?;
     let format = required::<String>(args, "format")?;
     let clip = optional::<String>(args, "clip")?
-        .map(|value| {
-            let numbers = parse_rect(value)?;
-            let [x0, y0, x1, y1] = numbers.as_slice() else {
-                return Err(GoatError::value_error("Rect: bad seq len"));
-            };
-            let clip = Rect::new(*x0, *y0, *x1, *y1).normalized();
-            if clip.is_empty() {
-                return Err(GoatError::message("--clip must have positive area"));
-            }
-            Ok(clip)
-        })
+        .map(|value| area(value, "--clip"))
         .transpose()?;
+    let marks = many::<String>(args, "mark")?
+        .into_iter()
+        .map(|value| area(value, "--mark"))
+        .collect::<Result<Vec<_>, _>>()?;
     let indices = page_indices(
         optional::<String>(args, "pages")?.map(String::as_str),
         doc.doc.page_count().map_err(error)?,
@@ -206,8 +283,14 @@ fn render(args: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError>
         format: format.clone(),
         dpi: dpi as f64,
         clip,
+        marks,
     };
     let outputs = map_pages(&task, &mut doc, &indices, &ctx.pool()?)?;
+    let marks: Vec<[f64; 4]> = task
+        .marks
+        .iter()
+        .map(|r| [r.x0, r.y0, r.x1, r.y1])
+        .collect();
     Ok(Map::from_iter([
         ("verb".into(), json!("render")),
         ("inputs".into(), json!([source])),
@@ -215,6 +298,7 @@ fn render(args: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError>
         ("dpi".into(), json!(dpi)),
         ("format".into(), json!(format)),
         ("clip".into(), json!(clip.map(|r| [r.x0, r.y0, r.x1, r.y1]))),
+        ("marks".into(), json!(marks)),
     ]))
 }
 
@@ -234,8 +318,8 @@ impl PageTask for VisualTask {
     }
 
     fn page(&self, doc: &mut Self::Doc, index: usize) -> Result<Self::Value, GoatError> {
-        let left = doc.0.page(index, self.dpi, None)?;
-        let right = doc.1.page(index, self.dpi, None)?;
+        let left = doc.0.page(index, self.dpi, None, &[])?;
+        let right = doc.1.page(index, self.dpi, None, &[])?;
         let (width, height) = (left.width(), left.height());
         let mut difference = left.to_rgb8([255; 3]);
         drop(left);
@@ -411,7 +495,64 @@ fn resize_rgb(
 
 #[cfg(test)]
 mod tests {
-    use super::resize_rgb;
+    use pdf_core::{Dict, Document, Object, Rect, Stream};
+    use pdf_interp::Interpreter;
+
+    use super::{RenderDoc, resize_rgb};
+
+    /// A 40 pt square page turned `rotation` degrees whose content fills PDF x 8..20,
+    /// y 4..24 black.
+    fn square_page(rotation: i64) -> RenderDoc {
+        let mut doc = Document::new();
+        let page = doc
+            .insert_blank_page(0, Rect::new(0.0, 0.0, 40.0, 40.0))
+            .unwrap();
+        let content = doc.add(Stream::new(Dict::new(), b"0 g 8 4 12 20 re f".to_vec()));
+        let mut dict = doc.get(page).unwrap().as_dict().unwrap().clone();
+        dict.insert("Contents", content);
+        dict.insert("Rotate", Object::Integer(rotation));
+        doc.set(page, dict);
+        RenderDoc {
+            doc,
+            interpreter: Interpreter::new(),
+        }
+    }
+
+    /// A mark given the rectangle `search` reports for a shape rings that shape on the
+    /// image, also when a clip moves the image's origin or /Rotate turns the page.
+    #[test]
+    fn marks_ring_search_rectangles_where_the_page_shows_them() {
+        // `search` measures from the unrotated crop box's top-left, y down.
+        let square = Rect::new(8.0, 16.0, 20.0, 36.0);
+        let [black, mark, white]: [Option<[u8; 4]>; 3] =
+            [[0, 0, 0, 255], [255, 0, 255, 255], [255; 4]].map(Some);
+        // Where the square lands at 144 dpi, as [left, top, right, bottom) pixels.
+        for (rotation, clip, [left, top, right, bottom]) in [
+            (0, None, [16, 32, 40, 72]),
+            (0, Some(Rect::new(4.0, 10.0, 30.0, 40.0)), [8, 12, 32, 52]),
+            // Turned a quarter clockwise, PDF (x, y) shows at (y, x).
+            (90, None, [8, 16, 48, 40]),
+        ] {
+            let image = square_page(rotation)
+                .page(0, 144.0, clip, &[square])
+                .unwrap();
+            let (middle_x, middle_y) = ((left + right) / 2, (top + bottom) / 2);
+            // From the square's last pixel outward: the 3-pixel ring, then the page.
+            for ((x, y), (dx, dy)) in [
+                ((left, middle_y), (-1, 0)),
+                ((right - 1, middle_y), (1, 0)),
+                ((middle_x, top), (0, -1)),
+                ((middle_x, bottom - 1), (0, 1)),
+            ] {
+                let at = |step: i32| image.pixel((x + dx * step) as u32, (y + dy * step) as u32);
+                assert_eq!(
+                    [at(0), at(1), at(3), at(4)],
+                    [black, mark, mark, white],
+                    "rotation {rotation}, clip {clip:?}, edge pixel ({x}, {y})"
+                );
+            }
+        }
+    }
 
     #[test]
     fn different_page_sizes_use_bicubic_filtering_in_both_directions() {

@@ -123,6 +123,15 @@ pub fn page_transform(page: &Page) -> Matrix {
     page_box_and_transform(page).1
 }
 
+/// PDF user space → the unrotated page: origin at the crop box's top-left, y
+/// down, in points scaled by /UserUnit, /Rotate ignored. `search` reports
+/// rectangles in this frame and `edit` places content in it.
+pub fn unrotated_transform(page: &Page) -> Matrix {
+    let crop = crop_box(page);
+    let unit = page.user_unit();
+    Matrix::new(unit, 0.0, 0.0, -unit, -crop.x0 * unit, crop.y1 * unit)
+}
+
 /// MuPDF's `fz_bound_page`: the crop box through [`page_transform`], so
 /// `Rect(0, 0, width, height)` of the page as displayed.
 pub fn page_bounds(page: &Page) -> Rect {
@@ -131,10 +140,7 @@ pub fn page_bounds(page: &Page) -> Rect {
 }
 
 fn page_box_and_transform(page: &Page) -> (Rect, Matrix) {
-    let mut crop = page.crop_box();
-    if crop.x1 - crop.x0 < 1.0 || crop.y1 - crop.y0 < 1.0 {
-        crop = Rect::new(0.0, 0.0, 1.0, 1.0);
-    }
+    let crop = crop_box(page);
     let unit = page.user_unit();
     let rotated = Matrix::rotate(-f64::from(page.rotation())).concat(&Matrix::scale(unit, -unit));
     let placed = crop.transform(&rotated);
@@ -142,6 +148,17 @@ fn page_box_and_transform(page: &Page) -> (Rect, Matrix) {
         crop,
         rotated.concat(&Matrix::translate(-placed.x0, -placed.y0)),
     )
+}
+
+/// The crop box, or the unit square in place of one under a point wide or
+/// tall, as MuPDF substitutes.
+fn crop_box(page: &Page) -> Rect {
+    let crop = page.crop_box();
+    if crop.x1 - crop.x0 < 1.0 || crop.y1 - crop.y0 < 1.0 {
+        Rect::new(0.0, 0.0, 1.0, 1.0)
+    } else {
+        crop
+    }
 }
 
 /// Runs the page's content, then its annotation appearances when

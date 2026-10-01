@@ -75,8 +75,9 @@ Type 1 fonts are embedded as subsets and kerned by their own tables, and
 gray, RGB, or CMYK `--color` shape the result. `edit add-image` places a PNG or
 JPEG signature inside `--rect`, keeping its aspect ratio unless `--stretch`, and
 also takes `--rotate` and `--opacity`. `--pages 1,3` draws the same thing on
-each listed page. Each run writes a new file; check the result with
-`render --clip`.
+each listed page. Each run writes a new file; check it with
+`render --mark x0,y0,x1,y1` on the returned `bbox`, which outlines that
+rectangle on the rendered page.
 
 Page-by-page verbs such as `text`, `search`, `count`, and `render` start
 sequentially. After 200 ms, they use worker threads if at least eight pages

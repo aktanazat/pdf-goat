@@ -5,12 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pdf_core::{
-    Dict, Document, Matrix, ObjRef, Object, Operation, Page, Rect, Stream, parse_content,
-    write_content,
+    Dict, Document, Matrix, ObjRef, Object, Operation, Rect, Stream, parse_content, write_content,
 };
 use pdf_interp::{
     ContentSource, Device, FormCall, GlyphPos, ImageEvent, ImageMaskEvent, Provenance, RunOptions,
-    TextRun,
+    TextRun, unrotated_transform,
 };
 
 use crate::{EditError, image_redact, path_redact};
@@ -116,17 +115,6 @@ impl Collector<'_> {
             Err(error) => self.error = Some(error),
         }
     }
-}
-
-/// Maps PDF user space to unrotated page space: origin at the crop box's top
-/// left, y down, in points scaled by UserUnit (the frame `search` reports).
-pub fn unrotated_transform(page: &Page) -> Matrix {
-    let mut crop = page.crop_box();
-    if crop.width() < 1.0 || crop.height() < 1.0 {
-        crop = Rect::new(0.0, 0.0, 1.0, 1.0);
-    }
-    let unit = page.user_unit();
-    Matrix::new(unit, 0.0, 0.0, -unit, -crop.x0 * unit, crop.y1 * unit)
 }
 
 pub(crate) fn apply(

@@ -1,8 +1,9 @@
 use pdf_core::{Dict, Document, Object, Point, Rect, write_content};
+use pdf_interp::unrotated_transform;
 
 use crate::EditError;
 use crate::pyfmt::{format_g, format_g_seq, jm_tuple};
-use crate::redact::{append_content, num, op, unrotated_transform};
+use crate::redact::{append_content, num, op};
 
 pub(crate) struct Replacement {
     pub rect: Rect,
