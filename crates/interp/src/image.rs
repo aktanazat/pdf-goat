@@ -1,7 +1,10 @@
 //! Image XObjects and inline images, with their PDF decoding and masks.
 
 use crate::InterpError;
-use crate::colorspace::{ColorSpace, ColorSpaceCache, MAX_COLORANTS};
+use crate::colorspace::{
+    ColorParams, ColorSpace, ColorSpaceCache, DefaultSpaces, MAX_COLORANTS, PixmapConversion,
+};
+use crate::icc::Intent;
 use pdf_codec::{CcittParams, DctParams, pixels};
 use pdf_core::{Dict, Document, ObjRef, Object, Stream};
 use std::sync::Arc;
@@ -62,6 +65,23 @@ pub struct PdfImage {
     alpha: Option<AlphaChannel>,
     color_key: Vec<[u16; 2]>,
     matte: Vec<f32>,
+    /// The rendering intent and black point compensation the image is
+    /// converted with: the fill's at the `Do`, or the image's own /Intent.
+    params: ColorParams,
+    /// The page's or form's default colour spaces at the `Do`.
+    defaults: Arc<DefaultSpaces>,
+}
+
+/// The image dictionary's /Intent when it names one of the four intents
+/// (`pdf_load_image_imp`: any other name leaves the fill's intent).
+pub(crate) fn image_intent(dict: &Dict) -> Option<Intent> {
+    match dict.get_name(b"Intent")? {
+        b"Perceptual" => Some(Intent::Perceptual),
+        b"RelativeColorimetric" => Some(Intent::RelativeColorimetric),
+        b"Saturation" => Some(Intent::Saturation),
+        b"AbsoluteColorimetric" => Some(Intent::AbsoluteColorimetric),
+        _ => None,
+    }
 }
 
 impl PdfImage {
@@ -101,21 +121,53 @@ impl PdfImage {
         self.filter.as_deref()
     }
 
-    /// RGB8 display pixels after /Decode, colour conversion, and matte removal.
+    /// RGB8 display pixels after /Decode, colour conversion, and matte
+    /// removal, converted as MuPDF converts an 8-bit pixmap: samples
+    /// quantised to bytes, then through the 8-bit link for the image's
+    /// colour parameters, with the page defaults standing in for device
+    /// spaces.
     pub fn decode_rgb(&self) -> Result<ImagePixels, InterpError> {
+        let space = self.defaults.substitute(&self.color_space);
+        let mut pixmap = PixmapConversion::new(&self.defaults);
+        let (rgb, alpha) = self.convert(3, |bytes| {
+            let [r, g, b] = pixmap.rgb(space, bytes, self.params);
+            [r, g, b, 0]
+        });
+        Ok(ImagePixels {
+            width: self.width,
+            height: self.height,
+            rgb,
+            alpha,
+        })
+    }
+
+    /// Each pixel after /Decode and matte removal, as the bytes of an 8-bit
+    /// pixmap in the image's space, through `convert`, keeping the first
+    /// `n_out` bytes it returns, with the alpha the pixels carry. A
+    /// one-component image without a matte converts each sample value once
+    /// (`fz_convert_pixmap_samples` looks single-channel colours up in a
+    /// table), so a grey or 1-bit page scan costs one lookup per pixel.
+    fn convert(
+        &self,
+        n_out: usize,
+        mut convert: impl FnMut(&[u8]) -> [u8; 4],
+    ) -> (Vec<u8>, Option<AlphaChannel>) {
         let n = usize::from(self.components);
         let count = self.width as usize * self.height as usize;
-        let max = f64::from((1u32 << self.sample_bits) - 1);
-        let mut rgb = Vec::with_capacity(count * 3);
+        let max = (1u32 << self.sample_bits) - 1;
+        let mut out = Vec::with_capacity(count * n_out);
         let mut color_alpha = (!self.color_key.is_empty()).then(|| Vec::with_capacity(count));
-        let mut v = [0.0f32; MAX_COLORANTS];
-        for (i, samples) in self.samples.chunks_exact(n).enumerate() {
-            let alpha = self.alpha.as_ref().map_or(1.0, |a| {
+        let alpha_of = |i: usize| {
+            self.alpha.as_ref().map_or(1.0, |a| {
                 f32::from(alpha_at(a, self.width, self.height, i)) / 255.0
-            });
+            })
+        };
+        let mut v = [0.0f32; MAX_COLORANTS];
+        let mut bytes = [0u8; MAX_COLORANTS];
+        let mut pixel = |samples: &[u16], alpha: f32| {
             for (c, (&s, value)) in samples.iter().zip(v.iter_mut()).enumerate() {
                 let [lo, hi] = self.decode[c];
-                *value = (lo + f64::from(s) / max * (hi - lo)) as f32;
+                *value = (lo + f64::from(s) / f64::from(max) * (hi - lo)) as f32;
                 if let Some(matte) = self.matte.get(c) {
                     *value = if alpha > 0.0 {
                         ((*value - *matte) / alpha + *matte).clamp(0.0, 1.0)
@@ -124,14 +176,26 @@ impl PdfImage {
                     };
                 }
             }
-            let color = self.color_space.to_rgb(&v[..n]);
-            rgb.extend(color.map(byte));
+            let m = self.color_space.sample_bytes(&v[..n], &mut bytes);
+            convert(&bytes[..m])
+        };
+        let table: Vec<[u8; 4]> = if n == 1 && self.matte.is_empty() && self.sample_bits <= 8 {
+            (0..=max as u16).map(|s| pixel(&[s], 1.0)).collect()
+        } else {
+            Vec::new()
+        };
+        for (i, samples) in self.samples.chunks_exact(n).enumerate() {
+            let converted = table
+                .get(usize::from(samples[0]))
+                .copied()
+                .unwrap_or_else(|| pixel(samples, alpha_of(i)));
+            out.extend_from_slice(&converted[..n_out]);
             if let Some(a) = &mut color_alpha {
                 let transparent = samples
                     .iter()
                     .zip(&self.color_key)
                     .all(|(s, [lo, hi])| s >= lo && s <= hi);
-                a.push(if transparent { 0 } else { byte(alpha) });
+                a.push(if transparent { 0 } else { byte(alpha_of(i)) });
             }
         }
         let alpha = color_alpha
@@ -141,12 +205,7 @@ impl PdfImage {
                 data,
             })
             .or_else(|| self.alpha.clone());
-        Ok(ImagePixels {
-            width: self.width,
-            height: self.height,
-            rgb,
-            alpha,
-        })
+        (out, alpha)
     }
 
     /// Stencil coverage: 255 paints, 0 leaves the destination unchanged.
@@ -188,24 +247,38 @@ impl PdfImage {
     }
 
     pub(crate) fn load(
-        doc: &Document,
+        context: ImageContext<'_>,
         object: Option<ObjRef>,
         stream: Stream,
-        resources: &Dict,
-        cache: &ColorSpaceCache,
     ) -> Result<PdfImage, InterpError> {
-        load(doc, object, stream, resources, cache, 0)
+        load(context, object, stream, 0)
     }
 }
 
+/// What an image is loaded against: the document, the resources its colour
+/// space names resolve in, and the colour conversion of the `Do`.
+#[derive(Clone, Copy)]
+pub(crate) struct ImageContext<'a> {
+    pub(crate) doc: &'a Document,
+    pub(crate) resources: &'a Dict,
+    pub(crate) cache: &'a ColorSpaceCache,
+    pub(crate) params: ColorParams,
+    pub(crate) defaults: &'a Arc<DefaultSpaces>,
+}
+
 fn load(
-    doc: &Document,
+    context: ImageContext<'_>,
     object: Option<ObjRef>,
     stream: Stream,
-    resources: &Dict,
-    cache: &ColorSpaceCache,
     depth: usize,
 ) -> Result<PdfImage, InterpError> {
+    let ImageContext {
+        doc,
+        resources,
+        cache,
+        params,
+        defaults,
+    } = context;
     if depth >= 16 {
         return Err(InterpError::Limit("image mask recursion exceeds 16".into()));
     }
@@ -382,14 +455,7 @@ fn load(
     let mask = doc.resolve_key(d, b"Mask")?;
     let mut matte = Vec::new();
     if let Some(s) = smask.as_stream() {
-        let image = load(
-            doc,
-            d.get_ref(b"SMask"),
-            s.clone(),
-            resources,
-            cache,
-            depth + 1,
-        )?;
+        let image = load(context, d.get_ref(b"SMask"), s.clone(), depth + 1)?;
         let max = f64::from((1u32 << image.sample_bits) - 1);
         let [lo, hi] = image.decode[0];
         alpha = Some(AlphaChannel {
@@ -406,15 +472,7 @@ fn load(
             matte = a.iter().map(|o| o.as_f64().unwrap_or(0.0) as f32).collect();
         }
     } else if let Some(s) = mask.as_stream() {
-        let image = load(
-            doc,
-            d.get_ref(b"Mask"),
-            s.clone(),
-            resources,
-            cache,
-            depth + 1,
-        )?
-        .decode_stencil()?;
+        let image = load(context, d.get_ref(b"Mask"), s.clone(), depth + 1)?.decode_stencil()?;
         alpha = Some(AlphaChannel {
             width: image.width,
             height: image.height,
@@ -454,6 +512,8 @@ fn load(
         alpha,
         color_key,
         matte,
+        params,
+        defaults: defaults.clone(),
     })
 }
 fn codec(e: pdf_codec::CodecError) -> InterpError {
@@ -468,4 +528,59 @@ fn alpha_at(a: &AlphaChannel, w: u32, h: u32, i: usize) -> u8 {
     let mx = x * a.width as usize / w as usize;
     let my = y * a.height as usize / h as usize;
     a.data.get(my * a.width as usize + mx).copied().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::icc;
+
+    fn gray_image(bits: u8, width: u32, height: u32, data: Vec<u8>) -> PdfImage {
+        let mut dict = Dict::new();
+        dict.insert("Width", i64::from(width));
+        dict.insert("Height", i64::from(height));
+        dict.insert("BitsPerComponent", i64::from(bits));
+        dict.insert("ColorSpace", Object::name("DeviceGray"));
+        let doc = Document::new();
+        let resources = Dict::new();
+        let cache = ColorSpaceCache::default();
+        let defaults = DefaultSpaces::none();
+        let context = ImageContext {
+            doc: &doc,
+            resources: &resources,
+            cache: &cache,
+            params: ColorParams::DEFAULT,
+            defaults: &defaults,
+        };
+        PdfImage::load(context, None, Stream::new(dict, data)).expect("image loads")
+    }
+
+    /// Link evaluations while `image` converts to RGB.
+    fn evaluations(image: &PdfImage) -> usize {
+        let before = icc::evaluations();
+        image.decode_rgb().expect("image decodes");
+        icc::evaluations() - before
+    }
+
+    /// A one-component image converts each sample value once, as
+    /// `fz_convert_pixmap_samples` does with its lookup table, never once
+    /// per pixel: grey and 1-bit page scans stay as cheap as a copy.
+    #[test]
+    fn grey_images_convert_each_sample_value_once() {
+        let bilevel = gray_image(1, 64, 64, (0..64 * 8).map(|i| (i * 37) as u8).collect());
+        let n = evaluations(&bilevel);
+        assert!(n <= 2, "{n} evaluations for a 64x64 1-bit image");
+        let grey = gray_image(8, 64, 64, (0..64 * 64).map(|i| i as u8).collect());
+        let n = evaluations(&grey);
+        assert!(n <= 256, "{n} evaluations for a 64x64 8-bit image");
+        // The table holds what the per-pixel conversion gives.
+        let pixels = grey.decode_rgb().expect("image decodes");
+        let defaults = DefaultSpaces::none();
+        let mut pixmap = PixmapConversion::new(&defaults);
+        let gray = ColorSpace::gray();
+        for (sample, rgb) in pixels.rgb.as_chunks::<3>().0.iter().take(256).enumerate() {
+            let want = pixmap.rgb(&gray, &[sample as u8], ColorParams::DEFAULT);
+            assert_eq!(*rgb, want, "sample {sample}");
+        }
+    }
 }

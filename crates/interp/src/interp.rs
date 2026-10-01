@@ -1,10 +1,11 @@
 //! Stateful interpretation of page and nested content streams.
 
-use crate::colorspace::{ColorSpace, ColorSpaceCache};
+use crate::colorspace::{self, ColorParams, ColorSpace, ColorSpaceCache, DefaultSpaces};
 use crate::device::*;
 use crate::font::{self, PdfFont};
 use crate::function::Function;
-use crate::image::PdfImage;
+use crate::icc::Intent as RenderingIntent;
+use crate::image::{self, ImageContext, PdfImage};
 use crate::ocg::OptionalContent;
 use crate::path::{FillRule, LineCap, LineJoin, Path, StrokeStyle};
 use crate::pattern::{Replay, ShadingPaint, SoftMask, TilingPaint};
@@ -13,7 +14,7 @@ use crate::{Intent, InterpError, RunOptions, page_transform};
 use pdf_core::{
     Dict, Document, Matrix, ObjRef, Object, Operation, Page, Point, Rect, Stream, parse_content,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::sync::{
     Arc,
@@ -29,10 +30,13 @@ pub(crate) struct Cache {
     fonts: RefCell<HashMap<ObjRef, Arc<PdfFont>>>,
     direct_fonts: RefCell<Vec<(Dict, Arc<PdfFont>)>>,
     fallback: RefCell<Option<Arc<PdfFont>>>,
-    images: RefCell<HashMap<ObjRef, Arc<PdfImage>>>,
+    /// Decoded images by object, with the colour parameters and default
+    /// colour spaces they were converted under.
+    images: RefCell<HashMap<(ObjRef, ColorParams, u64), Arc<PdfImage>>>,
     contents: RefCell<HashMap<ObjRef, Arc<[Operation]>>>,
     shadings: RefCell<HashMap<ObjRef, Arc<Shading>>>,
     colors: ColorSpaceCache,
+    output_intent: OnceCell<Option<Arc<ColorSpace>>>,
 }
 
 pub(crate) struct Run<'a> {
@@ -52,6 +56,20 @@ impl<'a> Run<'a> {
             oc: OptionalContent::load(doc),
             operations: Cell::new(0),
         }
+    }
+    /// `pdf_load_default_colorspaces`: the page's DefaultGray, DefaultRGB
+    /// and DefaultCMYK with the document's output intent behind them.
+    fn page_defaults(&self, page: &Page) -> Arc<DefaultSpaces> {
+        let output_intent = self
+            .cache
+            .output_intent
+            .get_or_init(|| colorspace::output_intent(self.doc, &self.cache.colors));
+        DefaultSpaces::for_page(
+            self.doc,
+            &page.resources,
+            output_intent.as_ref(),
+            &self.cache.colors,
+        )
     }
     pub(crate) fn hidden(&self, object: &Object) -> bool {
         !self.options.include_hidden_content
@@ -77,6 +95,7 @@ impl<'a> Run<'a> {
             self,
             page_transform(page).concat(&self.options.transform),
             page.resources.clone(),
+            self.page_defaults(page),
         );
         let contents = page.dict.get(b"Contents").cloned().unwrap_or(Object::Null);
         let streams = match self.doc.resolve(&contents)? {
@@ -116,6 +135,7 @@ impl<'a> Run<'a> {
                 .concat(&page_transform(page))
                 .concat(&self.options.transform),
             page.resources.clone(),
+            self.page_defaults(page),
         );
         engine.source.source = ContentSource::Appearance {
             annot,
@@ -334,6 +354,9 @@ struct State {
     clips: usize,
     alpha_is_shape: bool,
     soft_mask: Option<Arc<MaskDef>>,
+    /// The rendering intent and black point compensation of fills, strokes
+    /// and images (`ri`, ExtGState /RI and /UseBlackPtComp).
+    params: ColorParams,
 }
 impl State {
     fn new(ctm: Matrix) -> Self {
@@ -347,6 +370,7 @@ impl State {
             clips: 0,
             alpha_is_shape: false,
             soft_mask: None,
+            params: ColorParams::DEFAULT,
         }
     }
 }
@@ -377,6 +401,7 @@ struct MaskDef {
 struct ReplayContent {
     state: State,
     resources: Vec<Dict>,
+    defaults: Arc<DefaultSpaces>,
     stream: Stream,
     id: ObjRef,
     source: Provenance,
@@ -396,7 +421,7 @@ impl Replay for ContentReplay<'_, '_> {
         if c.depth >= MAX_NESTING {
             return Err(InterpError::Limit("paint recursion exceeds 64".into()));
         }
-        let mut engine = Engine::new(self.run, c.state.ctm, Dict::new());
+        let mut engine = Engine::new(self.run, c.state.ctm, Dict::new(), c.defaults.clone());
         engine.state = c.state.clone();
         engine.state.clips = 0;
         engine.resources = c.resources.clone();
@@ -433,6 +458,8 @@ struct Engine<'r, 'd> {
     state: State,
     stack: Vec<State>,
     resources: Vec<Dict>,
+    /// The default colour spaces in force, pushed by forms with their own.
+    defaults: Vec<Arc<DefaultSpaces>>,
     path: Path,
     path_start: usize,
     pending_clip: Option<FillRule>,
@@ -455,12 +482,13 @@ struct Engine<'r, 'd> {
     force_isolated: bool,
 }
 impl<'r, 'd> Engine<'r, 'd> {
-    fn new(run: &'r Run<'d>, ctm: Matrix, resources: Dict) -> Self {
+    fn new(run: &'r Run<'d>, ctm: Matrix, resources: Dict, defaults: Arc<DefaultSpaces>) -> Self {
         Self {
             run,
             state: State::new(ctm),
             stack: Vec::new(),
             resources: vec![resources],
+            defaults: vec![defaults],
             path: Path::new(),
             path_start: 0,
             pending_clip: None,
@@ -523,6 +551,9 @@ impl<'r, 'd> Engine<'r, 'd> {
     fn resources(&self) -> &Dict {
         &self.resources[self.resources.len() - 1]
     }
+    fn defaults(&self) -> &Arc<DefaultSpaces> {
+        &self.defaults[self.defaults.len() - 1]
+    }
 
     fn with_mask<R>(&self, f: impl FnOnce(Option<&SoftMask<'_>>) -> R) -> R {
         if let Some(mask) = &self.state.soft_mask {
@@ -582,7 +613,11 @@ impl<'r, 'd> Engine<'r, 'd> {
                     };
                     f(brush(Paint::Tiling(&tile)))
                 }
-                None => f(brush(Paint::Color(material.space.to_rgb(&material.values)))),
+                None => f(brush(Paint::Color(
+                    self.defaults()
+                        .substitute(&material.space)
+                        .to_rgb_with(&material.values, self.state.params),
+                ))),
             }
         })
     }
@@ -612,10 +647,11 @@ impl<'r, 'd> Engine<'r, 'd> {
         }
         let colored = d.get_i64(b"PaintType") != Some(2);
         let color = (!colored).then(|| {
-            material
-                .space
-                .pattern_base()
-                .map_or([0.0; 3], |s| s.to_rgb(&material.values))
+            material.space.pattern_base().map_or([0.0; 3], |s| {
+                self.defaults()
+                    .substitute(s)
+                    .to_rgb_with(&material.values, self.state.params)
+            })
         });
         let mut state = self.state.clone();
         state.ctm = matrix;
@@ -626,7 +662,7 @@ impl<'r, 'd> Engine<'r, 'd> {
         state.stroke.alpha = 1.0;
         state.blend = BlendMode::Normal;
         if let Some(color) = color {
-            state.fill.space = ColorSpace::rgb();
+            state.fill.space = ColorSpace::srgb();
             state.fill.values = color.to_vec();
             state.stroke = state.fill.clone();
         }
@@ -643,6 +679,7 @@ impl<'r, 'd> Engine<'r, 'd> {
         let content = ReplayContent {
             state,
             resources,
+            defaults: self.defaults().clone(),
             stream,
             id,
             source,
@@ -1076,7 +1113,12 @@ impl<'r, 'd> Engine<'r, 'd> {
                     });
                 }
             }
-            b"ri" | b"i" | b"MP" | b"DP" => {}
+            b"ri" => {
+                if let Some(name) = a.first().and_then(Object::as_name) {
+                    self.state.params.intent = RenderingIntent::from_pdf_name(name);
+                }
+            }
+            b"i" | b"MP" | b"DP" => {}
             _ => return Ok(self.compatibility != 0),
         }
         Ok(true)
@@ -1375,22 +1417,34 @@ impl<'r, 'd> Engine<'r, 'd> {
         if self.hidden != 0 {
             return;
         }
-        let cached = id.and_then(|id| self.run.cache.images.borrow().get(&id).cloned());
+        // pdf_show_image_imp: the image's own /Intent replaces the fill's.
+        let mut params = self.state.params;
+        if let Some(intent) = image::image_intent(&stream.dict) {
+            params.intent = intent;
+        }
+        let defaults = self.defaults();
+        let key = id.map(|id| (id, params, defaults.key()));
+        let cached = key.and_then(|key| self.run.cache.images.borrow().get(&key).cloned());
         let image = if let Some(image) = cached {
             image
         } else {
-            let Ok(image) = PdfImage::load(
-                self.run.doc,
-                id,
-                stream,
-                self.resources(),
-                &self.run.cache.colors,
-            ) else {
+            let context = ImageContext {
+                doc: self.run.doc,
+                resources: self.resources(),
+                cache: &self.run.cache.colors,
+                params,
+                defaults,
+            };
+            let Ok(image) = PdfImage::load(context, id, stream) else {
                 return;
             };
             let image = Arc::new(image);
-            if let Some(id) = id {
-                self.run.cache.images.borrow_mut().insert(id, image.clone());
+            if let Some(key) = key {
+                self.run
+                    .cache
+                    .images
+                    .borrow_mut()
+                    .insert(key, image.clone());
             }
             image
         };
@@ -1514,6 +1568,15 @@ impl<'r, 'd> Engine<'r, 'd> {
             },
         );
         self.state.clips += 1;
+        // pdf_update_default_colorspaces: the form's own Default* entries
+        // override the ones it inherits.
+        let defaults = DefaultSpaces::update(
+            self.defaults(),
+            self.run.doc,
+            &resources,
+            &self.run.cache.colors,
+        );
+        self.defaults.push(defaults);
         self.resources.push(resources);
         let mut forms = self.source.forms.to_vec();
         forms.push(FormCall {
@@ -1533,6 +1596,7 @@ impl<'r, 'd> Engine<'r, 'd> {
         self.depth -= 1;
         self.active.pop();
         self.resources.pop();
+        self.defaults.pop();
         while self.marks.len() > marks {
             self.marks.pop();
             device.end_marked_content();
@@ -1595,6 +1659,15 @@ impl<'r, 'd> Engine<'r, 'd> {
                 b"ca" => self.state.fill.alpha = num.clamp(0.0, 1.0) as f32,
                 b"AIS" => self.state.alpha_is_shape = value.as_bool().unwrap_or(false),
                 b"SMask" => self.state.soft_mask = self.load_mask(&value),
+                b"RI" => {
+                    if let Some(name) = value.as_name() {
+                        self.state.params.intent = RenderingIntent::from_pdf_name(name);
+                    }
+                }
+                // pdf_run_gs_UseBlackPtComp: only /ON turns it on.
+                b"UseBlackPtComp" => {
+                    self.state.params.bpc = matches!(value.as_name(), Some(b"ON"));
+                }
                 b"BM" => {
                     let value = value.as_array().and_then(|a| a.first()).unwrap_or(&value);
                     self.state.blend = value
@@ -1671,6 +1744,7 @@ impl<'r, 'd> Engine<'r, 'd> {
         let content = ReplayContent {
             state,
             resources: self.resources.clone(),
+            defaults: self.defaults().clone(),
             stream,
             id,
             source: self.source.clone(),
@@ -1683,7 +1757,10 @@ impl<'r, 'd> Engine<'r, 'd> {
         Some(Arc::new(MaskDef {
             content,
             luminosity: d.get_name(b"S") == Some(b"Luminosity"),
-            backdrop: space.to_rgb(&bc),
+            backdrop: self
+                .defaults()
+                .substitute(&space)
+                .to_rgb_with(&bc, self.state.params),
             transfer,
             bbox,
             key: PAINT_ID.fetch_add(1, Ordering::Relaxed),

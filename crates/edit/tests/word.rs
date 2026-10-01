@@ -221,7 +221,7 @@ fn referenced_graphics_retain_vector_colour_but_do_not_bake_in_editable_text() {
     let rgba = image.to_rgba8();
     let offset =
         ((image.height as usize * 3 / 5) * image.width as usize + image.width as usize * 3 / 5) * 4;
-    assert_eq!(&rgba[offset..offset + 4], &[51, 179, 102, 255]);
+    assert_eq!(&rgba[offset..offset + 4], &[51, 178, 102, 255]);
     for y in image.height as usize * 35 / 200..image.height as usize * 53 / 200 {
         for x in image.width as usize * 18 / 200..image.width as usize * 85 / 200 {
             assert_eq!(

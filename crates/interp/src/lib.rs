@@ -11,12 +11,12 @@
 //! a locked document, or a work bound instead of inventing drawing data.
 
 mod annot;
-mod cmyk_table;
 mod colorspace;
 mod device;
 mod font;
 mod font_data;
 mod function;
+mod icc;
 mod image;
 mod interp;
 mod ocg;

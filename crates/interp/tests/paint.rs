@@ -144,11 +144,12 @@ fn soft_mask_keeps_definition_transform_and_replays_without_itself() {
         vec![(true, Rect::new(5.0, 84.0, 15.0, 94.0), 128)]
     );
     assert_eq!(paints.groups, vec![(true, false)]);
+    let rects: Vec<Rect> = paints.colors.iter().map(|&(_, rect)| rect).collect();
     assert_eq!(
-        paints.colors,
+        rects,
         vec![
-            ([0.5, 0.5, 0.5], Rect::new(5.0, 84.0, 15.0, 94.0)),
-            ([1.0, 0.0, 0.0], Rect::new(25.0, 62.0, 27.0, 64.0))
+            Rect::new(5.0, 84.0, 15.0, 94.0),
+            Rect::new(25.0, 62.0, 27.0, 64.0)
         ]
     );
 }

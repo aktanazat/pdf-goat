@@ -1,24 +1,30 @@
 //! Colour spaces and their conversion to sRGB, following what PyMuPDF's
 //! MuPDF (colour management on) paints:
 //!
-//! - DeviceGray and DeviceRGB pass through; ICCBased spaces with 1 or 3
-//!   components are treated as those.
-//! - DeviceCMYK (and 4-component ICCBased) goes through MuPDF's default CMYK
-//!   profile, reproduced by a sampled table ([`crate::cmyk_table`]).
-//! - CalGray, CalRGB and Lab use their colorimetry: to CIE XYZ, Bradford
-//!   adapted to D50 (Lab is D50 already), then to sRGB.
+//! - DeviceRGB passes through; an ICCBased space whose profile is MuPDF's
+//!   own sRGB profile does too.
+//! - DeviceGray, DeviceCMYK and Lab go through MuPDF's default ICC
+//!   profiles; CalGray and CalRGB through the profile MuPDF synthesises
+//!   from their dictionaries; other ICCBased spaces through their embedded
+//!   profile. Every link is built by [`crate::icc`] the way Little-CMS
+//!   builds it for MuPDF: 16-bit for fills, 8-bit for image samples.
 //! - Indexed, Separation and DeviceN go through their base or alternate
 //!   space.
+//! - A fill's rendering intent and black point compensation
+//!   ([`ColorParams`]) pick the link; a page's or form's `DefaultGray`,
+//!   `DefaultRGB`, `DefaultCMYK` and the document's output intent
+//!   ([`DefaultSpaces`]) replace the device spaces.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use pdf_core::{Dict, Document, ObjRef, Object};
 
-use crate::cmyk_table::{CMYK_GRID, CMYK_TO_RGB};
 use crate::device::Rgb;
 use crate::function::Function;
+use crate::icc::{self, Intent, Profile, Transform};
 use crate::image::ColorFamily;
 
 /// Most components a colour may have.
@@ -27,11 +33,36 @@ const MAX_DEPTH: usize = 8;
 
 pub(crate) type ColorSpaceCache = RefCell<HashMap<ObjRef, Arc<ColorSpace>>>;
 
+/// MuPDF's `fz_color_params` as colour conversion sees them: the rendering
+/// intent and black point compensation of a fill, stroke or image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ColorParams {
+    pub(crate) intent: Intent,
+    pub(crate) bpc: bool,
+}
+
+impl ColorParams {
+    /// `fz_default_color_params`: relative colorimetric with compensation.
+    pub(crate) const DEFAULT: ColorParams = ColorParams {
+        intent: Intent::RelativeColorimetric,
+        bpc: true,
+    };
+}
+
+impl Default for ColorParams {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ColorSpace {
     /// The PDF family name: `DeviceGray`, `ICCBased`, `Indexed`, ...
     pub(crate) name: &'static str,
     kind: Kind,
+    /// One of MuPDF's device spaces (`FZ_COLORSPACE_IS_DEVICE`): what a
+    /// page's default colour spaces replace.
+    device: bool,
 }
 
 #[derive(Debug)]
@@ -39,20 +70,22 @@ enum Kind {
     Gray,
     Rgb,
     Cmyk,
-    CalGray {
-        white: [f64; 3],
-        gamma: f64,
-    },
-    CalRgb {
-        white: [f64; 3],
-        gamma: [f64; 3],
-        matrix: [f64; 9],
+    Icc {
+        n: usize,
+        /// Set for Lab profiles: the a*/b* clamp range.
+        lab: Option<[f64; 4]>,
+        profile: Arc<Profile>,
+        /// The 16-bit link with the default colour parameters.
+        link: Arc<Transform>,
     },
     Lab {
         range: [f64; 4],
     },
     Indexed {
         hival: usize,
+        base: Arc<ColorSpace>,
+        lookup: Vec<u8>,
+        /// The entries through `base` with the default colour parameters.
         palette: Vec<Rgb>,
     },
     Separation {
@@ -94,26 +127,55 @@ static GRAY: LazyLock<Arc<ColorSpace>> = LazyLock::new(|| {
     Arc::new(ColorSpace {
         name: "DeviceGray",
         kind: Kind::Gray,
+        device: true,
     })
 });
 static RGB: LazyLock<Arc<ColorSpace>> = LazyLock::new(|| {
     Arc::new(ColorSpace {
         name: "DeviceRGB",
         kind: Kind::Rgb,
+        device: true,
     })
 });
 static CMYK: LazyLock<Arc<ColorSpace>> = LazyLock::new(|| {
     Arc::new(ColorSpace {
         name: "DeviceCMYK",
         kind: Kind::Cmyk,
+        device: true,
+    })
+});
+static SRGB: LazyLock<Arc<ColorSpace>> = LazyLock::new(|| {
+    Arc::new(ColorSpace {
+        name: "DeviceRGB",
+        kind: Kind::Rgb,
+        device: false,
     })
 });
 static PATTERN: LazyLock<Arc<ColorSpace>> = LazyLock::new(|| {
     Arc::new(ColorSpace {
         name: "Pattern",
         kind: Kind::Pattern { base: None },
+        device: false,
     })
 });
+
+static GRAY_LINK: LazyLock<Arc<Transform>> =
+    LazyLock::new(|| device_link(&icc::DEVICE_GRAY, false));
+static CMYK_LINK: LazyLock<Arc<Transform>> =
+    LazyLock::new(|| device_link(&icc::DEVICE_CMYK, false));
+static LAB_LINK: LazyLock<Arc<Transform>> = LazyLock::new(|| device_link(&icc::DEVICE_LAB, false));
+static GRAY_LINK8: LazyLock<Arc<Transform>> =
+    LazyLock::new(|| device_link(&icc::DEVICE_GRAY, true));
+static CMYK_LINK8: LazyLock<Arc<Transform>> =
+    LazyLock::new(|| device_link(&icc::DEVICE_CMYK, true));
+static LAB_LINK8: LazyLock<Arc<Transform>> = LazyLock::new(|| device_link(&icc::DEVICE_LAB, true));
+
+/// A link to device RGB with MuPDF's default colour parameters: relative
+/// colorimetric intent with black point compensation.
+fn device_link(profile: &Arc<Profile>, bits8: bool) -> Arc<Transform> {
+    icc::link_to_rgb(profile, Intent::RelativeColorimetric, true, bits8)
+        .expect("MuPDF's bundled profiles link to device RGB")
+}
 
 impl ColorSpace {
     pub(crate) fn gray() -> Arc<ColorSpace> {
@@ -128,12 +190,91 @@ impl ColorSpace {
         CMYK.clone()
     }
 
+    /// RGB that is already converted: painted as is, never replaced by a
+    /// page's DefaultRGB.
+    pub(crate) fn srgb() -> Arc<ColorSpace> {
+        SRGB.clone()
+    }
+
+    /// The ICC profile a colour in this space goes through, when it has one.
+    fn profile(&self) -> Option<&Arc<Profile>> {
+        match &self.kind {
+            Kind::Gray => Some(&icc::DEVICE_GRAY),
+            Kind::Rgb => Some(&icc::DEVICE_RGB),
+            Kind::Cmyk => Some(&icc::DEVICE_CMYK),
+            Kind::Lab { .. } => Some(&icc::DEVICE_LAB),
+            Kind::Icc { profile, .. } => Some(profile),
+            _ => None,
+        }
+    }
+
+    /// The profile a colour leaves through towards `dest`: inside a
+    /// luminosity soft mask (`FZ_RI_IN_SOFTMASK`) every gray, RGB or CMYK
+    /// space goes through MuPDF's PostScript profile for its family.
+    fn source_profile(&self, dest: Dest<'_>) -> Option<&Arc<Profile>> {
+        if !dest.soft_mask {
+            return self.profile();
+        }
+        match self.family() {
+            ColorFamily::Gray => Some(&icc::PS_GRAY),
+            ColorFamily::Rgb => Some(&icc::PS_RGB),
+            ColorFamily::Cmyk => Some(&icc::PS_CMYK),
+            _ => self.profile(),
+        }
+    }
+
+    fn lab_range(&self) -> Option<[f64; 4]> {
+        match &self.kind {
+            Kind::Lab { range } => Some(*range),
+            Kind::Icc { lab, .. } => *lab,
+            _ => None,
+        }
+    }
+
+    /// The link to device RGB for `params`, 16-bit or 8-bit: the one built
+    /// at load for the defaults, else the cached link for that intent.
+    fn link(&self, params: ColorParams, bits8: bool) -> Option<Arc<Transform>> {
+        if params == ColorParams::DEFAULT {
+            let link = match (&self.kind, bits8) {
+                (Kind::Gray, false) => &*GRAY_LINK,
+                (Kind::Gray, true) => &*GRAY_LINK8,
+                (Kind::Cmyk, false) => &*CMYK_LINK,
+                (Kind::Cmyk, true) => &*CMYK_LINK8,
+                (Kind::Lab { .. }, false) => &*LAB_LINK,
+                (Kind::Lab { .. }, true) => &*LAB_LINK8,
+                (Kind::Icc { link, .. }, false) => link,
+                (Kind::Icc { profile, .. }, true) => {
+                    return icc::link_to_rgb(profile, params.intent, params.bpc, true);
+                }
+                _ => return None,
+            };
+            return Some(Arc::clone(link));
+        }
+        icc::link_to_rgb(self.profile()?, params.intent, params.bpc, bits8)
+    }
+
+    /// The link into `dest` for `params`: the device RGB links for the
+    /// page, the cached link between the two profiles otherwise.
+    fn link_to(&self, params: ColorParams, dest: Dest<'_>, bits8: bool) -> Option<Arc<Transform>> {
+        match dest.profile {
+            None => self.link(params, bits8),
+            Some(dst) => icc::link(
+                self.source_profile(dest)?,
+                dst,
+                params.intent,
+                params.bpc,
+                bits8,
+            ),
+        }
+    }
+
     /// Colour components (a pattern space: its base's, 0 without one).
     pub(crate) fn components(&self) -> usize {
         match &self.kind {
-            Kind::Gray | Kind::CalGray { .. } | Kind::Indexed { .. } | Kind::Separation { .. } => 1,
-            Kind::Rgb | Kind::CalRgb { .. } | Kind::Lab { .. } => 3,
+            Kind::Gray | Kind::Indexed { .. } | Kind::Separation { .. } => 1,
+            Kind::Rgb | Kind::Lab { .. } => 3,
             Kind::Cmyk => 4,
+            Kind::Icc { n, .. } => *n,
             Kind::DeviceN { n, .. } => *n,
             Kind::Pattern { base } => base.as_ref().map_or(0, |b| b.components()),
         }
@@ -157,10 +298,13 @@ impl ColorSpace {
 
     pub(crate) fn family(&self) -> ColorFamily {
         match &self.kind {
-            Kind::Gray | Kind::CalGray { .. } => ColorFamily::Gray,
-            Kind::Rgb | Kind::CalRgb { .. } => ColorFamily::Rgb,
+            Kind::Gray => ColorFamily::Gray,
+            Kind::Rgb => ColorFamily::Rgb,
             Kind::Cmyk => ColorFamily::Cmyk,
-            Kind::Lab { .. } => ColorFamily::Lab,
+            Kind::Lab { .. } | Kind::Icc { lab: Some(_), .. } => ColorFamily::Lab,
+            Kind::Icc { n: 1, .. } => ColorFamily::Gray,
+            Kind::Icc { n: 4, .. } => ColorFamily::Cmyk,
+            Kind::Icc { .. } => ColorFamily::Rgb,
             Kind::Indexed { .. } => ColorFamily::Indexed,
             Kind::Separation { .. } => ColorFamily::Separation,
             Kind::DeviceN { .. } => ColorFamily::DeviceN,
@@ -171,9 +315,12 @@ impl ColorSpace {
     /// The colour `cs`/`CS` selects (ISO 32000 8.6.8 and MuPDF).
     pub(crate) fn initial_color(&self) -> Vec<f32> {
         match &self.kind {
-            Kind::Cmyk => vec![0.0, 0.0, 0.0, 1.0],
+            Kind::Cmyk | Kind::Icc { n: 4, .. } => vec![0.0, 0.0, 0.0, 1.0],
             Kind::Separation { .. } | Kind::DeviceN { .. } => vec![1.0; self.components()],
-            Kind::Lab { range } => {
+            Kind::Lab { range }
+            | Kind::Icc {
+                lab: Some(range), ..
+            } => {
                 vec![
                     0.0,
                     (0.0f64).clamp(range[0], range[1]) as f32,
@@ -184,66 +331,66 @@ impl ColorSpace {
         }
     }
 
-    /// The default /Decode array of an image in this space.
+    /// The default /Decode array of an image in this space. Lab samples
+    /// decode to the 8-bit Lab encoding (`pdf_load_image_imp`: 0..100 and
+    /// -128..127 whatever the space's /Range).
     pub(crate) fn default_decode(&self, bpc: u8) -> Vec<[f64; 2]> {
         match &self.kind {
             Kind::Indexed { .. } => vec![[0.0, f64::from((1u32 << bpc.min(16)) - 1)]],
-            Kind::Lab { range } => vec![[0.0, 100.0], [range[0], range[1]], [range[2], range[3]]],
+            Kind::Lab { .. } | Kind::Icc { lab: Some(_), .. } => {
+                vec![[0.0, 100.0], [-128.0, 127.0], [-128.0, 127.0]]
+            }
             _ => vec![[0.0, 1.0]; self.components()],
         }
     }
 
     /// Converts component values (Lab: L*, a*, b*; Indexed: the index) to
-    /// sRGB in 0..=1.
+    /// sRGB in 0..=1 with the default colour parameters.
     pub(crate) fn to_rgb(&self, values: &[f32]) -> Rgb {
-        self.to_rgb_depth(values, 0)
+        self.to_rgb_depth(values, ColorParams::DEFAULT, 0)
     }
 
-    fn to_rgb_depth(&self, v: &[f32], depth: usize) -> Rgb {
+    /// [`ColorSpace::to_rgb`] with a fill's rendering intent and black
+    /// point compensation (`fz_convert_color` with its `fz_color_params`).
+    pub(crate) fn to_rgb_with(&self, values: &[f32], params: ColorParams) -> Rgb {
+        self.to_rgb_depth(values, params, 0)
+    }
+
+    fn to_rgb_depth(&self, v: &[f32], params: ColorParams, depth: usize) -> Rgb {
         let at = |i: usize| v.get(i).copied().unwrap_or(0.0);
         let unit = |x: f32| if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
         match &self.kind {
-            Kind::Gray => {
-                let g = unit(at(0));
-                [g, g, g]
-            }
             Kind::Rgb => [unit(at(0)), unit(at(1)), unit(at(2))],
-            Kind::Cmyk => cmyk_to_rgb([unit(at(0)), unit(at(1)), unit(at(2)), unit(at(3))]),
-            Kind::CalGray { white, gamma } => {
-                let a = f64::from(unit(at(0))).powf(*gamma);
-                xyz_to_srgb(adapt_to_d50(
-                    [white[0] * a, white[1] * a, white[2] * a],
-                    *white,
-                ))
+            Kind::Gray | Kind::Cmyk | Kind::Lab { .. } | Kind::Icc { .. } => {
+                let Some(link) = self.link(params, false) else {
+                    return [0.0; 3];
+                };
+                if let Some(range) = self.lab_range() {
+                    return link.convert(&lab_components(v, &range));
+                }
+                let n = self.components().min(4);
+                let mut comps = [0.0f32; 4];
+                for (slot, value) in comps.iter_mut().zip(v).take(n) {
+                    *slot = unit(*value);
+                }
+                link.convert(&comps[..n])
             }
-            Kind::CalRgb {
-                white,
-                gamma,
-                matrix,
+            Kind::Indexed {
+                palette,
+                hival,
+                base,
+                lookup,
             } => {
-                let a = f64::from(unit(at(0))).powf(gamma[0]);
-                let b = f64::from(unit(at(1))).powf(gamma[1]);
-                let c = f64::from(unit(at(2))).powf(gamma[2]);
-                let xyz = [
-                    matrix[0] * a + matrix[3] * b + matrix[6] * c,
-                    matrix[1] * a + matrix[4] * b + matrix[7] * c,
-                    matrix[2] * a + matrix[5] * b + matrix[8] * c,
-                ];
-                xyz_to_srgb(adapt_to_d50(xyz, *white))
-            }
-            Kind::Lab { range } => {
-                let l = f64::from(at(0)).clamp(0.0, 100.0);
-                let a = f64::from(at(1)).clamp(range[0], range[1]);
-                let b = f64::from(at(2)).clamp(range[2], range[3]);
-                lab_to_rgb(l, a, b)
-            }
-            Kind::Indexed { palette, hival, .. } => {
                 let index = if at(0).is_nan() {
                     0
                 } else {
                     at(0).round().clamp(0.0, *hival as f32) as usize
                 };
-                palette.get(index).copied().unwrap_or([0.0; 3])
+                if params == ColorParams::DEFAULT || depth > MAX_DEPTH {
+                    return palette.get(index).copied().unwrap_or([0.0; 3]);
+                }
+                let (comps, n) = indexed_entry(base, lookup, index);
+                base.to_rgb_depth(&comps[..n], params, depth + 1)
             }
             Kind::Separation { alternate, tint }
             | Kind::DeviceN {
@@ -264,13 +411,58 @@ impl ColorSpace {
                 for (slot, value) in alt.iter_mut().zip(&out[..m]) {
                     *slot = *value as f32;
                 }
-                alternate.to_rgb_depth(&alt[..m], depth + 1)
+                alternate.to_rgb_depth(&alt[..m], params, depth + 1)
             }
             Kind::Pattern { base } => match base {
-                Some(base) if depth <= MAX_DEPTH => base.to_rgb_depth(v, depth + 1),
+                Some(base) if depth <= MAX_DEPTH => base.to_rgb_depth(v, params, depth + 1),
                 _ => [0.0; 3],
             },
         }
+    }
+
+    /// Component values as the bytes of an 8-bit pixmap in this space
+    /// (`fz_unpack_tile` after `fz_decode_tile`): Lab in its 8-bit
+    /// encoding, Indexed the index. Returns the count of bytes written.
+    pub(crate) fn sample_bytes(&self, values: &[f32], out: &mut [u8; MAX_COLORANTS]) -> usize {
+        let at = |i: usize| values.get(i).copied().unwrap_or(0.0);
+        let unit = |x: f32| {
+            if x.is_nan() {
+                0
+            } else {
+                (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+            }
+        };
+        if let Kind::Indexed { hival, .. } = &self.kind {
+            let top = (*hival).min(255) as f32;
+            out[0] = if at(0).is_nan() {
+                0
+            } else {
+                at(0).round().clamp(0.0, top) as u8
+            };
+            return 1;
+        }
+        if self.lab_range().is_some() {
+            let l = at(0);
+            out[0] = if l.is_nan() {
+                0
+            } else {
+                (l.clamp(0.0, 100.0) * 2.55 + 0.5) as u8
+            };
+            for (k, slot) in out.iter_mut().enumerate().take(3).skip(1) {
+                let v = at(k);
+                *slot = if v.is_nan() {
+                    0
+                } else {
+                    (v + 128.0).round().clamp(0.0, 255.0) as u8
+                };
+            }
+            return 3;
+        }
+        let n = self.components().clamp(1, MAX_COLORANTS);
+        for (i, slot) in out.iter_mut().enumerate().take(n) {
+            *slot = unit(at(i));
+        }
+        n
     }
 
     /// Loads a colour space operand or /ColorSpace value. Names are looked
@@ -282,6 +474,174 @@ impl ColorSpace {
         cache: &ColorSpaceCache,
     ) -> Option<Arc<ColorSpace>> {
         load(doc, object, resources, cache, 0)
+    }
+}
+
+/// Where a conversion lands.
+#[derive(Clone, Copy)]
+struct Dest<'a> {
+    /// None: the page's device RGB, through the links built for it.
+    profile: Option<&'a Arc<Profile>>,
+    /// DeviceGray paints a CMYK destination as K alone (PDF 1.7 6.3).
+    cmyk: bool,
+    /// `FZ_RI_IN_SOFTMASK`: see [`ColorSpace::source_profile`].
+    soft_mask: bool,
+}
+
+impl Dest<'_> {
+    fn page() -> Dest<'static> {
+        Dest {
+            profile: None,
+            cmyk: false,
+            soft_mask: false,
+        }
+    }
+
+    fn is_page(self) -> bool {
+        self.profile.is_none()
+    }
+
+    /// The destination of an Indexed base or a tint alternate: MuPDF
+    /// clears the soft mask flag before it converts them.
+    fn inner(self) -> Self {
+        Dest {
+            soft_mask: false,
+            ..self
+        }
+    }
+}
+
+/// A link's source profile, destination profile (none: the page) and
+/// colour parameters.
+type LinkId = (u64, Option<u64>, ColorParams);
+
+/// One pixmap's conversion (`fz_convert_pixmap_samples`): 8-bit samples
+/// through the 8-bit links with the device spaces replaced by the page's
+/// defaults, each link looked up once per pixmap rather than per pixel.
+pub(crate) struct PixmapConversion<'a> {
+    defaults: &'a DefaultSpaces,
+    links: Vec<(LinkId, Option<Arc<Transform>>)>,
+}
+
+impl<'a> PixmapConversion<'a> {
+    pub(crate) fn new(defaults: &'a DefaultSpaces) -> Self {
+        Self {
+            defaults,
+            links: Vec::new(),
+        }
+    }
+
+    /// Samples of `space` (Lab in its 8-bit encoding, Indexed the index)
+    /// as page RGB. Fewer bytes than components read as zero.
+    pub(crate) fn rgb(&mut self, space: &ColorSpace, bytes: &[u8], params: ColorParams) -> [u8; 3] {
+        let mut out = [0u8; MAX_COLORANTS];
+        self.convert(space, bytes, params, Dest::page(), &mut out, 0);
+        [out[0], out[1], out[2]]
+    }
+
+    fn link(
+        &mut self,
+        space: &ColorSpace,
+        params: ColorParams,
+        dest: Dest<'_>,
+    ) -> Option<&Transform> {
+        let id = (
+            space.source_profile(dest)?.id(),
+            dest.profile.map(|p| p.id()),
+            params,
+        );
+        let at = match self.links.iter().position(|(key, _)| *key == id) {
+            Some(at) => at,
+            None => {
+                self.links.push((id, space.link_to(params, dest, true)));
+                self.links.len() - 1
+            }
+        };
+        self.links[at].1.as_deref()
+    }
+
+    /// 8-bit samples of `space` into `dest`. Returns the count written.
+    fn convert(
+        &mut self,
+        space: &ColorSpace,
+        bytes: &[u8],
+        params: ColorParams,
+        dest: Dest<'_>,
+        out: &mut [u8; MAX_COLORANTS],
+        depth: usize,
+    ) -> usize {
+        let at = |i: usize| bytes.get(i).copied().unwrap_or(0);
+        if depth > MAX_DEPTH {
+            return 0;
+        }
+        let defaults = self.defaults;
+        match &space.kind {
+            Kind::Rgb if dest.is_page() => {
+                out[..3].copy_from_slice(&[at(0), at(1), at(2)]);
+                3
+            }
+            Kind::Gray if space.device && dest.cmyk => {
+                out[..4].copy_from_slice(&[0, 0, 0, 255 - at(0)]);
+                4
+            }
+            Kind::Gray | Kind::Rgb | Kind::Cmyk | Kind::Lab { .. } | Kind::Icc { .. } => {
+                let n = space.components().min(4);
+                let mut input = [0u8; 4];
+                for (i, slot) in input.iter_mut().enumerate().take(n) {
+                    *slot = at(i);
+                }
+                let Some(link) = self.link(space, params, dest) else {
+                    return 0;
+                };
+                let m = link.outputs().min(MAX_COLORANTS);
+                link.eval8(&input[..n], &mut out[..m]);
+                m
+            }
+            Kind::Indexed {
+                base,
+                lookup,
+                hival,
+                ..
+            } => {
+                // fz_convert_indexed_pixmap_to_base: the lookup bytes are
+                // the samples of a pixmap in the base space.
+                let n = base.components().clamp(1, MAX_COLORANTS);
+                let index = usize::from(at(0)).min(*hival);
+                let mut entry = [0u8; MAX_COLORANTS];
+                for (c, slot) in entry.iter_mut().enumerate().take(n) {
+                    *slot = lookup.get(index * n + c).copied().unwrap_or(0);
+                }
+                let base = defaults.substitute(base);
+                self.convert(base, &entry[..n], params, dest.inner(), out, depth + 1)
+            }
+            Kind::Separation { alternate, tint }
+            | Kind::DeviceN {
+                alternate, tint, ..
+            } => {
+                // fz_convert_separation_pixmap_to_base: the tint output
+                // truncated to bytes, Lab in its 8-bit encoding.
+                let n = space.components().min(MAX_COLORANTS);
+                let mut input = [0.0f64; MAX_COLORANTS];
+                for (i, slot) in input.iter_mut().enumerate().take(n) {
+                    *slot = f64::from(at(i)) / 255.0;
+                }
+                let mut tinted = [0.0f64; MAX_COLORANTS];
+                let m = alternate.components().clamp(1, MAX_COLORANTS);
+                tint.eval(&input[..n], &mut tinted[..m]);
+                let mut alt = [0u8; MAX_COLORANTS];
+                let lab = alternate.lab_range().is_some();
+                for (k, (slot, value)) in alt.iter_mut().zip(&tinted[..m]).enumerate() {
+                    *slot = match (lab, k) {
+                        (true, 0) => (value / 100.0 * 255.0) as u8,
+                        (true, _) => (value + 128.0) as u8,
+                        _ => (value * 255.0) as u8,
+                    };
+                }
+                let alternate = defaults.substitute(alternate);
+                self.convert(alternate, &alt[..m], params, dest.inner(), out, depth + 1)
+            }
+            Kind::Pattern { .. } => 0,
+        }
     }
 }
 
@@ -365,32 +725,34 @@ fn load_array(
             let gamma = dict
                 .get(b"Gamma")
                 .and_then(|o| doc.resolve_f64(o).ok().flatten())
-                .filter(|g| *g > 0.0);
-            ColorSpace {
-                name: "CalGray",
-                kind: Kind::CalGray {
-                    white: white(&dict),
-                    gamma: gamma.unwrap_or(1.0),
-                },
+                .filter(|g| *g > 0.0)
+                .unwrap_or(1.0);
+            match cal_space("CalGray", white(&dict), &[gamma as f32], None) {
+                Some(space) => space,
+                None => return Some(ColorSpace::gray()),
             }
         }
         b"CalRGB" => {
             let dict = dict_at(1).unwrap_or_default();
             let gamma = match numbers(&dict, b"Gamma").as_deref() {
-                Some([r, g, b]) if *r > 0.0 && *g > 0.0 && *b > 0.0 => [*r, *g, *b],
+                Some([r, g, b]) if *r > 0.0 && *g > 0.0 && *b > 0.0 => {
+                    [*r as f32, *g as f32, *b as f32]
+                }
                 _ => [1.0; 3],
             };
             let matrix = match numbers(&dict, b"Matrix") {
-                Some(m) if m.len() == 9 => [m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]],
+                Some(m) if m.len() == 9 => {
+                    let mut out = [0.0f32; 9];
+                    for (slot, value) in out.iter_mut().zip(&m) {
+                        *slot = *value as f32;
+                    }
+                    out
+                }
                 _ => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             };
-            ColorSpace {
-                name: "CalRGB",
-                kind: Kind::CalRgb {
-                    white: white(&dict),
-                    gamma,
-                    matrix,
-                },
+            match cal_space("CalRGB", white(&dict), &gamma, Some(matrix)) {
+                Some(space) => space,
+                None => return Some(ColorSpace::rgb()),
             }
         }
         b"Lab" => {
@@ -402,32 +764,65 @@ fn load_array(
             ColorSpace {
                 name: "Lab",
                 kind: Kind::Lab { range },
+                device: false,
             }
         }
         b"ICCBased" => {
-            let stream = doc.resolve_stream(items.get(1)?).ok()??;
+            let stream_object = items.get(1)?;
+            let stream_ref = match stream_object {
+                Object::Reference(id) => Some(*id),
+                _ => None,
+            };
+            if let Some(id) = stream_ref
+                && let Some(hit) = cache.borrow().get(&id)
+            {
+                return Some(hit.clone());
+            }
+            let stream = doc.resolve_stream(stream_object).ok()??;
             let n = stream
                 .dict
                 .get(b"N")
                 .and_then(|o| doc.resolve_i64(o).ok().flatten())
                 .unwrap_or(0);
-            let by_n = match n {
-                1 => Some(ColorSpace::gray()),
-                3 => Some(ColorSpace::rgb()),
-                4 => Some(ColorSpace::cmyk()),
-                _ => None,
-            };
-            let base = match by_n {
+            // MuPDF keeps an embedded profile unless it has more channels
+            // than /N claims; a broken profile falls back to /N, then
+            // /Alternate.
+            let embedded = doc
+                .decode_stream(&stream)
+                .ok()
+                .and_then(|data| icc::Profile::parse(&data.data))
+                .filter(|profile| n <= 0 || profile.components() as i64 <= n)
+                .and_then(|profile| {
+                    let lab = profile.is_lab().then_some([-128.0, 127.0, -128.0, 127.0]);
+                    icc_space("ICCBased", &profile, lab)
+                });
+            let space = match embedded {
                 Some(space) => space,
                 None => {
-                    let alternate = stream.dict.get(b"Alternate")?;
-                    load(doc, alternate, resources, cache, depth + 1)?
+                    let base = match n {
+                        1 => ColorSpace::gray(),
+                        3 => ColorSpace::rgb(),
+                        4 => ColorSpace::cmyk(),
+                        _ => load(
+                            doc,
+                            stream.dict.get(b"Alternate")?,
+                            resources,
+                            cache,
+                            depth + 1,
+                        )?,
+                    };
+                    ColorSpace {
+                        name: "ICCBased",
+                        kind: iccbased_kind(&base)?,
+                        device: base.device,
+                    }
                 }
             };
-            ColorSpace {
-                name: "ICCBased",
-                kind: iccbased_kind(&base)?,
+            let space = Arc::new(space);
+            if let Some(id) = stream_ref {
+                cache.borrow_mut().insert(id, space.clone());
             }
+            return Some(space);
         }
         b"Indexed" | b"I" => {
             let base = load(doc, items.get(1)?, resources, cache, depth + 1)?;
@@ -440,21 +835,22 @@ fn load_array(
                 Object::Stream(stream) => doc.decode_stream(&stream).ok()?.data,
                 _ => return None,
             };
-            let n = base.components().max(1);
-            let decode = base.default_decode(8);
+            let n = base.components().clamp(1, MAX_COLORANTS);
             let mut palette = Vec::with_capacity(hival + 1);
-            let mut comps = [0.0f32; MAX_COLORANTS];
             for entry in 0..=hival {
-                for (c, slot) in comps.iter_mut().enumerate().take(n.min(MAX_COLORANTS)) {
-                    let byte = lookup.get(entry * n + c).copied().unwrap_or(0);
-                    let [d0, d1] = decode.get(c).copied().unwrap_or([0.0, 1.0]);
-                    *slot = (d0 + f64::from(byte) / 255.0 * (d1 - d0)) as f32;
-                }
-                palette.push(base.to_rgb(&comps[..n.min(MAX_COLORANTS)]));
+                let (comps, n) = indexed_entry(&base, &lookup, entry);
+                palette.push(base.to_rgb(&comps[..n]));
             }
+            let _ = n;
             ColorSpace {
                 name: "Indexed",
-                kind: Kind::Indexed { hival, palette },
+                kind: Kind::Indexed {
+                    hival,
+                    base,
+                    lookup,
+                    palette,
+                },
+                device: false,
             }
         }
         b"Separation" => {
@@ -466,6 +862,7 @@ fn load_array(
             ColorSpace {
                 name: "Separation",
                 kind: Kind::Separation { alternate, tint },
+                device: false,
             }
         }
         b"DeviceN" => {
@@ -482,6 +879,7 @@ fn load_array(
             ColorSpace {
                 name: "DeviceN",
                 kind: Kind::DeviceN { n, alternate, tint },
+                device: false,
             }
         }
         b"Pattern" => {
@@ -492,6 +890,7 @@ fn load_array(
             ColorSpace {
                 name: "Pattern",
                 kind: Kind::Pattern { base },
+                device: false,
             }
         }
         _ => return None,
@@ -502,12 +901,37 @@ fn load_array(
 /// An ICCBased space behaves as its device equivalent.
 fn iccbased_kind(base: &ColorSpace) -> Option<Kind> {
     Some(match &base.kind {
-        Kind::Gray | Kind::CalGray { .. } => Kind::Gray,
-        Kind::Rgb | Kind::CalRgb { .. } => Kind::Rgb,
+        Kind::Gray => Kind::Gray,
+        Kind::Rgb => Kind::Rgb,
         Kind::Cmyk => Kind::Cmyk,
         Kind::Lab { range } => Kind::Lab { range: *range },
+        Kind::Icc {
+            n,
+            lab,
+            profile,
+            link,
+        } => Kind::Icc {
+            n: *n,
+            lab: *lab,
+            profile: profile.clone(),
+            link: link.clone(),
+        },
         _ => return None,
     })
+}
+
+/// One Indexed lookup entry as the base's components (8-bit samples through
+/// the base's default /Decode).
+fn indexed_entry(base: &ColorSpace, lookup: &[u8], index: usize) -> ([f32; MAX_COLORANTS], usize) {
+    let n = base.components().clamp(1, MAX_COLORANTS);
+    let decode = base.default_decode(8);
+    let mut comps = [0.0f32; MAX_COLORANTS];
+    for (c, slot) in comps.iter_mut().enumerate().take(n) {
+        let byte = lookup.get(index * n + c).copied().unwrap_or(0);
+        let [d0, d1] = decode.get(c).copied().unwrap_or([0.0, 1.0]);
+        *slot = (d0 + f64::from(byte) / 255.0 * (d1 - d0)) as f32;
+    }
+    (comps, n)
 }
 
 fn load_tint(doc: &Document, object: &Object) -> Option<Tint> {
@@ -525,107 +949,253 @@ fn load_tint(doc: &Document, object: &Object) -> Option<Tint> {
     (!functions.is_empty()).then_some(Tint { functions })
 }
 
+// ----- default colour spaces -------------------------------------------------
+
+static NEXT_DEFAULTS_KEY: AtomicU64 = AtomicU64::new(1);
+
+static NO_DEFAULTS: LazyLock<Arc<DefaultSpaces>> = LazyLock::new(|| {
+    Arc::new(DefaultSpaces {
+        gray: None,
+        rgb: None,
+        cmyk: None,
+        key: 0,
+    })
+});
+
+/// `fz_default_colorspaces`: what a page or form paints DeviceGray,
+/// DeviceRGB and DeviceCMYK through, from its Resources `/ColorSpace`
+/// `DefaultGray`, `DefaultRGB` and `DefaultCMYK` entries and the document's
+/// output intent. `None` keeps the device space.
+#[derive(Debug)]
+pub(crate) struct DefaultSpaces {
+    gray: Option<Arc<ColorSpace>>,
+    rgb: Option<Arc<ColorSpace>>,
+    cmyk: Option<Arc<ColorSpace>>,
+    key: u64,
+}
+
+impl DefaultSpaces {
+    /// No substitutions: the device spaces paint as themselves.
+    pub(crate) fn none() -> Arc<DefaultSpaces> {
+        NO_DEFAULTS.clone()
+    }
+
+    /// Identifies the set, for caches of images converted through it; 0 is
+    /// the empty set.
+    pub(crate) fn key(&self) -> u64 {
+        self.key
+    }
+
+    /// `pdf_load_default_colorspaces`: a page's defaults, with the output
+    /// intent standing in for whichever device space the page left alone.
+    pub(crate) fn for_page(
+        doc: &Document,
+        resources: &Dict,
+        output_intent: Option<&Arc<ColorSpace>>,
+        cache: &ColorSpaceCache,
+    ) -> Arc<DefaultSpaces> {
+        let mut spaces = DefaultSpaces {
+            gray: None,
+            rgb: None,
+            cmyk: None,
+            key: 0,
+        };
+        spaces.load(doc, resources, cache);
+        if let Some(oi) = output_intent {
+            // fz_set_default_output_intent
+            let slot = match oi.family() {
+                ColorFamily::Gray => &mut spaces.gray,
+                ColorFamily::Rgb => &mut spaces.rgb,
+                ColorFamily::Cmyk => &mut spaces.cmyk,
+                _ => &mut None,
+            };
+            if slot.is_none() {
+                *slot = Some(oi.clone());
+            }
+        }
+        Self::finish(spaces)
+    }
+
+    /// `pdf_update_default_colorspaces`: a form's own Resources override the
+    /// set it inherits.
+    pub(crate) fn update(
+        parent: &Arc<DefaultSpaces>,
+        doc: &Document,
+        resources: &Dict,
+        cache: &ColorSpaceCache,
+    ) -> Arc<DefaultSpaces> {
+        let mut spaces = DefaultSpaces {
+            gray: parent.gray.clone(),
+            rgb: parent.rgb.clone(),
+            cmyk: parent.cmyk.clone(),
+            key: 0,
+        };
+        if !spaces.load(doc, resources, cache) {
+            return parent.clone();
+        }
+        Self::finish(spaces)
+    }
+
+    /// Reads the `Default*` entries; whether any was present.
+    fn load(&mut self, doc: &Document, resources: &Dict, cache: &ColorSpaceCache) -> bool {
+        let Some(dict) = resources
+            .get(b"ColorSpace")
+            .and_then(|o| doc.resolve_dict(o).ok().flatten())
+        else {
+            return false;
+        };
+        let gray = set_default(
+            &mut self.gray,
+            doc,
+            &dict,
+            b"DefaultGray",
+            ColorFamily::Gray,
+            1,
+            cache,
+        );
+        let rgb = set_default(
+            &mut self.rgb,
+            doc,
+            &dict,
+            b"DefaultRGB",
+            ColorFamily::Rgb,
+            3,
+            cache,
+        );
+        let cmyk = set_default(
+            &mut self.cmyk,
+            doc,
+            &dict,
+            b"DefaultCMYK",
+            ColorFamily::Cmyk,
+            4,
+            cache,
+        );
+        gray || rgb || cmyk
+    }
+
+    fn finish(mut spaces: DefaultSpaces) -> Arc<DefaultSpaces> {
+        if spaces.gray.is_none() && spaces.rgb.is_none() && spaces.cmyk.is_none() {
+            return Self::none();
+        }
+        spaces.key = NEXT_DEFAULTS_KEY.fetch_add(1, Ordering::Relaxed);
+        Arc::new(spaces)
+    }
+
+    /// `fz_default_colorspace`: a device space becomes its default; every
+    /// other space is painted as itself.
+    pub(crate) fn substitute<'a>(&'a self, space: &'a ColorSpace) -> &'a ColorSpace {
+        if !space.device {
+            return space;
+        }
+        let replacement = match &space.kind {
+            Kind::Gray => &self.gray,
+            Kind::Rgb => &self.rgb,
+            Kind::Cmyk => &self.cmyk,
+            _ => &None,
+        };
+        replacement.as_deref().unwrap_or(space)
+    }
+}
+
+/// `fz_set_default_gray` and friends: the entry is taken only when it is a
+/// space of the right family and component count; a device space resets
+/// the slot.
+fn set_default(
+    slot: &mut Option<Arc<ColorSpace>>,
+    doc: &Document,
+    dict: &Dict,
+    key: &[u8],
+    family: ColorFamily,
+    n: usize,
+    cache: &ColorSpaceCache,
+) -> bool {
+    let Some(object) = dict.get(key) else {
+        return false;
+    };
+    let Some(space) = ColorSpace::load(doc, object, None, cache) else {
+        return false;
+    };
+    if space.is_pattern() || space.family() != family || space.components() != n {
+        return false;
+    }
+    *slot = (!space.device).then_some(space);
+    true
+}
+
+/// `pdf_document_output_intent`: the first `/OutputIntents` entry's
+/// `/DestOutputProfile` as an ICCBased space. MuPDF reads it without an
+/// Alternate and needs `/N`; a profile that falls back to a device space
+/// changes nothing.
+pub(crate) fn output_intent(doc: &Document, cache: &ColorSpaceCache) -> Option<Arc<ColorSpace>> {
+    let catalog = doc.catalog().ok()?;
+    let intents = doc.resolve_array(catalog.get(b"OutputIntents")?).ok()??;
+    let first = doc.resolve_dict(intents.first()?).ok()??;
+    let profile = first.get(b"DestOutputProfile")?;
+    let stream = doc.resolve_stream(profile).ok()??;
+    let n = stream
+        .dict
+        .get(b"N")
+        .and_then(|o| doc.resolve_i64(o).ok().flatten())
+        .unwrap_or(0);
+    if n <= 0 {
+        return None;
+    }
+    let array = Object::Array(vec![Object::name("ICCBased"), profile.clone()]);
+    let space = ColorSpace::load(doc, &array, None, cache)?;
+    (!space.device).then_some(space)
+}
+
 // ----- conversions -----------------------------------------------------------
 
 const D50: [f64; 3] = [0.9642, 1.0, 0.8249];
 
-/// MuPDF's default CMYK → sRGB: quadrilinear interpolation in the sampled
-/// grid.
-pub(crate) fn cmyk_to_rgb(cmyk: [f32; 4]) -> Rgb {
-    let steps = (CMYK_GRID - 1) as f32;
-    let mut base = [0usize; 4];
-    let mut frac = [0.0f32; 4];
-    for i in 0..4 {
-        let x = cmyk[i].clamp(0.0, 1.0) * steps;
-        let lower = x.floor().min(steps - 1.0);
-        base[i] = lower as usize;
-        frac[i] = x - lower;
-    }
-    let mut rgb = [0.0f32; 3];
-    for corner in 0..16usize {
-        let mut weight = 1.0f32;
-        let mut index = 0usize;
-        for i in 0..4 {
-            let high = (corner >> (3 - i)) & 1;
-            weight *= if high == 1 { frac[i] } else { 1.0 - frac[i] };
-            index = index * CMYK_GRID + base[i] + high;
-        }
-        if weight == 0.0 {
-            continue;
-        }
-        let at = index * 3;
-        for (c, slot) in rgb.iter_mut().enumerate() {
-            *slot += weight * f32::from(CMYK_TO_RGB[at + c]);
-        }
-    }
-    rgb.map(|v| (v / 255.0).clamp(0.0, 1.0))
+/// Lab components clamped the way MuPDF clamps them before the link.
+fn lab_components(v: &[f32], range: &[f64; 4]) -> [f32; 3] {
+    let at = |i: usize| f64::from(v.get(i).copied().unwrap_or(0.0));
+    [
+        at(0).clamp(0.0, 100.0) as f32,
+        at(1).clamp(range[0], range[1]) as f32,
+        at(2).clamp(range[2], range[3]) as f32,
+    ]
 }
 
-/// Bradford chromatic adaptation from `white` to D50.
-fn adapt_to_d50(xyz: [f64; 3], white: [f64; 3]) -> [f64; 3] {
-    const M: [[f64; 3]; 3] = [
-        [0.8951, 0.2664, -0.1614],
-        [-0.7502, 1.7135, 0.0367],
-        [0.0389, -0.0685, 1.0296],
-    ];
-    const M_INV: [[f64; 3]; 3] = [
-        [0.9869929, -0.1470543, 0.1599627],
-        [0.4323053, 0.5183603, 0.0492912],
-        [-0.0085287, 0.0400428, 0.9684867],
-    ];
-    let mul = |m: &[[f64; 3]; 3], v: [f64; 3]| {
-        [
-            m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-            m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-            m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-        ]
-    };
-    let src = mul(&M, white);
-    let dst = mul(&M, D50);
-    if src.iter().any(|v| v.abs() < 1e-9) {
-        return xyz;
-    }
-    let cone = mul(&M, xyz);
-    let scaled = [
-        cone[0] * dst[0] / src[0],
-        cone[1] * dst[1] / src[1],
-        cone[2] * dst[2] / src[2],
-    ];
-    mul(&M_INV, scaled)
+/// A CalGray/CalRGB space as MuPDF builds it: an ICC profile generated
+/// from the dictionary, linked like any other profile.
+fn cal_space(
+    name: &'static str,
+    white: [f64; 3],
+    gamma: &[f32],
+    matrix: Option<[f32; 9]>,
+) -> Option<ColorSpace> {
+    let profile = icc::cal_profile(white.map(|w| w as f32), gamma, matrix)?;
+    icc_space(name, &profile, None)
 }
 
-/// D50 XYZ → sRGB (D50-adapted sRGB matrix), gamma encoded.
-fn xyz_to_srgb(xyz: [f64; 3]) -> Rgb {
-    let [x, y, z] = xyz;
-    let r = 3.1338561 * x - 1.6168667 * y - 0.4906146 * z;
-    let g = -0.9787684 * x + 1.9161415 * y + 0.0334540 * z;
-    let b = 0.0719453 * x - 0.2289914 * y + 1.4052427 * z;
-    [srgb_encode(r), srgb_encode(g), srgb_encode(b)]
-}
-
-fn srgb_encode(v: f64) -> f32 {
-    let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
-    let e = if v <= 0.0031308 {
-        12.92 * v
+/// A colour space over an ICC profile. A profile that links to device RGB
+/// as identity is plain RGB, as in MuPDF.
+fn icc_space(
+    name: &'static str,
+    profile: &Arc<Profile>,
+    lab: Option<[f64; 4]>,
+) -> Option<ColorSpace> {
+    let link = icc::link_to_rgb(profile, Intent::RelativeColorimetric, true, false)?;
+    let n = profile.components();
+    let kind = if link.is_identity() && n == 3 && lab.is_none() {
+        Kind::Rgb
     } else {
-        1.055 * v.powf(1.0 / 2.4) - 0.055
-    };
-    e as f32
-}
-
-/// CIE L*a*b* (D50) → sRGB.
-fn lab_to_rgb(l: f64, a: f64, b: f64) -> Rgb {
-    let fy = (l + 16.0) / 116.0;
-    let fx = fy + a / 500.0;
-    let fz = fy - b / 200.0;
-    let finv = |t: f64| {
-        if t > 6.0 / 29.0 {
-            t * t * t
-        } else {
-            3.0 * (6.0f64 / 29.0).powi(2) * (t - 4.0 / 29.0)
+        Kind::Icc {
+            n,
+            lab,
+            profile: profile.clone(),
+            link,
         }
     };
-    xyz_to_srgb([D50[0] * finv(fx), D50[1] * finv(fy), D50[2] * finv(fz)])
+    Some(ColorSpace {
+        name,
+        kind,
+        device: false,
+    })
 }
 
 #[cfg(test)]
@@ -636,21 +1206,141 @@ mod tests {
         rgb.map(|v| (v * 255.0).round() as u8)
     }
 
-    #[test]
-    fn cmyk_matches_mupdf_default_profile_at_grid_points() {
-        // Values PyMuPDF 1.27 paints for these fills.
-        assert_eq!(bytes(cmyk_to_rgb([1.0, 0.0, 0.0, 0.0])), [0, 173, 239]);
-        assert_eq!(bytes(cmyk_to_rgb([0.0, 0.0, 0.0, 1.0])), [34, 31, 31]);
-        assert_eq!(bytes(cmyk_to_rgb([0.0, 1.0, 1.0, 0.0])), [237, 28, 36]);
-        assert_eq!(bytes(cmyk_to_rgb([0.0, 0.0, 0.0, 0.0])), [255, 255, 255]);
+    fn within_one(got: [u8; 3], want: [u8; 3]) -> bool {
+        got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 1)
     }
 
     #[test]
-    fn lab_converts_through_d50_to_srgb() {
-        // PyMuPDF paints Lab (50, 20, -30) as (131, 107, 170).
-        let rgb = bytes(lab_to_rgb(50.0, 20.0, -30.0));
-        for (got, want) in rgb.iter().zip([131u8, 107, 170]) {
-            assert!(got.abs_diff(want) <= 3, "{rgb:?}");
+    fn device_cmyk_fills_match_pymupdf() {
+        // Values PyMuPDF 1.27 paints for these fills at 72 dpi.
+        let cmyk = ColorSpace::cmyk();
+        for (input, want) in [
+            ([1.0, 0.0, 0.0, 0.0], [0, 173, 239]),
+            ([0.0, 0.0, 0.0, 1.0], [34, 31, 31]),
+            ([0.0, 1.0, 1.0, 0.0], [237, 28, 36]),
+            ([0.5, 0.0, 0.0, 0.0], [109, 207, 246]),
+            ([0.3, 0.6, 0.1, 0.2], [150, 101, 140]),
+            ([0.0, 0.0, 0.0, 0.0], [255, 255, 255]),
+        ] {
+            let got = bytes(cmyk.to_rgb(&input));
+            assert!(
+                within_one(got, want),
+                "cmyk {input:?}: got {got:?}, want {want:?}"
+            );
         }
+    }
+
+    #[test]
+    fn device_gray_fills_match_pymupdf() {
+        let gray = ColorSpace::gray();
+        for (input, want) in [
+            (0.2f32, [51, 51, 50]),
+            (100.0 / 255.0, [99, 100, 99]),
+            (1.0, [255, 255, 255]),
+        ] {
+            let got = bytes(gray.to_rgb(&[input]));
+            assert!(
+                within_one(got, want),
+                "gray {input}: got {got:?}, want {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lab_fills_match_pymupdf() {
+        let lab = ColorSpace {
+            name: "Lab",
+            kind: Kind::Lab {
+                range: [-100.0, 100.0, -100.0, 100.0],
+            },
+            device: false,
+        };
+        let got = bytes(lab.to_rgb(&[50.0, 20.0, -30.0]));
+        assert!(within_one(got, [131, 107, 170]), "{got:?}");
+        let white = bytes(lab.to_rgb(&[100.0, 0.0, 0.0]));
+        assert!(white.iter().all(|&v| v >= 253), "{white:?}");
+    }
+
+    #[test]
+    fn cal_spaces_keep_white_and_black() {
+        let gray = cal_space("CalGray", D50, &[1.0], None).expect("CalGray profile");
+        assert_eq!(bytes(gray.to_rgb(&[1.0])), [255, 255, 255]);
+        assert_eq!(bytes(gray.to_rgb(&[0.0])), [0, 0, 0]);
+        let srgb_matrix = [
+            0.4124, 0.2126, 0.0193, 0.3576, 0.7152, 0.1192, 0.1805, 0.0722, 0.9505,
+        ];
+        let rgb = cal_space("CalRGB", [0.9505, 1.0, 1.089], &[2.2; 3], Some(srgb_matrix))
+            .expect("CalRGB profile");
+        assert_eq!(bytes(rgb.to_rgb(&[1.0, 1.0, 1.0])), [255, 255, 255]);
+        assert_eq!(bytes(rgb.to_rgb(&[0.0, 0.0, 0.0])), [0, 0, 0]);
+    }
+
+    #[test]
+    fn rendering_intent_and_compensation_change_cmyk_fills() {
+        // PyMuPDF 1.27 at 72 dpi: the same CMYK fill under `/Perceptual ri`
+        // and under `/UseBlackPtComp /OFF`, which lcms2 links differently.
+        let cmyk = ColorSpace::cmyk();
+        let dark = [0.0, 0.0, 0.0, 1.0];
+        let default = bytes(cmyk.to_rgb(&dark));
+        let perceptual = bytes(cmyk.to_rgb_with(
+            &dark,
+            ColorParams {
+                intent: Intent::Perceptual,
+                bpc: true,
+            },
+        ));
+        let no_bpc = bytes(cmyk.to_rgb_with(
+            &dark,
+            ColorParams {
+                intent: Intent::RelativeColorimetric,
+                bpc: false,
+            },
+        ));
+        assert!(within_one(default, [34, 31, 31]), "{default:?}");
+        assert!(within_one(no_bpc, [55, 52, 53]), "{no_bpc:?}");
+        assert!(within_one(perceptual, [43, 40, 41]), "{perceptual:?}");
+    }
+
+    #[test]
+    fn gray_image_bytes_match_gray_fills() {
+        // An 8-bit DeviceGray sample converts like the fill of the same
+        // value, through the 33-point link.
+        let gray = ColorSpace::gray();
+        let defaults = DefaultSpaces::none();
+        let mut pixmap = PixmapConversion::new(&defaults);
+        for sample in [0u8, 1, 51, 100, 128, 200, 254, 255] {
+            let image = pixmap.rgb(&gray, &[sample], ColorParams::DEFAULT);
+            let fill = bytes(gray.to_rgb(&[f32::from(sample) / 255.0]));
+            assert!(
+                within_one(image, fill),
+                "{sample}: image {image:?} fill {fill:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_spaces_replace_only_device_spaces() {
+        let srgb_matrix = [
+            0.4124, 0.2126, 0.0193, 0.3576, 0.7152, 0.1192, 0.1805, 0.0722, 0.9505,
+        ];
+        let cal = Arc::new(
+            cal_space("CalRGB", [0.9505, 1.0, 1.089], &[1.0; 3], Some(srgb_matrix))
+                .expect("CalRGB profile"),
+        );
+        let spaces = DefaultSpaces {
+            gray: None,
+            rgb: Some(cal.clone()),
+            cmyk: None,
+            key: 1,
+        };
+        let device = ColorSpace::rgb();
+        assert!(std::ptr::eq(spaces.substitute(&device), &*cal));
+        let converted = ColorSpace::srgb();
+        assert!(std::ptr::eq(spaces.substitute(&converted), &*converted));
+        let gray = ColorSpace::gray();
+        assert!(std::ptr::eq(spaces.substitute(&gray), &*gray));
+        // Linear CalRGB mid-grey is lighter than the sRGB byte it replaces.
+        let mid = bytes(spaces.substitute(&device).to_rgb(&[0.5, 0.5, 0.5]));
+        assert!(mid[0] > 180, "{mid:?}");
     }
 }
