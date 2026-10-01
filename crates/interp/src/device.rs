@@ -331,6 +331,8 @@ pub struct Glyph {
     /// origin is `(trm.e, trm.f)`. Text state, advances, and matrix arithmetic
     /// use float32 precision; published coordinates are widened to f64.
     pub trm: Matrix,
+    /// Glyph space → user space, before CTM and page transforms.
+    pub user_trm: Matrix,
     /// MuPDF's `fz_advance_glyph`: the font program's advance in em (the
     /// PDF widths for substituted, non-embedded fonts).
     pub advance: f64,

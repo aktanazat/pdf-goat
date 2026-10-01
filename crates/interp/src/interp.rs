@@ -1253,7 +1253,8 @@ impl<'r, 'd> Engine<'r, 'd> {
                         tsm.f = (y as f32 * ts.size).mul_add(-0.001, tsm.f);
                         w as f32 * 0.001
                     };
-                    let trm = tsm.concat(self.tm).concat(ctm);
+                    let user_trm = tsm.concat(self.tm);
+                    let trm = user_trm.concat(ctm);
                     let unicode = font.unicode(code.code, cid);
                     self.bidi = bidi_level(unicode.first(), self.bidi);
                     let glyph = Glyph {
@@ -1262,6 +1263,7 @@ impl<'r, 'd> Engine<'r, 'd> {
                         gid,
                         unicode,
                         trm: trm.into(),
+                        user_trm: user_trm.into(),
                         advance: font.advance_glyph(gid, wmode),
                         width: width.into(),
                         quad: trm.quad(
@@ -1279,10 +1281,14 @@ impl<'r, 'd> Engine<'r, 'd> {
                             byte_len: code.len,
                         },
                     };
-                    if mode >= 4
-                        && let Some(path) = font.glyph_path(gid)
-                    {
-                        self.text_clip.append_transformed(&path, &glyph.trm);
+                    if mode >= 4 {
+                        match font.glyph_path(gid) {
+                            Some(path) => self.text_clip.append_transformed(&path, &glyph.trm),
+                            // A glyph without an outline still takes part in
+                            // the clip (as nothing), so the clip is pushed at
+                            // ET and shuts out later paint, as in MuPDF.
+                            None => self.text_clip.move_to(Point::new(glyph.trm.e, glyph.trm.f)),
+                        }
                     }
                     glyphs.push(glyph);
                     if wmode == 0 {

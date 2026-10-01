@@ -18,8 +18,40 @@ fn transform(m: Matrix) -> raster::Transform {
     raster::Transform::new(m.a, m.b, m.c, m.d, m.e, m.f)
 }
 
-fn rect(r: Rect) -> raster::Rect {
-    raster::Rect::new(r.x0, r.y0, r.x1, r.y1)
+/// MuPDF 1.27.2 geometry.c `fz_transform_rect` (AGPL-3.0).
+/// Bounds must round in the same float precision as the painted geometry.
+fn rect(r: Rect, m: Matrix) -> raster::Rect {
+    if r.is_empty() {
+        return raster::Rect::new(0.0, 0.0, 0.0, 0.0);
+    }
+    let [a, b, c, d, e, f] = [m.a, m.b, m.c, m.d, m.e, m.f].map(|v| v as f32);
+    let point = |x: f64, y: f64| {
+        let (x, y) = (x as f32, y as f32);
+        [x.mul_add(a, y * c) + e, x.mul_add(b, y * d) + f]
+    };
+    let (p, q) = (point(r.x0, r.y0), point(r.x1, r.y1));
+    let mut bounds = [
+        p[0].min(q[0]),
+        p[1].min(q[1]),
+        p[0].max(q[0]),
+        p[1].max(q[1]),
+    ];
+    let axis = (b.abs() < f32::EPSILON && c.abs() < f32::EPSILON)
+        || (a.abs() < f32::EPSILON && d.abs() < f32::EPSILON);
+    if !axis {
+        for p in [point(r.x0, r.y1), point(r.x1, r.y0)] {
+            bounds[0] = bounds[0].min(p[0]);
+            bounds[1] = bounds[1].min(p[1]);
+            bounds[2] = bounds[2].max(p[0]);
+            bounds[3] = bounds[3].max(p[1]);
+        }
+    }
+    raster::Rect::new(
+        bounds[0].into(),
+        bounds[1].into(),
+        bounds[2].into(),
+        bounds[3].into(),
+    )
 }
 
 fn path(source: &interp::Path) -> raster::Path {
@@ -36,6 +68,55 @@ fn path(source: &interp::Path) -> raster::Path {
                 out.cubic_to(a.x, a.y, b.x, b.y, p.x, p.y);
             }
             interp::PathEl::Close => {
+                out.close();
+            }
+        }
+    }
+    out.finish()
+}
+
+/// A glyph program's outline in font units, quadratics kept, with the
+/// matrix to one-em glyph space.
+pub(crate) struct Outline {
+    pub(crate) units: raster::Path,
+    pub(crate) to_em: raster::Transform,
+    pub(crate) font: Arc<pdf_font::Font>,
+    pub(crate) gid: u16,
+}
+
+fn glyph_outline(outline: &interp::GlyphOutline) -> Outline {
+    Outline {
+        units: glyph_path(&outline.ops),
+        to_em: transform(outline.to_em),
+        font: Arc::clone(&outline.font),
+        gid: outline.gid,
+    }
+}
+
+fn glyph_path(ops: &[interp::GlyphOp]) -> raster::Path {
+    let mut out = raster::PathBuilder::new();
+    for op in ops {
+        match *op {
+            interp::GlyphOp::MoveTo(x, y) => {
+                out.move_to(f64::from(x), f64::from(y));
+            }
+            interp::GlyphOp::LineTo(x, y) => {
+                out.line_to(f64::from(x), f64::from(y));
+            }
+            interp::GlyphOp::QuadTo(cx, cy, x, y) => {
+                out.quad_to(f64::from(cx), f64::from(cy), f64::from(x), f64::from(y));
+            }
+            interp::GlyphOp::CurveTo(x1, y1, x2, y2, x, y) => {
+                out.cubic_to(
+                    f64::from(x1),
+                    f64::from(y1),
+                    f64::from(x2),
+                    f64::from(y2),
+                    f64::from(x),
+                    f64::from(y),
+                );
+            }
+            interp::GlyphOp::Close => {
                 out.close();
             }
         }
@@ -103,11 +184,12 @@ struct Group {
 
 pub(crate) struct RasterDevice {
     canvas: raster::Canvas,
-    post: Matrix,
     draw_text: bool,
     depth: usize,
     error: Option<RenderError>,
-    glyphs: HashMap<(u64, u32), Arc<raster::Path>>,
+    glyphs: HashMap<(u64, u32), Arc<Outline>>,
+    glyph_cache: raster::GlyphCache,
+    native_glyphs: Option<crate::glyph::Glyphs>,
     masks: HashMap<u64, Arc<raster::Mask>>,
     mask_bytes: usize,
     groups: Vec<Group>,
@@ -123,34 +205,64 @@ impl RasterDevice {
         alpha: bool,
         draw_text: bool,
     ) -> Result<Self, RenderError> {
-        let mut canvas = raster::Canvas::new(width, height)?;
+        Self::new_at(raster::IntRect::from_size(width, height), alpha, draw_text)
+    }
+
+    fn new_at(bounds: raster::IntRect, alpha: bool, draw_text: bool) -> Result<Self, RenderError> {
+        let mut canvas = raster::Canvas::new_at(bounds)?;
         if !alpha {
             canvas.clear(raster::Color::WHITE);
         }
         Ok(Self {
             canvas,
-            post: Matrix::IDENTITY,
             draw_text,
             depth: 0,
             error: None,
             glyphs: HashMap::new(),
+            glyph_cache: raster::GlyphCache::new(),
+            native_glyphs: None,
             masks: HashMap::new(),
             mask_bytes: 0,
             groups: Vec::new(),
             cell_scissor: false,
         })
     }
+    fn native_glyphs(&mut self) -> Result<&mut crate::glyph::Glyphs, RenderError> {
+        if self.native_glyphs.is_none() {
+            self.native_glyphs = Some(crate::glyph::Glyphs::new()?);
+        }
+        Ok(self.native_glyphs.as_mut().expect("initialized above"))
+    }
 
-    fn child(&self, width: u32, height: u32, post: Matrix) -> Result<Self, RenderError> {
+    fn paint_glyph(
+        &mut self,
+        brush: interp::Brush<'_>,
+        bitmap: raster::Glyph,
+    ) -> Result<(), RenderError> {
+        let r = bitmap.mask.rect();
+        let placed = raster::IntRect::new(
+            r.x0.saturating_add(bitmap.x),
+            r.y0.saturating_add(bitmap.y),
+            r.x1.saturating_add(bitmap.x),
+            r.y1.saturating_add(bitmap.y),
+        );
+        self.paint(
+            brush,
+            |canvas| placed.intersect(&canvas.clip_bounds()),
+            |canvas, paint| canvas.fill_mask_at(&bitmap.mask, bitmap.x, bitmap.y, paint),
+        )
+    }
+
+    fn child(&self, bounds: raster::IntRect) -> Result<Self, RenderError> {
         let depth = self.depth + self.groups.len() + 1;
         if depth > MAX_NESTING
-            || u64::from(width) * u64::from(height) * 4 * (depth as u64 + 1) > MAX_LAYER_BYTES
+            || u64::from(bounds.width()) * u64::from(bounds.height()) * 4 * (depth as u64 + 1)
+                > MAX_LAYER_BYTES
         {
             return Err(limit("rendering layers exceed the memory limit"));
         }
-        let mut child = Self::new(width, height, true, true)?;
+        let mut child = Self::new_at(bounds, true, true)?;
         child.depth = depth;
-        child.post = post;
         Ok(child)
     }
 
@@ -175,7 +287,8 @@ impl RasterDevice {
         if let Some(cached) = self.masks.get(&mask.key) {
             return Ok(Some(Arc::clone(cached)));
         }
-        let mut device = self.child(self.canvas.width(), self.canvas.height(), self.post)?;
+        let bounds = self.canvas.bounds();
+        let mut device = self.child(bounds)?;
         if mask.luminosity {
             device.canvas.clear(raster::Color::rgb(
                 mask.backdrop[0],
@@ -194,6 +307,7 @@ impl RasterDevice {
         } else {
             raster::Mask::from_alpha(&pixmap)
         };
+        coverage.translate(bounds.x0, bounds.y0);
         if let Some(lut) = &mask.transfer {
             coverage.map_values(lut);
         }
@@ -227,16 +341,16 @@ impl RasterDevice {
                 draw(&mut self.canvas, &paint);
             }
             interp::Paint::Shading(shading) => {
-                let matrix = shading.matrix.concat(&self.post);
+                let matrix = shading.matrix;
                 let shape = shape(&mut self.canvas);
                 self.shade(&shading.shading, matrix, composite, Some(shape), draw)?;
             }
             interp::Paint::Tiling(tile) => {
-                let matrix = tile.matrix.concat(&self.post);
+                let matrix = tile.matrix;
                 let Some(inverse) = matrix.invert() else {
                     return Ok(());
                 };
-                let bounds = rect(tile.bbox.transform(&matrix)).round_out();
+                let bounds = rect(tile.bbox, matrix).round_out();
                 if bounds.is_empty() {
                     return Ok(());
                 }
@@ -249,9 +363,7 @@ impl RasterDevice {
                 {
                     return Err(limit("tiling pattern overlap exceeds the work limit"));
                 }
-                let origin = Matrix::translate(-f64::from(bounds.x0), -f64::from(bounds.y0));
-                let mut image =
-                    self.child(bounds.width(), bounds.height(), self.post.concat(&origin))?;
+                let mut image = self.child(bounds)?;
                 image.cell_scissor = true;
                 tile.run_cell(&mut image)?;
                 let pixmap = image.finish()?;
@@ -301,9 +413,7 @@ impl RasterDevice {
         if let Some(shape) = shape {
             scissor = scissor.intersect(&shape);
         }
-        let bound = shading
-            .bound()
-            .map(|bound| rect(bound.transform(&matrix)).round_out());
+        let bound = shading.bound().map(|bound| rect(bound, matrix).round_out());
         if let Some(bound) = bound
             && (shape.is_some() || self.canvas.clip_depth() > 0)
         {
@@ -418,26 +528,22 @@ impl interp::Device for RasterDevice {
     fn fill_path(&mut self, source: &interp::Path, event: &interp::FillEvent<'_>) {
         self.apply(|this| {
             let path = path(source);
-            let ctm = transform(event.ctm.concat(&this.post));
+            let ctm = transform(event.ctm);
             // MuPDF paints a pattern through the fill path as a clip, and a
             // rectangular clip is a whole-pixel scissor.
             let scissor = match event.brush.paint {
                 interp::Paint::Color(_) => None,
-                _ => path.transform(&ctm).as_rect().map(rect_scissor),
+                _ => this.canvas.fill_scissor(&path, &ctm),
             };
-            let style = raster::FillStyle {
-                rule: rule(event.rule),
-                thin_line: true,
-            };
+            let rule = rule(event.rule);
             this.paint(
                 event.brush,
-                |canvas| match scissor {
-                    Some(rect) => rect.round_out().intersect(&canvas.clip_bounds()),
-                    None => canvas.fill_bounds(&path, &ctm),
-                },
+                |canvas| scissor.unwrap_or_else(|| canvas.fill_bounds(&path, &ctm)),
                 |canvas, paint| match scissor {
-                    Some(rect) => canvas.fill_rect(rect, &raster::Transform::IDENTITY, paint),
-                    None => canvas.fill_path(&path, &ctm, style, paint),
+                    Some(rect) => {
+                        canvas.fill_rect(rect.to_rect(), &raster::Transform::IDENTITY, paint)
+                    }
+                    None => canvas.fill_path(&path, &ctm, rule, paint),
                 },
             )
         });
@@ -446,7 +552,7 @@ impl interp::Device for RasterDevice {
     fn stroke_path(&mut self, source: &interp::Path, event: &interp::StrokeEvent<'_>) {
         self.apply(|this| {
             let path = path(source);
-            let ctm = transform(event.ctm.concat(&this.post));
+            let ctm = transform(event.ctm);
             let style = stroke(event.style);
             this.paint(
                 event.brush,
@@ -459,14 +565,11 @@ impl interp::Device for RasterDevice {
     fn clip_path(&mut self, source: &interp::Path, event: &interp::ClipEvent<'_>) {
         self.apply(|this| {
             let path = path(source);
-            let ctm = transform(event.ctm.concat(&this.post));
+            let ctm = transform(event.ctm);
             if std::mem::take(&mut this.cell_scissor) {
                 let scissor = this.canvas.fill_bounds(&path, &ctm);
                 this.canvas
                     .push_clip_rect(scissor.to_rect(), &raster::Transform::IDENTITY);
-            } else if let Some(rect) = path.transform(&ctm).as_rect() {
-                this.canvas
-                    .push_clip_rect(rect_scissor(rect), &raster::Transform::IDENTITY);
             } else {
                 this.canvas.push_clip_path(&path, &ctm, rule(event.rule));
             }
@@ -491,35 +594,56 @@ impl interp::Device for RasterDevice {
                 let outline = match this.glyphs.get(&key) {
                     Some(outline) => Arc::clone(outline),
                     None => {
-                        let Some(source) = run.font.glyph_path(glyph.gid) else {
+                        let Some(outline) = run.font.glyph_outline(glyph.gid) else {
                             continue;
                         };
-                        let outline = Arc::new(path(&source));
+                        let outline = Arc::new(glyph_outline(&outline));
                         this.glyphs.insert(key, Arc::clone(&outline));
                         outline
                     }
                 };
                 if let Some(brush) = run.fill {
-                    let ctm = transform(glyph.trm.concat(&this.post));
-                    this.paint(
-                        brush,
-                        |canvas| canvas.fill_bounds(&outline, &ctm),
-                        |canvas, paint| {
-                            canvas.fill_path(&outline, &ctm, raster::FillStyle::default(), paint)
-                        },
-                    )?;
+                    let ctm = transform(glyph.trm);
+                    // Glyphs up to MuPDF's bitmap size come from the glyph
+                    // cache at a quantised subpixel position; larger ones
+                    // are filled as paths.
+                    match this
+                        .glyph_cache
+                        .glyph(key.0, key.1, &outline.units, &outline.to_em, &ctm)
+                    {
+                        Some(bitmap) => this.paint_glyph(brush, bitmap)?,
+                        None => {
+                            let tm = transform(glyph.user_trm);
+                            let path = this.native_glyphs()?.outline(key.0, &outline, &tm)?;
+                            let ctm = transform(run.ctm);
+                            this.paint(
+                                brush,
+                                |canvas| canvas.fill_bounds(&path, &ctm),
+                                |canvas, paint| {
+                                    canvas.fill_path(&path, &ctm, raster::FillRule::NonZero, paint)
+                                },
+                            )?;
+                        }
+                    }
                 }
-                if let Some(brush) = run.stroke
-                    && let Some(inverse) = run.ctm.invert()
-                {
-                    let user_outline = outline.transform(&transform(glyph.trm.concat(&inverse)));
-                    let ctm = transform(run.ctm.concat(&this.post));
+                if let Some(brush) = run.stroke {
+                    let ctm = transform(run.ctm);
                     let style = stroke(run.stroke_style);
-                    this.paint(
-                        brush,
-                        |canvas| canvas.stroke_bounds(&user_outline, &ctm, &style),
-                        |canvas, paint| canvas.stroke_path(&user_outline, &ctm, &style, paint),
-                    )?;
+                    if style.dash.as_ref().is_none_or(|dash| dash.array.is_empty()) {
+                        let trm = transform(glyph.trm);
+                        let bitmap = this
+                            .native_glyphs()?
+                            .stroke(key.0, &outline, &trm, &ctm, &style)?;
+                        this.paint_glyph(brush, bitmap)?;
+                    } else {
+                        let tm = transform(glyph.user_trm);
+                        let path = this.native_glyphs()?.outline(key.0, &outline, &tm)?;
+                        this.paint(
+                            brush,
+                            |canvas| canvas.stroke_bounds(&path, &ctm, &style),
+                            |canvas, paint| canvas.stroke_path(&path, &ctm, &style, paint),
+                        )?;
+                    }
                 }
             }
             Ok(())
@@ -528,7 +652,7 @@ impl interp::Device for RasterDevice {
 
     fn fill_shading(&mut self, event: &interp::ShadingEvent<'_>) {
         self.apply(|this| {
-            let matrix = event.matrix.concat(&this.post);
+            let matrix = event.matrix;
             let mask = this.mask(event.soft_mask)?;
             let composite = raster::Composite {
                 alpha: event.alpha,
@@ -558,9 +682,7 @@ impl interp::Device for RasterDevice {
                 .map(|alpha| raster::MaskImage::new(alpha.width, alpha.height, &alpha.data))
                 .transpose()?;
             let mask = this.mask(event.soft_mask)?;
-            let ctm = Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 1.0)
-                .concat(&event.ctm)
-                .concat(&this.post);
+            let ctm = Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 1.0).concat(&event.ctm);
             this.canvas.draw_image(
                 &image,
                 &transform(ctm),
@@ -587,11 +709,7 @@ impl interp::Device for RasterDevice {
         self.apply(|this| {
             let pixels = event.image.decode_stencil()?;
             let mask = raster::MaskImage::new(pixels.width, pixels.height, &pixels.data)?;
-            let ctm = transform(
-                Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 1.0)
-                    .concat(&event.ctm)
-                    .concat(&this.post),
-            );
+            let ctm = transform(Matrix::new(1.0, 0.0, 0.0, -1.0, 0.0, 1.0).concat(&event.ctm));
             let filter = if event.image.interpolate() {
                 raster::Filter::Bilinear
             } else {
@@ -648,18 +766,69 @@ impl interp::Device for RasterDevice {
     }
 }
 
-/// The whole-pixel scissor MuPDF uses instead of a mask for an axis-aligned
-/// rectangular clip: the rectangle's edges land on its rasteriser's 17 × 15
-/// antialiasing subsample grid (truncated), and the pixel bounds round out
-/// from there.
-fn rect_scissor(rect: raster::Rect) -> raster::Rect {
-    fn outward(lo: f64, hi: f64, samples: f64) -> (f64, f64) {
-        (
-            ((lo * samples).floor() / samples).floor(),
-            ((hi * samples).floor() / samples).ceil(),
-        )
+#[cfg(test)]
+mod tests {
+    use pdf_core::{Dict, Document, Name, Rect, Stream};
+    use pdf_interp::{Interpreter, RunOptions};
+
+    use super::RasterDevice;
+
+    /// Renders `content` with Helvetica as `/F` and returns the number of
+    /// glyph bitmaps that were rasterized.
+    fn glyph_renders(content: &[u8]) -> u64 {
+        let mut doc = Document::new();
+        let page = doc
+            .insert_blank_page(0, Rect::new(0.0, 0.0, 200.0, 40.0))
+            .unwrap();
+        let mut font = Dict::new();
+        font.insert("Type", Name::from("Font"));
+        font.insert("Subtype", Name::from("Type1"));
+        font.insert("BaseFont", Name::from("Helvetica"));
+        let mut fonts = Dict::new();
+        fonts.insert("F", font);
+        let mut resources = Dict::new();
+        resources.insert("Font", fonts);
+        let content = doc.add(Stream::new(Dict::new(), content.to_vec()));
+        let mut dict = doc.get(page).unwrap().as_dict().unwrap().clone();
+        dict.insert("Contents", content);
+        dict.insert("Resources", resources);
+        doc.set(page, dict);
+        let mut device = RasterDevice::new(200, 40, false, true).unwrap();
+        Interpreter::new()
+            .run_page(
+                &doc,
+                &doc.page(0).unwrap(),
+                &mut device,
+                &RunOptions::default(),
+            )
+            .unwrap();
+        assert!(device.error.is_none());
+        device.glyph_cache.renders()
     }
-    let (x0, x1) = outward(rect.x0, rect.x1, 17.0);
-    let (y0, y1) = outward(rect.y0, rect.y1, 15.0);
-    raster::Rect::new(x0, y0, x1, y1)
+
+    /// The same glyph at the same size and subpixel phase is rasterized once
+    /// per page, however many times it is drawn.
+    #[test]
+    fn repeated_glyphs_share_one_bitmap() {
+        let mut content = b"BT /F 12 Tf ".to_vec();
+        for i in 0..40 {
+            content.extend_from_slice(format!("1 0 0 1 {} 20 Tm (H) Tj ", 4 * i).as_bytes());
+        }
+        content.extend_from_slice(b"ET");
+        assert_eq!(glyph_renders(&content), 1);
+    }
+
+    /// Quarter-pixel phases along the baseline are distinct bitmaps (text
+    /// under 24 px), so four phases of one glyph rasterize four times.
+    #[test]
+    fn subpixel_phases_are_separate_bitmaps() {
+        assert_eq!(
+            glyph_renders(
+                b"BT /F 12 Tf 1 0 0 1 10 20 Tm (H) Tj 1 0 0 1 20.25 20 Tm (H) Tj \
+                  1 0 0 1 30.5 20 Tm (H) Tj 1 0 0 1 40.75 20 Tm (H) Tj \
+                  1 0 0 1 50 20 Tm (H) Tj 1 0 0 1 60.25 20 Tm (H) Tj ET"
+            ),
+            4
+        );
+    }
 }

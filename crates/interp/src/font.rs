@@ -34,7 +34,7 @@ pub struct FontFlags {
 #[derive(Debug)]
 enum Program {
     Face(Arc<Font>),
-    Base14(Standard14, Option<Arc<Font>>),
+    Base14(Standard14, Arc<Font>),
     Type3,
 }
 
@@ -44,6 +44,18 @@ enum Charmap {
     Builtin(Box<[u32; 256]>),
     Names,
     Sfnt(u16, u16),
+}
+
+/// A glyph program's outline in its own units and the matrix to one-em
+/// glyph space.
+#[derive(Clone, Debug)]
+pub struct GlyphOutline {
+    pub ops: Vec<PathOp>,
+    pub to_em: Matrix,
+    /// Shared original program and its actual glyph id, for hinted outlines
+    /// and font-specific stroke rendering.
+    pub font: Arc<Font>,
+    pub gid: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -178,17 +190,32 @@ impl PdfFont {
         self.type3_matrix
     }
 
-    /// Outline in one-em glyph space, including substitute-font width adjustment.
-    pub fn glyph_path(&self, gid: u32) -> Option<Path> {
-        let (face, real_gid, matrix) = self.outline_mapping(gid)?;
+    /// The glyph program's outline in font units, with the matrix that
+    /// maps it to one-em glyph space (the font matrix and the substitute
+    /// width adjustment). TrueType quadratics stay quadratics, so a
+    /// rasterizer can walk them the way FreeType does.
+    pub fn glyph_outline(&self, gid: u32) -> Option<GlyphOutline> {
+        let (face, real_gid, to_em) = self.outline_mapping(gid)?;
         let outline = face.outline(real_gid).ok()?;
         if outline.is_empty() {
             return None;
         }
+        Some(GlyphOutline {
+            ops: outline.ops().to_vec(),
+            to_em,
+            font: Arc::clone(face),
+            gid: real_gid,
+        })
+    }
+
+    /// Outline in one-em glyph space, including substitute-font width
+    /// adjustment, as a cubic path.
+    pub fn glyph_path(&self, gid: u32) -> Option<Path> {
+        let GlyphOutline { ops, to_em, .. } = self.glyph_outline(gid)?;
         let mut path = Path::new();
-        for op in outline.ops() {
-            let p = |x: f32, y: f32| Point::new(f64::from(x), f64::from(y)).transform(&matrix);
-            match *op {
+        let p = |x: f32, y: f32| Point::new(f64::from(x), f64::from(y)).transform(&to_em);
+        for op in ops {
+            match op {
                 PathOp::MoveTo(x, y) => path.move_to(p(x, y)),
                 PathOp::LineTo(x, y) => path.line_to(p(x, y)),
                 PathOp::QuadTo(cx, cy, x, y) => {
@@ -246,14 +273,14 @@ impl PdfFont {
         Some(rect)
     }
 
-    fn outline_mapping(&self, gid: u32) -> Option<(&Font, u16, Matrix)> {
+    fn outline_mapping(&self, gid: u32) -> Option<(&Arc<Font>, u16, Matrix)> {
         let (face, real_gid, target) = match &self.program {
             Program::Face(face) => (
                 face,
                 face_gid(face, gid)?,
                 self.stretch.then(|| self.stretched_width(gid)),
             ),
-            Program::Base14(base, Some(face)) => {
+            Program::Base14(base, face) => {
                 let name = base_name(*base, gid)?;
                 let real_gid = face.glyph_by_name(name).or_else(|| {
                     let c = if *base == Standard14::ZapfDingbats {
@@ -1032,7 +1059,6 @@ fn set_face(font: &mut PdfFont, face: Arc<Font>) {
 
 fn builtin(font: &mut PdfFont, base: Standard14) {
     let name = base.name();
-    let m = base.metrics();
     font.flags = FontFlags {
         mono: name.starts_with("Courier"),
         serif: name.starts_with("Times"),
@@ -1061,18 +1087,34 @@ fn builtin(font: &mut PdfFont, base: Standard14) {
     font.ascender = a;
     font.descender = d;
     font.bbox = Rect::new(b[0], b[1], b[2], b[3]);
-    static FACES: [OnceLock<Option<Arc<Font>>>; 14] = [const { OnceLock::new() }; 14];
+    // Unmodified URW CFF programs from MuPDF 1.27.2 resources/fonts/urw.
+    // Copyright 2016 (URW)++ Design & Development, SIL OFL 1.1; see fonts/OFL.txt.
+    // Bundling the same outlines makes Standard 14 rendering independent
+    // of which substitute fonts happen to be installed on the host.
+    static FACES: [OnceLock<Arc<Font>>; 14] = [const { OnceLock::new() }; 14];
     let shape = FACES[base as usize]
         .get_or_init(|| {
-            FontLocator::system()
-                .find(&FontRequest {
-                    base_font: name,
-                    flags: m.flags,
-                    weight: None,
-                    script: Script::Latin,
-                })
-                .and_then(|s| s.load().ok())
-                .map(Arc::new)
+            let bytes: &[u8] = match base {
+                Standard14::Courier => include_bytes!("fonts/NimbusMonoPS-Regular.cff"),
+                Standard14::CourierBold => include_bytes!("fonts/NimbusMonoPS-Bold.cff"),
+                Standard14::CourierBoldOblique => {
+                    include_bytes!("fonts/NimbusMonoPS-BoldItalic.cff")
+                }
+                Standard14::CourierOblique => include_bytes!("fonts/NimbusMonoPS-Italic.cff"),
+                Standard14::Helvetica => include_bytes!("fonts/NimbusSans-Regular.cff"),
+                Standard14::HelveticaBold => include_bytes!("fonts/NimbusSans-Bold.cff"),
+                Standard14::HelveticaBoldOblique => {
+                    include_bytes!("fonts/NimbusSans-BoldItalic.cff")
+                }
+                Standard14::HelveticaOblique => include_bytes!("fonts/NimbusSans-Italic.cff"),
+                Standard14::Symbol => include_bytes!("fonts/StandardSymbolsPS.cff"),
+                Standard14::TimesBold => include_bytes!("fonts/NimbusRoman-Bold.cff"),
+                Standard14::TimesBoldItalic => include_bytes!("fonts/NimbusRoman-BoldItalic.cff"),
+                Standard14::TimesItalic => include_bytes!("fonts/NimbusRoman-Italic.cff"),
+                Standard14::TimesRoman => include_bytes!("fonts/NimbusRoman-Regular.cff"),
+                Standard14::ZapfDingbats => include_bytes!("fonts/Dingbats.cff"),
+            };
+            Arc::new(Font::parse(bytes.to_vec()).expect("bundled Standard 14 font"))
         })
         .clone();
     font.program = Program::Base14(base, shape);

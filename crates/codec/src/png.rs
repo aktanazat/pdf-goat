@@ -4,6 +4,10 @@
 
 use crate::error::{CodecError, Result, check_dimensions};
 use crate::image::{DecodedImage, PixelLayout, check_len, row_stride};
+use miniz_oxide::deflate::core::{
+    CompressorOxide, TDEFLFlush, TDEFLStatus, compress,
+    deflate_flags::{TDEFL_GREEDY_PARSING_FLAG, TDEFL_WRITE_ZLIB_HEADER},
+};
 
 const CODEC: &str = "png";
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
@@ -517,6 +521,15 @@ impl PngColor {
     }
 }
 
+/// Deflate effort for `encode_png`: greedy parsing with 192 hash-chain probes.
+/// Measured on text, dense-vector, photo, smooth-gradient and mixed pages at
+/// 144 and 300 dpi, this is the fastest miniz setting whose output stays
+/// within 2% of level 6 (lazy parsing, 128 probes) on every page kind: fewer
+/// probes grow smooth gradients by 4–19%, and lazy parsing with fewer probes
+/// grows them by 5–27%, because the sparse non-zero residuals of filtered
+/// gradient rows need deep chains to reach the previous row's pattern.
+const DEFLATE_FLAGS: u32 = 192 | TDEFL_WRITE_ZLIB_HEADER | TDEFL_GREEDY_PARSING_FLAG;
+
 /// Encodes packed rows as a non-interlaced PNG, with adaptive per-row
 /// filtering and an optional `pHYs` chunk from `dpi`.
 pub fn encode_png(
@@ -561,7 +574,7 @@ pub fn encode_png(
         }
         prev.copy_from_slice(row);
     }
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
+    let compressed = deflate_zlib(&raw);
 
     let mut out = Vec::with_capacity(compressed.len() + 128);
     out.extend_from_slice(&SIGNATURE);
@@ -583,19 +596,78 @@ pub fn encode_png(
     Ok(out)
 }
 
+/// Compresses `raw` as a zlib stream with [`DEFLATE_FLAGS`]; the same loop as
+/// `miniz_oxide::deflate::compress_to_vec_zlib`, which only exposes the
+/// numbered levels.
+fn deflate_zlib(raw: &[u8]) -> Vec<u8> {
+    let mut compressor = CompressorOxide::new(DEFLATE_FLAGS);
+    let mut out = vec![0u8; (raw.len() / 2).max(64)];
+    let mut input = raw;
+    let mut out_pos = 0;
+    loop {
+        let (status, consumed, produced) = compress(
+            &mut compressor,
+            input,
+            &mut out[out_pos..],
+            TDEFLFlush::Finish,
+        );
+        input = &input[consumed..];
+        out_pos += produced;
+        match status {
+            TDEFLStatus::Done => {
+                out.truncate(out_pos);
+                return out;
+            }
+            TDEFLStatus::Okay => {
+                if out.len() - out_pos < 64 {
+                    out.resize(out.len() * 2, 0);
+                }
+            }
+            // Only a reused compressor or a failed output callback reports
+            // these; this compressor is fresh and writes to a slice.
+            TDEFLStatus::BadParam | TDEFLStatus::PutBufFailed => {
+                unreachable!("miniz_oxide compress with Finish into a growing buffer failed")
+            }
+        }
+    }
+}
+
+/// Writes the filtered row for PNG filter `kind` into `out`. Each filter is
+/// its own loop over the row: one `match` per row instead of per byte, and
+/// the first `bpp` bytes (whose left neighbours are zero) are peeled off so
+/// the main loops have no bounds branches.
 fn apply_filter(kind: u8, row: &[u8], prev: &[u8], bpp: usize, out: &mut [u8]) {
-    for i in 0..row.len() {
-        let a = if i >= bpp { row[i - bpp] } else { 0 };
-        let b = prev[i];
-        let c = if i >= bpp { prev[i - bpp] } else { 0 };
-        let pred = match kind {
-            0 => 0,
-            1 => a,
-            2 => b,
-            3 => ((u16::from(a) + u16::from(b)) / 2) as u8,
-            _ => paeth(a, b, c),
-        };
-        out[i] = row[i].wrapping_sub(pred);
+    match kind {
+        0 => out.copy_from_slice(row),
+        1 => {
+            out[..bpp].copy_from_slice(&row[..bpp]);
+            for i in bpp..row.len() {
+                out[i] = row[i].wrapping_sub(row[i - bpp]);
+            }
+        }
+        2 => {
+            for ((o, &r), &p) in out.iter_mut().zip(row).zip(prev) {
+                *o = r.wrapping_sub(p);
+            }
+        }
+        3 => {
+            for i in 0..bpp {
+                out[i] = row[i].wrapping_sub(prev[i] / 2);
+            }
+            for i in bpp..row.len() {
+                let avg = ((u16::from(row[i - bpp]) + u16::from(prev[i])) / 2) as u8;
+                out[i] = row[i].wrapping_sub(avg);
+            }
+        }
+        _ => {
+            // paeth(0, b, 0) is b.
+            for i in 0..bpp {
+                out[i] = row[i].wrapping_sub(prev[i]);
+            }
+            for i in bpp..row.len() {
+                out[i] = row[i].wrapping_sub(paeth(row[i - bpp], prev[i], prev[i - bpp]));
+            }
+        }
     }
 }
 
@@ -609,6 +681,26 @@ fn write_chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
     out.extend_from_slice(&crc.finish().to_be_bytes());
 }
 
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut n = 0;
+    while n < 256 {
+        let mut c = n as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 == 1 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        table[n] = c;
+        n += 1;
+    }
+    table
+};
+
 struct Crc32(u32);
 
 impl Crc32 {
@@ -618,15 +710,7 @@ impl Crc32 {
 
     fn update(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            let mut c = self.0 ^ u32::from(b);
-            for _ in 0..8 {
-                c = if c & 1 == 1 {
-                    0xEDB8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-            }
-            self.0 = c;
+            self.0 = CRC_TABLE[((self.0 ^ u32::from(b)) & 0xFF) as usize] ^ (self.0 >> 8);
         }
     }
 
@@ -721,5 +805,45 @@ mod tests {
         let mut crc = Crc32::new();
         crc.update(b"IEND");
         assert_eq!(crc.finish(), 0xAE42_6082);
+    }
+
+    /// A page-like RGB image: flat margin, a smooth diagonal gradient, LCG
+    /// noise and anti-aliased diagonal lines, so every filter kind is chosen
+    /// somewhere. The encoded length pins the deflate effort
+    /// ([`DEFLATE_FLAGS`]) and the filter heuristic together: level 6
+    /// (the previous setting) encodes it to 13_081 bytes.
+    #[test]
+    fn encoded_size_pins_deflate_effort_and_filter_choice() {
+        let (w, h) = (128u32, 128u32);
+        let mut data = vec![255u8; w as usize * h as usize * 3];
+        let mut seed = 0x1234_5678u32;
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let px = &mut data[(y * w as usize + x) * 3..][..3];
+                match (x < 64, y < 64) {
+                    (true, true) => {
+                        let t = (x + y) as u8;
+                        px.copy_from_slice(&[240 - t, 80 + t, 30 + t / 2]);
+                    }
+                    (false, true) => {
+                        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        px.copy_from_slice(&(seed >> 8).to_le_bytes()[..3]);
+                    }
+                    (true, false) => {
+                        let d = (x + y) % 16;
+                        let v = match d {
+                            0 => 0,
+                            1 | 15 => 128,
+                            _ => 255,
+                        };
+                        px.copy_from_slice(&[v, v, v]);
+                    }
+                    (false, false) => {}
+                }
+            }
+        }
+        let png = encode_png(&data, w, h, PngColor::Rgb, None).unwrap();
+        assert_eq!(decode_png(&png).unwrap().data, data);
+        assert_eq!(png.len(), 13_119);
     }
 }

@@ -105,14 +105,19 @@ impl Color {
         )
     }
 
-    /// Premultiplied RGBA8: `round(255 * a)` and `round(255 * c * a)`.
+    /// Straight RGB bytes, `trunc(255 * c)` like MuPDF's `colorfv * 255`.
+    pub fn to_rgb8(self) -> [u8; 3] {
+        [color_byte(self.r), color_byte(self.g), color_byte(self.b)]
+    }
+
+    /// Premultiplied RGBA8: `trunc(255 * a)` and `trunc(255 * c * a)`.
     pub fn to_premultiplied(self) -> [u8; 4] {
         let a = unit(self.a);
         [
-            to_u8(unit(self.r) * a),
-            to_u8(unit(self.g) * a),
-            to_u8(unit(self.b) * a),
-            to_u8(a),
+            color_byte(unit(self.r) * a),
+            color_byte(unit(self.g) * a),
+            color_byte(unit(self.b) * a),
+            color_byte(a),
         ]
     }
 }
@@ -124,6 +129,12 @@ pub(crate) fn unit(v: f32) -> f32 {
 /// `round(v * 255)` for `v` in `0..=1`.
 pub(crate) fn to_u8(v: f32) -> u8 {
     (unit(v) * 255.0 + 0.5) as u8
+}
+
+/// MuPDF's conversion of colour components and constant alpha to bytes.
+#[inline]
+pub(crate) fn color_byte(v: f32) -> u8 {
+    (unit(v) * 255.0) as u8
 }
 
 /// `round(a * b / 255)`, exact for all byte inputs.

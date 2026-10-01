@@ -1,8 +1,8 @@
 //! Pixel-exact contract tests through the public drawing API.
 
 use pdf_raster::{
-    BlendMode, Canvas, Color, Composite, Dash, FillRule, FillStyle, Filter, Image, ImageFormat,
-    ImageOptions, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform,
+    BlendMode, Canvas, Color, Composite, Dash, FillRule, Filter, Image, ImageFormat, ImageOptions,
+    IntRect, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform,
 };
 
 const ID: Transform = Transform::IDENTITY;
@@ -57,14 +57,51 @@ fn rect_with_integer_edges_covers_exactly_its_pixels() {
 }
 
 #[test]
-fn rect_with_half_pixel_edges_gives_half_and_quarter_coverage() {
+fn fractional_edges_count_covered_subsamples_of_the_17_by_15_grid() {
     let p = filled(10, 8, Rect::new(2.5, 3.0, 6.0, 5.5));
-    // 0.5 coverage rounds to 128, the 0.25 corner to 64.
+    // As in MuPDF, coverage is the number of covered subsamples on a 17 × 15
+    // grid, 255 for a full pixel. x = 2.5 lands on column ⌊2.5 · 17⌋ = 42,
+    // so pixel 2 keeps 51 − 42 = 9 of its 17 columns; y = 5.5 lands on row
+    // ⌊5.5 · 15⌋ = 82, so row 5 keeps 82 − 75 = 7 of its 15 rows.
+    // MuPDF's solid-span alpha is (255 * E(coverage)) >> 8, where
+    // E(v)=v+(v>>7): counts 135,63,119 become alpha 135,62,118.
     assert_eq!(alpha_row(&p, 2), vec![0; 10]);
-    assert_eq!(alpha_row(&p, 3), vec![0, 0, 128, 255, 255, 255, 0, 0, 0, 0]);
-    assert_eq!(alpha_row(&p, 4), vec![0, 0, 128, 255, 255, 255, 0, 0, 0, 0]);
-    assert_eq!(alpha_row(&p, 5), vec![0, 0, 64, 128, 128, 128, 0, 0, 0, 0]);
+    assert_eq!(alpha_row(&p, 3), vec![0, 0, 135, 255, 255, 255, 0, 0, 0, 0]);
+    assert_eq!(alpha_row(&p, 4), vec![0, 0, 135, 255, 255, 255, 0, 0, 0, 0]);
+    assert_eq!(alpha_row(&p, 5), vec![0, 0, 62, 118, 118, 118, 0, 0, 0, 0]);
     assert_eq!(alpha_row(&p, 6), vec![0; 10]);
+}
+
+#[test]
+fn diagonal_edge_steps_the_subsample_grid_like_mupdf() {
+    // The hypotenuse is y = x; everything left of it is inside. On the
+    // 17 × 15 grid the edge crosses sub-scanline j of a diagonal pixel at
+    // column ⌈17 j / 15⌉, so the pixel holds Σ ⌈17 j / 15⌉ (j < 15) = 126
+    // subsamples; the solid-span alpha is (255*126)>>8 = 125.
+    let tri = polyline(&[(0.0, 0.0), (8.0, 8.0), (0.0, 8.0)], true);
+    let mut c = Canvas::new(8, 8).unwrap();
+    c.fill_path(&tri, &ID, FillRule::NonZero, &black());
+    assert_eq!(alpha_rows(&c.finish()), diagonal_triangle(8));
+}
+
+/// Alpha rows of the `size`-pixel triangle left of `y = x` as the gel
+/// paints it: coverage 126 becomes alpha (255*126)>>8 = 125 on the diagonal.
+fn diagonal_triangle(size: u32) -> Vec<Vec<u8>> {
+    (0..size)
+        .map(|y| {
+            (0..size)
+                .map(|x| match x.cmp(&y) {
+                    std::cmp::Ordering::Less => 255,
+                    std::cmp::Ordering::Equal => 125,
+                    std::cmp::Ordering::Greater => 0,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn alpha_rows(p: &Pixmap) -> Vec<Vec<u8>> {
+    (0..p.height()).map(|y| alpha_row(p, y)).collect()
 }
 
 fn pentagram(cx: f64, cy: f64, r: f64) -> Path {
@@ -82,15 +119,7 @@ fn even_odd_and_nonzero_differ_exactly_in_the_star_center() {
     let star = pentagram(50.0, 50.0, 40.0);
     let draw = |rule| {
         let mut c = Canvas::new(100, 100).unwrap();
-        c.fill_path(
-            &star,
-            &ID,
-            FillStyle {
-                rule,
-                thin_line: false,
-            },
-            &black(),
-        );
+        c.fill_path(&star, &ID, rule, &black());
         c.finish()
     };
     let nonzero = draw(FillRule::NonZero);
@@ -210,10 +239,12 @@ fn dash_gaps_land_at_the_pattern_positions_after_the_phase() {
 }
 
 #[test]
-fn stacked_clips_restrict_a_fill_to_their_intersection() {
+fn axis_aligned_path_clip_is_a_whole_pixel_scissor() {
     let mut c = Canvas::new(40, 40).unwrap();
     c.push_clip_rect(Rect::new(0.0, 0.0, 15.5, 15.5), &ID);
-    // The extra collinear vertex keeps this off the rectangle fast path.
+    // Collinear vertices and all: the path scan converts to two vertical
+    // edges, which MuPDF turns into a scissor of whole pixels (9..30), not
+    // a mask. The analytic rectangle clip keeps its half pixel at 15.5.
     let square = polyline(
         &[
             (9.5, 9.5),
@@ -227,25 +258,40 @@ fn stacked_clips_restrict_a_fill_to_their_intersection() {
     c.push_clip_path(&square, &ID, FillRule::NonZero);
     c.fill_rect(Rect::new(0.0, 0.0, 40.0, 40.0), &ID, &black());
     let p = c.finish();
-    // The intersection is [9.5, 15.5]²: pixels 9 and 15 are half inside
-    // along each axis (the left half-pixel from the path clip, the right
-    // one from the rectangle clip), so the corners get a quarter.
     let mut middle = vec![0u8; 40];
-    middle[9] = 128;
-    middle[10..15].fill(255);
+    middle[9..15].fill(255);
     middle[15] = 128;
     let mut edge = vec![0u8; 40];
-    edge[9] = 64;
-    edge[10..15].fill(128);
-    edge[15] = 64;
+    edge[9..15].fill(128);
+    edge[15] = 63; // solid-span alpha: (255*64)>>8
     for y in 0..40 {
         let want = match y {
-            9 | 15 => edge.clone(),
-            10..=14 => middle.clone(),
+            9..=14 => middle.clone(),
+            15 => edge.clone(),
             _ => vec![0; 40],
         };
         assert_eq!(alpha_row(&p, y), want, "row {y}");
     }
+}
+
+#[test]
+fn fill_scissor_rounds_out_from_the_subsample_grid_only_for_rectangles() {
+    let mut c = Canvas::new(10, 10).unwrap();
+    // x1 = 6.0 is column 102 = 6 · 17 exactly: the scissor ends at pixel 6,
+    // it does not round out to 7.
+    let rect = Path::from_rect(Rect::new(2.5, 3.0, 6.0, 5.5));
+    assert_eq!(c.fill_scissor(&rect, &ID), Some(IntRect::new(2, 3, 6, 6)));
+    let rotated = Transform::rotate(0.3);
+    assert_eq!(c.fill_scissor(&rect, &rotated), None);
+}
+
+#[test]
+fn non_rectangular_clip_masks_with_the_same_subsample_counts_as_a_fill() {
+    let tri = polyline(&[(0.0, 0.0), (8.0, 8.0), (0.0, 8.0)], true);
+    let mut c = Canvas::new(8, 8).unwrap();
+    c.push_clip_path(&tri, &ID, FillRule::NonZero);
+    c.fill_rect(Rect::new(0.0, 0.0, 8.0, 8.0), &ID, &black());
+    assert_eq!(alpha_rows(&c.finish()), diagonal_triangle(8));
 }
 
 #[test]
@@ -294,10 +340,10 @@ fn image_sample_row_zero_lands_at_the_top_of_the_unit_square() {
 fn multiply_blend_gives_the_product_of_backdrop_and_source() {
     let mut c = Canvas::new(2, 2).unwrap();
     c.clear(Color::rgb(0.4, 0.8, 1.0)); // bytes 102, 204, 255
-    let mut paint = Paint::solid(Color::rgb(1.0, 0.5, 0.2)); // bytes 255, 128, 51
+    let mut paint = Paint::solid(Color::rgb(1.0, 0.5, 0.2)); // bytes 255, 127, 51
     paint.composite.blend_mode = BlendMode::Multiply;
     c.fill_rect(Rect::new(0.0, 0.0, 2.0, 2.0), &ID, &paint);
-    // round(cb * cs * 255): 102 * 255 / 255, 204 * 128 / 255, 255 * 51 / 255.
+    // round(cb * cs * 255): 102 * 255 / 255, 204 * 127 / 255, 255 * 51 / 255.
     assert_eq!(c.finish().pixel(1, 1), Some([102, 102, 51, 255]));
 }
 
@@ -315,14 +361,15 @@ fn group_popped_with_half_alpha_mixes_evenly_with_the_backdrop() {
         alpha: 0.5,
         ..Composite::default()
     });
-    // Alpha 0.5 quantizes to 128/255: red keeps 128 + 127 from white.
-    assert_eq!(c.finish().pixel(2, 2), Some([255, 127, 127, 255]));
+    // MuPDF truncates alpha to 127: source (255*127)>>8 = 126;
+    // white retains (255*E(255-126))>>8 = 129. The page stays opaque.
+    assert_eq!(c.finish().pixel(2, 2), Some([255, 129, 129, 255]));
 }
 
 #[test]
-fn zero_width_stroke_is_one_device_pixel_under_any_scale() {
+fn zero_width_stroke_is_a_fifth_of_a_pixel_hairline_under_any_scale() {
     let mut c = Canvas::new(60, 30).unwrap();
-    let line = polyline(&[(1.0, 1.05), (5.0, 1.05)], false);
+    let line = polyline(&[(1.0, 1.055), (5.0, 1.055)], false);
     let scale = Transform::scale(10.0, 10.0);
     c.stroke_path(
         &line,
@@ -334,11 +381,48 @@ fn zero_width_stroke_is_one_device_pixel_under_any_scale() {
         &black(),
     );
     let p = c.finish();
+    // MuPDF widens anything thinner than 0.2 device pixels to 0.2: the
+    // band 10.45..10.65 spans sub-scanlines ⌊156.75⌋..⌊159.75⌋, three of
+    // the fifteen in row 10, so coverage 3*17=51, alpha (255*51)>>8=50.
     let mut covered = vec![0u8; 60];
-    covered[10..50].fill(255);
+    covered[10..50].fill(50);
     assert_eq!(alpha_row(&p, 9), vec![0; 60]);
     assert_eq!(alpha_row(&p, 10), covered);
     assert_eq!(alpha_row(&p, 11), vec![0; 60]);
+}
+
+#[test]
+fn zero_length_dashes_draw_round_dots_and_nothing_with_butt_caps() {
+    let line = polyline(&[(5.0, 10.0), (25.0, 10.0)], false);
+    let draw = |cap| {
+        let mut c = Canvas::new(30, 20).unwrap();
+        c.stroke_path(
+            &line,
+            &ID,
+            &Stroke {
+                width: 4.0,
+                cap,
+                dash: Some(Dash {
+                    array: vec![0.0, 8.0],
+                    phase: 0.0,
+                }),
+                ..Stroke::default()
+            },
+            &black(),
+        );
+        c.finish()
+    };
+    // Dots of radius 2 at x = 5, 13, 21; pixel 9 is two units from both.
+    let round = draw(LineCap::Round);
+    assert_eq!(alpha_at(&round, 5, 10), 255);
+    assert_eq!(alpha_at(&round, 4, 10), 255);
+    assert_eq!(alpha_at(&round, 9, 10), 0);
+    assert_eq!(alpha_at(&round, 13, 10), 255);
+    let butt = draw(LineCap::Butt);
+    assert!(
+        butt.data().iter().all(|&v| v == 0),
+        "butt caps draw nothing"
+    );
 }
 
 #[test]
@@ -372,8 +456,11 @@ fn zero_length_subpath_with_round_cap_draws_a_dot() {
 #[test]
 fn stroke_join_counts_the_inner_corner_once() {
     // Width 4 around (10.5, 30.5) -> (10.5, 10.5) -> (30.5, 10.5): the inner
-    // corner is (12.5, 12.5), so pixel (12, 12) is covered 0.5 by each
-    // segment and 0.75 by their union.
+    // corner is (12.5, 12.5). In pixel (12, 12) the vertical arm covers
+    // 8 of 17 columns (⌊12.5 · 17⌋ = 212, from 204) and the horizontal arm
+    // 7 of 15 rows (⌊12.5 · 15⌋ = 187, from 180): their union is
+    // 8 · 15 + 7 · 17 − 8 · 7 = 183 subsamples, not the sum.
+    // MuPDF solid-span alpha preserves 183, but counts 120/119 paint 119/118.
     let corner = polyline(&[(10.5, 30.5), (10.5, 10.5), (30.5, 10.5)], false);
     let mut c = Canvas::new(40, 40).unwrap();
     c.stroke_path(
@@ -386,86 +473,9 @@ fn stroke_join_counts_the_inner_corner_once() {
         &black(),
     );
     let p = c.finish();
-    assert_eq!(alpha_at(&p, 12, 12), 191);
-    assert_eq!(alpha_at(&p, 12, 20), 128);
-    assert_eq!(alpha_at(&p, 20, 12), 128);
-}
-
-fn thin_fill(path: &Path, thin_line: bool) -> Pixmap {
-    let mut c = Canvas::new(10, 10).unwrap();
-    c.fill_path(
-        path,
-        &ID,
-        FillStyle {
-            rule: FillRule::NonZero,
-            thin_line,
-        },
-        &black(),
-    );
-    c.finish()
-}
-
-#[test]
-fn thin_line_rule_paints_a_zero_height_rectangle_as_a_one_pixel_rule() {
-    let mut pb = PathBuilder::new();
-    pb.rect(2.0, 5.5, 6.0, 0.0);
-    let flat = pb.finish();
-    let thin = thin_fill(&flat, true);
-    assert_eq!(alpha_row(&thin, 4), vec![0; 10]);
-    assert_eq!(
-        alpha_row(&thin, 5),
-        vec![0, 0, 255, 255, 255, 255, 255, 255, 0, 0]
-    );
-    assert_eq!(alpha_row(&thin, 6), vec![0; 10]);
-    assert!(thin_fill(&flat, false).data().iter().all(|&v| v == 0));
-}
-
-#[test]
-fn thin_line_rule_widens_a_sliver_to_one_pixel_about_its_centre() {
-    let sliver = Path::from_rect(Rect::new(2.0, 5.2, 8.0, 5.4));
-    let thin = thin_fill(&sliver, true);
-    // Band y 4.8..5.8: 0.2 of row 4, 0.8 of row 5.
-    assert_eq!(
-        alpha_row(&thin, 4),
-        vec![0, 0, 51, 51, 51, 51, 51, 51, 0, 0]
-    );
-    assert_eq!(
-        alpha_row(&thin, 5),
-        vec![0, 0, 204, 204, 204, 204, 204, 204, 0, 0]
-    );
-    assert_eq!(alpha_row(&thin, 6), vec![0; 10]);
-}
-
-#[test]
-fn thin_line_rule_paints_a_diagonal_line_drawn_as_a_fill() {
-    let line = polyline(&[(2.0, 2.0), (8.0, 8.0)], false);
-    let thin = thin_fill(&line, true);
-    // A band one pixel thick along y = x with butt ends: 0.914 of a pixel
-    // on the line, 0.25 beside it, 0.125 beside the end pixels.
-    assert_eq!(alpha_row(&thin, 1), vec![0, 0, 32, 0, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(alpha_row(&thin, 2), vec![0, 32, 233, 64, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(alpha_row(&thin, 5), vec![0, 0, 0, 0, 64, 233, 64, 0, 0, 0]);
-    assert_eq!(alpha_row(&thin, 7), vec![0, 0, 0, 0, 0, 0, 64, 233, 32, 0]);
-    assert!(thin_fill(&line, false).data().iter().all(|&v| v == 0));
-}
-
-#[test]
-fn far_off_canvas_vertices_keep_the_visible_diagonal_exact() {
-    // The triangle's hypotenuse is y = x; everything left of it is inside.
-    let tri = polyline(&[(-1e6, -1e6), (1e6, 1e6), (-1e6, 1e6)], true);
-    let mut c = Canvas::new(8, 8).unwrap();
-    c.fill_path(&tri, &ID, FillStyle::default(), &black());
-    let p = c.finish();
-    for y in 0..8u32 {
-        let want: Vec<u8> = (0..8u32)
-            .map(|x| match x.cmp(&y) {
-                std::cmp::Ordering::Less => 255,
-                std::cmp::Ordering::Equal => 128,
-                std::cmp::Ordering::Greater => 0,
-            })
-            .collect();
-        assert_eq!(alpha_row(&p, y), want, "row {y}");
-    }
+    assert_eq!(alpha_at(&p, 12, 12), 183);
+    assert_eq!(alpha_at(&p, 12, 20), 119);
+    assert_eq!(alpha_at(&p, 20, 12), 118);
 }
 
 #[test]

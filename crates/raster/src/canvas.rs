@@ -2,13 +2,15 @@
 
 use std::sync::Arc;
 
-use crate::blend::{BlendMode, SrcRow, blend_pixel, blend_row, knockout_pixel};
+use crate::blend::{
+    BlendMode, SrcRow, blend_pixel, blend_row, expand, knockout_pixel, lerp, over_alpha,
+};
 use crate::geom::{IntRect, Point, Rect, Transform};
 use crate::image::{Filter, Image, ImageShader, MaskImage, Pixels, Shader, reduce, sample_mask};
 use crate::mask::{Mask, scale_all};
-use crate::path::{FlattenSink, Path, flatten};
-use crate::pixmap::{Color, Pixmap, RasterError, mul255, to_u8, zeroed_bytes};
-use crate::raster::{DEVICE_TOLERANCE, Edges, FillRule, Rasterizer};
+use crate::path::Path;
+use crate::pixmap::{Color, Pixmap, RasterError, color_byte, mul255, to_u8, unit, zeroed_bytes};
+use crate::raster::{Edges, FillRule, Rasterizer};
 use crate::stroke::{Stroke, stroke_edges};
 
 /// Where paint colour comes from.
@@ -48,43 +50,24 @@ impl Default for Composite<'_> {
 pub struct Paint<'a> {
     pub source: Source<'a>,
     pub composite: Composite<'a>,
-    /// Anti-aliased edges; when off a pixel is painted if at least half of it
-    /// is covered.
-    pub anti_alias: bool,
 }
 
 impl Paint<'_> {
-    /// Opaque-compositing, anti-aliased paint of one colour.
+    /// Opaque-compositing paint of one colour.
     pub fn solid(color: Color) -> Paint<'static> {
         Paint {
             source: Source::Solid(color),
             composite: Composite::default(),
-            anti_alias: true,
         }
     }
 
-    /// Anti-aliased paint from a shader.
+    /// Paint from a shader.
     pub fn shader(shader: &dyn Shader) -> Paint<'_> {
         Paint {
             source: Source::Shader(shader),
             composite: Composite::default(),
-            anti_alias: true,
         }
     }
-}
-
-/// Fill options.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FillStyle {
-    pub rule: FillRule,
-    /// PDF thin-line rule, meant for vector art (leave it off for glyphs).
-    /// Each subpath whose points lie within a strip thinner than one pixel
-    /// (measured across `x`, across `y`, or across the line from its first
-    /// point to its farthest one) is also painted as a band exactly one
-    /// pixel thick, centred on that strip and spanning the points along it.
-    /// Zero-height rules and lines drawn as fills thus become one-pixel
-    /// lines; a subpath that collapses to a single point paints nothing.
-    pub thin_line: bool,
 }
 
 /// Image drawing options.
@@ -201,14 +184,18 @@ fn initial_pixmap<'a>(
 struct DrawRow<'a> {
     x: u32,
     y: u32,
+    origin: (i32, i32),
     source: SrcRow<'a>,
     coverage: &'a [u8],
     shape: &'a [u8],
     mode: BlendMode,
+    /// MuPDF paints opaque solid objects directly even in a knockout group.
+    knockout: bool,
 }
 
 fn draw_row(base: &mut Pixmap, layers: &mut [Layer], row: DrawRow<'_>) {
-    let x1 = row.x + row.coverage.len() as u32;
+    let n = row.coverage.len();
+    let x1 = row.x + n as u32;
     let Some((layer, earlier)) = layers.split_last_mut() else {
         blend_row(
             base.row_mut(row.y, row.x, x1),
@@ -218,41 +205,46 @@ fn draw_row(base: &mut Pixmap, layers: &mut [Layer], row: DrawRow<'_>) {
         );
         return;
     };
-    let initial = initial_pixmap(base, earlier, layer.initial)
-        .map(|p| p.row(row.y, row.x, x1).as_chunks::<4>().0);
     let offset = row.y as usize * layer.pixmap.width() as usize + row.x as usize;
     let dst = layer.pixmap.row_mut(row.y, row.x, x1);
-    for (i, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let source = row
-            .source
-            .get(i)
-            .map(|v| mul255(u32::from(v), u32::from(row.coverage[i])) as u8);
-        let shape = row.shape[i];
-        if layer.knockout {
-            knockout_pixel(
-                pixel,
-                initial.map_or([0; 4], |p| p[i]),
-                source,
-                shape,
+    if layer.knockout && row.knockout {
+        let initial = initial_pixmap(base, earlier, layer.initial)
+            .map(|p| p.row(row.y, row.x, x1).as_chunks::<4>().0);
+        for (i, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let mut source = initial.map_or([0; 4], |p| p[i]);
+            blend_row(
+                &mut source,
+                row.source.at(i),
+                &row.coverage[i..i + 1],
                 row.mode,
             );
-        } else {
-            blend_pixel(pixel, source, row.mode);
+            let shape = row.shape[i];
+            knockout_pixel(pixel, source, shape);
+            if let Some(alpha) = layer.alpha.get_mut(offset + i) {
+                let sa = row.source.over_alpha(i, row.coverage[i], 0);
+                *alpha = (mul255(u32::from(sa), u32::from(shape))
+                    + mul255(u32::from(*alpha), 255 - u32::from(shape)))
+                    as u8;
+            }
         }
-        if let Some(alpha) = layer.alpha.get_mut(offset + i) {
-            let keep = 255 - u32::from(if layer.knockout { shape } else { source[3] });
-            *alpha = (u32::from(source[3]) + mul255(u32::from(*alpha), keep)).min(255) as u8;
+    } else {
+        blend_row(dst, row.source, row.coverage, row.mode);
+        if let Some(alpha) = layer.alpha.get_mut(offset..offset + n) {
+            for (i, (alpha, &cov)) in alpha.iter_mut().zip(row.coverage).enumerate() {
+                *alpha = row.source.over_alpha(i, cov, *alpha);
+            }
         }
-        if let Some(accumulated) = layer.shape.get_mut(offset + i) {
-            *accumulated =
-                (u32::from(shape) + mul255(u32::from(*accumulated), 255 - u32::from(shape))) as u8;
+    }
+    if let Some(accumulated) = layer.shape.get_mut(offset..offset + n) {
+        for (accumulated, &shape) in accumulated.iter_mut().zip(row.shape) {
+            *accumulated = over_alpha(*accumulated, shape, 255);
         }
     }
     layer.dirty = layer.dirty.union(&IntRect::new(
-        row.x as i32,
-        row.y as i32,
-        x1 as i32,
-        row.y as i32 + 1,
+        row.x as i32 + row.origin.0,
+        row.y as i32 + row.origin.1,
+        x1 as i32 + row.origin.0,
+        row.y as i32 + row.origin.1 + 1,
     ));
 }
 
@@ -280,86 +272,6 @@ impl Stencil<'_> {
     }
 }
 
-/// Collects, one subpath at a time in device space, the one-pixel bands the
-/// thin-line rule adds to a fill.
-struct ThinLines<'a> {
-    edges: &'a mut Edges,
-    points: &'a mut Vec<Point>,
-}
-
-impl ThinLines<'_> {
-    fn flush(&mut self) {
-        if let Some(band) = thin_band(self.points) {
-            // Reversed: the same (negative) orientation as stroke pieces.
-            self.edges.add_polygon(&band, &Transform::IDENTITY, true);
-        }
-        self.points.clear();
-    }
-}
-
-impl FlattenSink for ThinLines<'_> {
-    fn move_to(&mut self, p: Point) {
-        self.flush();
-        self.points.push(p);
-    }
-
-    fn line_to(&mut self, p: Point, _smooth: bool) {
-        self.points.push(p);
-    }
-
-    fn close(&mut self) {}
-}
-
-/// The band a thin subpath gets: of the strips across `x`, across `y`, and
-/// across the line from the first point to the farthest one, the thinnest
-/// that is under one pixel, widened to exactly one pixel about its centre
-/// and spanning the points along it. `None` when no strip is that thin or
-/// all points coincide.
-fn thin_band(pts: &[Point]) -> Option<[Point; 4]> {
-    let &p0 = pts.first()?;
-    let far = pts
-        .iter()
-        .copied()
-        .max_by(|a, b| (*a - p0).length().total_cmp(&(*b - p0).length()))?;
-    let reach = (far - p0).length();
-    if !(reach > 0.0 && reach.is_finite()) {
-        return None;
-    }
-    let mut best: Option<(f64, Point)> = None;
-    for u in [
-        Point::new(1.0, 0.0),
-        Point::new(0.0, 1.0),
-        (far - p0) * (1.0 / reach),
-    ] {
-        let (lo, hi) = extent(pts, p0, Point::new(-u.y, u.x));
-        let width = hi - lo;
-        if width < 1.0 && best.is_none_or(|(w, _)| width < w) {
-            best = Some((width, u));
-        }
-    }
-    let (_, u) = best?;
-    let v = Point::new(-u.y, u.x);
-    let (s0, s1) = extent(pts, p0, u);
-    let (lo, hi) = extent(pts, p0, v);
-    let mid = 0.5 * (lo + hi);
-    let at = |s: f64, o: f64| p0 + u * s + v * o;
-    Some([
-        at(s0, mid - 0.5),
-        at(s1, mid - 0.5),
-        at(s1, mid + 0.5),
-        at(s0, mid + 0.5),
-    ])
-}
-
-/// Range of `(p - origin) · dir` over `pts`.
-fn extent(pts: &[Point], origin: Point, dir: Point) -> (f64, f64) {
-    pts.iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &p| {
-            let t = (p - origin).dot(dir);
-            (lo.min(t), hi.max(t))
-        })
-}
-
 /// A drawing surface over an RGBA8 premultiplied pixmap.
 ///
 /// Device space is the pixel grid: `x` right, `y` down, pixel `(i, j)`
@@ -367,6 +279,7 @@ fn extent(pts: &[Point], origin: Point, dir: Point) -> (f64, f64) {
 /// into the transforms they pass.
 pub struct Canvas {
     base: Pixmap,
+    bounds: IntRect,
     layers: Vec<Layer>,
     group_bytes: usize,
     clips: Vec<Clip>,
@@ -376,9 +289,6 @@ pub struct Canvas {
     row_cov: Vec<u8>,
     row_shape: Vec<u8>,
     row_src: Vec<[u8; 4]>,
-    thin_points: Vec<Point>,
-    thin_cov: Mask,
-    max_cov: Mask,
 }
 
 impl Canvas {
@@ -387,23 +297,33 @@ impl Canvas {
         Ok(Canvas::from_pixmap(Pixmap::new(width, height)?))
     }
 
+    /// A transparent canvas retaining its absolute device-space origin.
+    /// Keeping that origin through edge quantization avoids changing
+    /// fractional coverage when a pattern cell is rendered offscreen.
+    pub fn new_at(bounds: IntRect) -> Result<Canvas, RasterError> {
+        let pixmap = Pixmap::new(bounds.width(), bounds.height())?;
+        Ok(Self::from_pixmap_in(pixmap, bounds))
+    }
+
     /// Draws onto an existing pixmap.
     pub fn from_pixmap(pixmap: Pixmap) -> Canvas {
-        let full = pixmap.bounds();
+        let bounds = pixmap.bounds();
+        Self::from_pixmap_in(pixmap, bounds)
+    }
+
+    fn from_pixmap_in(pixmap: Pixmap, bounds: IntRect) -> Canvas {
         Canvas {
             base: pixmap,
+            bounds,
             layers: Vec::new(),
             group_bytes: 0,
-            clips: vec![Clip::from_rect(full.to_rect(), None, full)],
+            clips: vec![Clip::from_rect(bounds.to_rect(), None, bounds)],
             raster: Rasterizer::default(),
             edges: Edges::default(),
             cov: Mask::default(),
             row_cov: Vec::new(),
             row_src: Vec::new(),
             row_shape: Vec::new(),
-            thin_points: Vec::new(),
-            thin_cov: Mask::default(),
-            max_cov: Mask::default(),
         }
     }
 
@@ -426,8 +346,9 @@ impl Canvas {
         self.base
     }
 
-    fn bounds(&self) -> IntRect {
-        self.base.bounds()
+    /// Absolute device-space bounds of the backing pixmap.
+    pub fn bounds(&self) -> IntRect {
+        self.bounds
     }
 
     fn top_clip(&self) -> &Clip {
@@ -462,54 +383,23 @@ impl Canvas {
         &mut self,
         path: &Path,
         transform: &Transform,
-        style: FillStyle,
+        rule: FillRule,
         paint: &Paint<'_>,
     ) {
-        self.edges.clear();
+        self.edges.reset(self.top_clip().bounds);
         self.edges.add_path(path, transform);
-        let limit = self.top_clip().bounds;
         let mut cov = std::mem::take(&mut self.cov);
-        let mut filled =
-            self.raster
-                .rasterize(&self.edges, limit, style.rule, paint.anti_alias, &mut cov);
-        if style.thin_line {
-            self.edges.clear();
-            let mut sink = ThinLines {
-                edges: &mut self.edges,
-                points: &mut self.thin_points,
-            };
-            flatten(path, transform, DEVICE_TOLERANCE, &mut sink);
-            sink.flush();
-            if self.raster.rasterize(
-                &self.edges,
-                limit,
-                FillRule::NonZero,
-                paint.anti_alias,
-                &mut self.thin_cov,
-            ) {
-                if filled {
-                    max_into(&cov, &self.thin_cov, &mut self.max_cov);
-                    std::mem::swap(&mut cov, &mut self.max_cov);
-                } else {
-                    std::mem::swap(&mut cov, &mut self.thin_cov);
-                }
-                filled = true;
-            }
-        }
-        if filled {
-            self.paint(&cov, paint.source, None, &paint.composite);
+        if self.raster.rasterize(&mut self.edges, rule, &mut cov) {
+            let extents = std::mem::take(&mut self.raster.extents);
+            self.paint(&cov, &extents, (0, 0), paint.source, None, &paint.composite);
+            self.raster.extents = extents;
         }
         self.cov = cov;
     }
 
     /// Fills a rectangle given in user space.
     pub fn fill_rect(&mut self, rect: Rect, transform: &Transform, paint: &Paint<'_>) {
-        self.fill_path(
-            &Path::from_rect(rect),
-            transform,
-            FillStyle::default(),
-            paint,
-        );
+        self.fill_path(&Path::from_rect(rect), transform, FillRule::NonZero, paint);
     }
 
     /// Strokes `path`; the stroke geometry is built in user space and then
@@ -521,18 +411,16 @@ impl Canvas {
         stroke: &Stroke,
         paint: &Paint<'_>,
     ) {
-        self.edges.clear();
+        self.edges.reset(self.top_clip().bounds);
         stroke_edges(path, transform, stroke, &mut self.edges);
-        let limit = self.top_clip().bounds;
         let mut cov = std::mem::take(&mut self.cov);
-        if self.raster.rasterize(
-            &self.edges,
-            limit,
-            FillRule::NonZero,
-            paint.anti_alias,
-            &mut cov,
-        ) {
-            self.paint(&cov, paint.source, None, &paint.composite);
+        if self
+            .raster
+            .rasterize(&mut self.edges, FillRule::NonZero, &mut cov)
+        {
+            let extents = std::mem::take(&mut self.raster.extents);
+            self.paint(&cov, &extents, (0, 0), paint.source, None, &paint.composite);
+            self.raster.extents = extents;
         }
         self.cov = cov;
     }
@@ -541,9 +429,19 @@ impl Canvas {
     /// non-horizontal edges rounded out and limited to the clip. A shading
     /// painted through the path is scissored to this, as MuPDF does.
     pub fn fill_bounds(&mut self, path: &Path, transform: &Transform) -> IntRect {
-        self.edges.clear();
+        self.edges.reset(self.top_clip().bounds);
         self.edges.add_path(path, transform);
         self.edge_bounds()
+    }
+
+    /// The whole-pixel scissor MuPDF clips to instead of a mask when `path`
+    /// scan converts to an axis-aligned rectangle (`fz_is_rect_gel`): its
+    /// edges land on the 17 × 15 subsample grid and the pixel bounds round
+    /// out from there. `None` for any other shape.
+    pub fn fill_scissor(&mut self, path: &Path, transform: &Transform) -> Option<IntRect> {
+        self.edges.reset(self.top_clip().bounds);
+        self.edges.add_path(path, transform);
+        self.edges.is_rect().then(|| self.edge_bounds())
     }
 
     /// Pixels that stroking `path` can reach; see [`Canvas::fill_bounds`].
@@ -553,21 +451,24 @@ impl Canvas {
         transform: &Transform,
         stroke: &Stroke,
     ) -> IntRect {
-        self.edges.clear();
+        self.edges.reset(self.top_clip().bounds);
         stroke_edges(path, transform, stroke, &mut self.edges);
         self.edge_bounds()
     }
 
     fn edge_bounds(&self) -> IntRect {
-        match self.edges.bbox() {
-            Some(bbox) => bbox.round_out().intersect(&self.top_clip().bounds),
-            None => IntRect::EMPTY,
-        }
+        self.edges.bounds().intersect(&self.top_clip().bounds)
     }
 
     /// Paints a precomputed coverage mask (for example a cached glyph).
     pub fn fill_mask(&mut self, mask: &Mask, paint: &Paint<'_>) {
-        self.paint(mask, paint.source, None, &paint.composite);
+        self.paint(mask, &[], (0, 0), paint.source, None, &paint.composite);
+    }
+
+    /// Paints `mask` moved by whole pixels `(dx, dy)`: a glyph bitmap
+    /// rendered relative to its origin, placed at the origin's pixel.
+    pub fn fill_mask_at(&mut self, mask: &Mask, dx: i32, dy: i32, paint: &Paint<'_>) {
+        self.paint(mask, &[], (dx, dy), paint.source, None, &paint.composite);
     }
 
     /// Draws `image` into the parallelogram that `transform` makes of the
@@ -600,8 +501,17 @@ impl Canvas {
             filter: options.filter,
         };
         let cov = std::mem::take(&mut self.cov);
-        self.paint(&cov, Source::Shader(&shader), None, &options.composite);
+        let extents = std::mem::take(&mut self.raster.extents);
+        self.paint(
+            &cov,
+            &extents,
+            (0, 0),
+            Source::Shader(&shader),
+            None,
+            &options.composite,
+        );
         self.cov = cov;
+        self.raster.extents = extents;
     }
 
     /// Paints `paint` through a stencil mask placed like an image
@@ -641,40 +551,47 @@ impl Canvas {
             filter,
         };
         let cov = std::mem::take(&mut self.cov);
-        self.paint(&cov, paint.source, Some(&stencil), &paint.composite);
+        let extents = std::mem::take(&mut self.raster.extents);
+        self.paint(
+            &cov,
+            &extents,
+            (0, 0),
+            paint.source,
+            Some(&stencil),
+            &paint.composite,
+        );
         self.cov = cov;
+        self.raster.extents = extents;
     }
 
     fn unit_square_coverage(&mut self, t: &Transform) -> bool {
-        self.edges.clear();
+        self.edges.reset(self.top_clip().bounds);
         let unit = [
             Point::new(0.0, 0.0),
             Point::new(1.0, 0.0),
             Point::new(1.0, 1.0),
             Point::new(0.0, 1.0),
         ];
-        self.edges.add_polygon(&unit, t, false);
-        let limit = self.top_clip().bounds;
+        self.edges.add_polygon(&unit, t);
         self.raster
-            .rasterize(&self.edges, limit, FillRule::NonZero, true, &mut self.cov)
+            .rasterize(&mut self.edges, FillRule::NonZero, &mut self.cov)
     }
 
-    /// Intersects the clip with `path`.
+    /// Intersects the clip with `path`. As in MuPDF, a path that scan
+    /// converts to an axis-aligned rectangle becomes a whole-pixel scissor
+    /// (see [`Canvas::fill_scissor`]); any other shape becomes a coverage
+    /// mask.
     pub fn push_clip_path(&mut self, path: &Path, transform: &Transform, rule: FillRule) {
-        if transform.is_axis_aligned()
-            && let Some(r) = path.as_rect()
-        {
-            self.push_clip_rect(r, transform);
+        let top = self.top_clip().clone();
+        self.edges.reset(top.bounds);
+        self.edges.add_path(path, transform);
+        if self.edges.is_rect() {
+            let bounds = self.edges.bounds().intersect(&top.bounds);
+            self.push_clip_rect(bounds.to_rect(), &Transform::IDENTITY);
             return;
         }
-        let top = self.top_clip().clone();
-        self.edges.clear();
-        self.edges.add_path(path, transform);
         let mut mask = Mask::default();
-        if !self
-            .raster
-            .rasterize(&self.edges, top.bounds, rule, true, &mut mask)
-        {
+        if !self.raster.rasterize(&mut self.edges, rule, &mut mask) {
             self.clips.push(Clip {
                 bounds: IntRect::EMPTY,
                 ..top
@@ -846,11 +763,11 @@ impl Canvas {
         self.clips[layer.clip_depth - 1] = layer.entry_clip;
         let Canvas {
             base,
+            bounds,
             layers,
             clips,
             row_cov,
             row_shape,
-            row_src,
             ..
         } = self;
         let clip = &clips[clips.len() - 1];
@@ -858,28 +775,22 @@ impl Canvas {
         if region.is_empty() {
             return true;
         }
-        let alpha = to_u8(composite.alpha);
+        let alpha = color_byte(composite.alpha);
         let n = region.width() as usize;
         for y in region.y0..region.y1 {
-            let x0 = region.x0 as u32;
-            let x1 = region.x1 as u32;
-            let offset = y as usize * base.width() as usize + x0 as usize;
-            let src = layer.pixmap.row(y as u32, x0, x1).as_chunks::<4>().0;
-            let initial = initial_pixmap(base, layers, layer.initial)
-                .map(|p| p.row(y as u32, x0, x1).as_chunks::<4>().0);
-            row_src.clear();
-            for (i, pixel) in src.iter().enumerate() {
-                let mut source = *pixel;
-                if let Some(initial) = initial {
-                    let a = layer.alpha[offset + i];
-                    for k in 0..3 {
-                        let backdrop = mul255(u32::from(initial[i][k]), 255 - u32::from(a)) as u8;
-                        source[k] = source[k].saturating_sub(backdrop).min(a);
-                    }
-                    source[3] = a;
+            let x0 = (region.x0 - bounds.x0) as u32;
+            let x1 = (region.x1 - bounds.x0) as u32;
+            let local_y = (y - bounds.y0) as u32;
+            let offset = local_y as usize * base.width() as usize + x0 as usize;
+            let pixels = layer.pixmap.row(local_y, x0, x1);
+            let source = if layer.initial.is_some() {
+                SrcRow::Backdrop {
+                    pixels,
+                    alpha: &layer.alpha[offset..offset + n],
                 }
-                row_src.push(source);
-            }
+            } else {
+                SrcRow::Pixels(pixels)
+            };
             row_shape.clear();
             if layer.shape.is_empty() {
                 row_shape.resize(n, 255);
@@ -904,11 +815,13 @@ impl Canvas {
                 layers,
                 DrawRow {
                     x: x0,
-                    y: y as u32,
-                    source: SrcRow::Pixels(row_src.as_flattened()),
+                    y: local_y,
+                    origin: (bounds.x0, bounds.y0),
+                    source,
                     coverage: row_cov,
                     shape: row_shape,
                     mode: composite.blend_mode,
+                    knockout: true,
                 },
             );
         }
@@ -920,22 +833,27 @@ impl Canvas {
         self.layers.len()
     }
 
-    /// Composites `src` through coverage `cov`, the clip, an optional
-    /// stencil, and the composite's alpha and soft mask.
+    /// Composites `src` through coverage `cov` (moved by whole pixels
+    /// `offset`), the clip, an optional stencil, and the composite's alpha
+    /// and soft mask. `extents` holds, per row of `cov`, the pixel range the
+    /// rasterizer wrote (empty when unknown).
     fn paint(
         &mut self,
         cov: &Mask,
+        extents: &[[u32; 2]],
+        offset: (i32, i32),
         src: Source<'_>,
         stencil: Option<&Stencil<'_>>,
         composite: &Composite<'_>,
     ) {
-        let alpha = to_u8(composite.alpha);
+        let alpha = color_byte(composite.alpha);
         let grouped = !self.layers.is_empty();
         if alpha == 0 && !grouped {
             return;
         }
         let Canvas {
             base,
+            bounds,
             layers,
             clips,
             row_cov,
@@ -944,45 +862,86 @@ impl Canvas {
             ..
         } = self;
         let clip = &clips[clips.len() - 1];
-        let region = cov.rect().intersect(&clip.bounds).intersect(&base.bounds());
+        let cov_rect = {
+            let r = cov.rect();
+            IntRect::new(
+                r.x0.saturating_add(offset.0),
+                r.y0.saturating_add(offset.1),
+                r.x1.saturating_add(offset.0),
+                r.y1.saturating_add(offset.1),
+            )
+        };
+        let region = cov_rect.intersect(&clip.bounds).intersect(bounds);
         if region.is_empty() {
             return;
         }
-        let (solid, cov_alpha) = match src {
-            Source::Solid(c) => {
-                let p = c.to_premultiplied();
-                (
-                    Some(p.map(|v| mul255(u32::from(v), u32::from(alpha)) as u8)),
-                    255,
-                )
-            }
-            Source::Shader(_) => (None, alpha),
+        let solid = match src {
+            Source::Solid(c) => Some((c.to_rgb8(), color_byte(unit(c.a) * composite.alpha))),
+            Source::Shader(_) => None,
         };
-        if !grouped && solid.is_some_and(|c| c[3] == 0) {
+        let cov_alpha = if solid.is_some() { 255 } else { alpha };
+        if !grouped && solid.is_some_and(|(_, a)| a == 0) {
             return;
         }
         let n = region.width() as usize;
-        let dx = (region.x0 - cov.rect().x0) as usize;
+        let dx = (region.x0 - cov_rect.x0) as usize;
+        // A solid colour through an unmodified coverage row inside the clip
+        // rectangle paints straight from the mask.
+        let direct = !grouped
+            && stencil.is_none()
+            && composite.soft_mask.is_none()
+            && clip.mask.is_none()
+            && region.x0 >= clip.inner.x0
+            && region.x1 <= clip.inner.x1;
         for y in region.y0..region.y1 {
-            let Some(row) = cov.row(y) else {
+            let Some(row) = cov.row(y - offset.1) else {
                 continue;
             };
+            // The pixels of this row worth visiting: the rasterizer's extent
+            // when it is known, else the whole region.
+            let (a0, b0) = match extents.get((y - cov_rect.y0) as usize) {
+                Some(&[lo, hi]) => (
+                    (lo as usize).clamp(dx, dx + n) - dx,
+                    (hi as usize).clamp(dx, dx + n) - dx,
+                ),
+                None => (0, n),
+            };
+            if a0 >= b0 {
+                continue;
+            }
+            let x_start = region.x0 + a0 as i32;
+            let row = &row[dx + a0..dx + b0];
+            if let (true, Some((color, alpha))) =
+                (direct && y >= clip.inner.y0 && y < clip.inner.y1, solid)
+            {
+                let Some((a, b)) = nonzero_span(row) else {
+                    continue;
+                };
+                blend_row(
+                    base.row_mut(
+                        (y - bounds.y0) as u32,
+                        (x_start + a as i32 - bounds.x0) as u32,
+                        (x_start + b as i32 - bounds.x0) as u32,
+                    ),
+                    SrcRow::Solid { color, alpha },
+                    &row[a..b],
+                    composite.blend_mode,
+                );
+                continue;
+            }
             row_cov.clear();
-            row_cov.extend_from_slice(&row[dx..dx + n]);
-            clip.apply(region.x0, y, row_cov);
+            row_cov.extend_from_slice(row);
+            clip.apply(x_start, y, row_cov);
             if let Some(st) = stencil {
-                st.mul_row(region.x0, y, row_cov);
+                st.mul_row(x_start, y, row_cov);
             }
             if grouped {
                 row_shape.clear();
                 row_shape.extend_from_slice(row_cov);
                 if composite.alpha_is_shape {
-                    scale_all(row_shape, u32::from(alpha));
-                    if let Source::Solid(c) = src {
-                        scale_all(row_shape, u32::from(c.to_premultiplied()[3]));
-                    }
+                    scale_all(row_shape, u32::from(solid.map_or(alpha, |(_, a)| a)));
                     if let Some(mask) = composite.soft_mask {
-                        mask.mul_row(region.x0, y, row_shape);
+                        mask.mul_row(x_start, y, row_shape);
                     }
                 }
             }
@@ -990,18 +949,18 @@ impl Canvas {
                 scale_all(row_cov, u32::from(cov_alpha));
             }
             if let Some(mask) = composite.soft_mask {
-                mask.mul_row(region.x0, y, row_cov);
+                mask.mul_row(x_start, y, row_cov);
             }
             let Some((a, b)) = nonzero_span(if grouped { row_shape } else { row_cov }) else {
                 continue;
             };
-            let x0 = (region.x0 + a as i32) as u32;
+            let x0 = x_start + a as i32;
             let source = match (solid, src) {
-                (Some(c), _) => SrcRow::Solid(c),
+                (Some((color, alpha)), _) => SrcRow::Solid { color, alpha },
                 (None, Source::Shader(s)) => {
                     row_src.clear();
                     row_src.resize(b - a, [0; 4]);
-                    s.shade_row(x0 as i32, y, row_src);
+                    s.shade_row(x0, y, row_src);
                     if grouped && composite.alpha_is_shape {
                         for (shape, pixel) in row_shape[a..b].iter_mut().zip(row_src.iter()) {
                             *shape = mul255(u32::from(*shape), u32::from(pixel[3])) as u8;
@@ -1011,16 +970,24 @@ impl Canvas {
                 }
                 (None, Source::Solid(_)) => continue,
             };
+            if grouped {
+                for shape in row_shape.iter_mut() {
+                    *shape = lerp(255, 0, expand(*shape));
+                }
+            }
             draw_row(
                 base,
                 layers,
                 DrawRow {
-                    x: x0,
-                    y: y as u32,
+                    x: (x0 - bounds.x0) as u32,
+                    y: (y - bounds.y0) as u32,
+                    origin: (bounds.x0, bounds.y0),
                     source,
                     coverage: &row_cov[a..b],
                     shape: if grouped { &row_shape[a..b] } else { &[] },
                     mode: composite.blend_mode,
+                    knockout: solid.is_none_or(|(_, alpha)| alpha != 255)
+                        || composite.soft_mask.is_some(),
                 },
             );
         }
@@ -1032,23 +999,6 @@ fn nonzero_span(row: &[u8]) -> Option<(usize, usize)> {
     let a = row.iter().position(|&v| v != 0)?;
     let b = row.iter().rposition(|&v| v != 0).map_or(a + 1, |i| i + 1);
     Some((a, b))
-}
-
-/// Per-pixel maximum of two coverage masks over the union of their rects.
-fn max_into(a: &Mask, b: &Mask, out: &mut Mask) {
-    let rect = a.rect().union(&b.rect());
-    out.reset(rect);
-    let w = rect.width() as usize;
-    if w == 0 {
-        return;
-    }
-    for (ry, row) in out.data_mut().chunks_exact_mut(w).enumerate() {
-        let y = rect.y0 + ry as i32;
-        for (i, v) in row.iter_mut().enumerate() {
-            let x = rect.x0 + i as i32;
-            *v = a.value(x, y).max(b.value(x, y));
-        }
-    }
 }
 
 /// Snaps an axis-aligned unit-square placement to whole device pixels,

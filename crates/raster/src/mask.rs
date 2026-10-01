@@ -29,19 +29,14 @@ impl Mask {
         })
     }
 
-    /// Anti-aliased (or thresholded) coverage of `path` under `transform`,
-    /// limited to `bounds`. Outside reads 0.
-    pub fn from_path(
-        path: &Path,
-        transform: &Transform,
-        rule: FillRule,
-        anti_alias: bool,
-        bounds: IntRect,
-    ) -> Mask {
+    /// Anti-aliased coverage of `path` under `transform`, limited to
+    /// `bounds`. Outside reads 0.
+    pub fn from_path(path: &Path, transform: &Transform, rule: FillRule, bounds: IntRect) -> Mask {
         let mut edges = Edges::default();
+        edges.reset(bounds);
         edges.add_path(path, transform);
         let mut out = Mask::default();
-        if !Rasterizer::default().rasterize(&edges, bounds, rule, anti_alias, &mut out) {
+        if !Rasterizer::default().rasterize(&mut edges, rule, &mut out) {
             out = Mask::default();
         }
         out

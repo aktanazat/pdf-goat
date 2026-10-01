@@ -1,18 +1,18 @@
-//! Stroking: turns a path into filled pieces.
+//! Stroking: turns a path into the edges of its outline. Ported from MuPDF
+//! `draw-path.c` (AGPL).
 //!
-//! Every segment becomes a quad, every outer join and cap its own polygon,
-//! all with the same orientation, so a nonzero fill of the pieces is their
-//! union. At a join the two segment quads are cut along the line from the
-//! vertex to the inner corner, so the pieces tile instead of overlapping
-//! (overlap would count twice in anti-aliased edge pixels). Stroking happens
-//! in user space and the pieces are then mapped to device space, so the pen
-//! follows non-uniform transforms.
+//! Every segment contributes a quad, every join and cap its own small
+//! polygon; the pieces overlap and a nonzero fill of the edge list is their
+//! union. Geometry is built in user space (so the pen follows non-uniform
+//! transforms) and each edge is mapped to device space as it is emitted.
+//! Dashing walks the flattened path in user space, clipped to the device
+//! scissor so an off-screen path costs nothing.
 
-use std::f64::consts::PI;
+use std::f32::consts::{PI, SQRT_2};
 
 use crate::geom::{Point, Transform};
-use crate::path::{Path, Polyline, PolylineCollector, flatten};
-use crate::raster::{DEVICE_TOLERANCE, Edges};
+use crate::path::{M32, Path, PathEl, bezier, quadratic};
+use crate::raster::{DEVICE_FLATNESS, Edges};
 
 /// Shape at the open ends of a stroked subpath (PDF `J`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -46,14 +46,15 @@ pub struct Dash {
 /// Stroke parameters in user space.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stroke {
-    /// Line width; `0` (or any non-positive or non-finite value) draws a
-    /// one-device-pixel hairline.
+    /// Line width. Any stroke thinner than [`HAIRLINE_WIDTH`] device
+    /// pixels, including `0` and non-finite widths, is widened to that.
     pub width: f64,
     pub cap: LineCap,
     pub join: LineJoin,
     pub miter_limit: f64,
     /// `None`, an empty array, an all-zero array, or one with a negative or
-    /// non-finite entry strokes solid.
+    /// non-finite entry strokes solid. So does a pattern whose period is
+    /// under a hundredth of a user unit or half a device pixel.
     pub dash: Option<Dash>,
 }
 
@@ -69,467 +70,841 @@ impl Default for Stroke {
     }
 }
 
-/// Dash output above this many pieces is drawn solid instead.
-const MAX_DASH_PIECES: f64 = 200_000.0;
-const MAX_ARC_STEPS: usize = 256;
+/// Thinnest stroke drawn, in device pixels: MuPDF's `2 / (aa_level + 2)`
+/// with anti-aliasing level 8 (`fz_draw_stroke_path`).
+pub const HAIRLINE_WIDTH: f32 = 0.2;
 
-/// Adds the stroke outline of `path` under `transform` to `edges`.
+/// `FLT_TINY * FLT_TINY` is about `FLT_EPSILON`.
+const FLT_TINY: f32 = 3.4e-4;
+
+/// Adds the stroke outline of `path` under `transform` to `edges`, which
+/// must already be reset to the device clip (`do_flatten_stroke`).
 pub(crate) fn stroke_edges(path: &Path, transform: &Transform, stroke: &Stroke, edges: &mut Edges) {
-    let hairline = !(stroke.width.is_finite() && stroke.width > 0.0);
-    let scale = transform.max_scale();
-    let user_tol = if scale.is_finite() && scale > 1e-12 {
-        DEVICE_TOLERANCE / scale
-    } else {
-        DEVICE_TOLERANCE
-    };
-    let mut collector = PolylineCollector::default();
-    flatten(path, &Transform::IDENTITY, user_tol, &mut collector);
-    let mut lines = collector.lines;
-    lines.retain(|l| l.has_segments);
-    if let Some(pattern) = stroke.dash.as_ref().and_then(normalize_dash) {
-        lines = apply_dash(
-            &lines,
-            &pattern,
-            stroke.dash.as_ref().map_or(0.0, |d| d.phase),
-        );
+    let ctm = M32::from(transform);
+    let mut expansion = ctm.expansion();
+    if expansion < f32::EPSILON {
+        expansion = 1.0;
     }
-    let (hw, tol, piece_transform) = if hairline {
-        for l in &mut lines {
-            for p in &mut l.points {
-                *p = transform.apply(*p);
-            }
-            l.zero_dir = transform.apply_vector(l.zero_dir);
-        }
-        (0.5, DEVICE_TOLERANCE, Transform::IDENTITY)
-    } else {
-        (0.5 * stroke.width, user_tol, *transform)
-    };
-    let miter_limit = if stroke.miter_limit.is_finite() {
-        stroke.miter_limit.max(1.0)
-    } else {
-        10.0
-    };
-    let mut stroker = Stroker {
-        hw,
-        tol,
-        cap: stroke.cap,
-        join: stroke.join,
-        miter_limit,
-        transform: piece_transform,
-        edges,
-        scratch: Vec::new(),
-        pts: Vec::new(),
-        smooth: Vec::new(),
-        cuts: Vec::new(),
-    };
-    let eps = tol * 1e-4;
-    for l in &lines {
-        stroker.polyline(l, eps);
-    }
-}
-
-/// Even-length, positive-total dash array, or `None` for a solid stroke.
-fn normalize_dash(dash: &Dash) -> Option<Vec<f64>> {
-    let a = &dash.array;
-    if a.is_empty() || a.iter().any(|v| !v.is_finite() || *v < 0.0) {
-        return None;
-    }
-    let mut out = a.clone();
-    if out.len() % 2 == 1 {
-        out.extend_from_slice(a);
-    }
-    let total: f64 = out.iter().sum();
-    (total > 0.0 && total.is_finite()).then_some(out)
-}
-
-fn apply_dash(lines: &[Polyline], pattern: &[f64], phase: f64) -> Vec<Polyline> {
-    let total: f64 = pattern.iter().sum();
-    let length: f64 = lines.iter().map(polyline_length).sum();
-    if length / total * pattern.len() as f64 > MAX_DASH_PIECES {
-        return lines.to_vec();
-    }
-    let phase = if phase.is_finite() {
-        phase.rem_euclid(total)
+    let mut linewidth = if stroke.width.is_finite() {
+        stroke.width as f32
     } else {
         0.0
     };
-    let mut out = Vec::new();
-    for l in lines {
-        dash_one(l, pattern, phase, &mut out);
+    if linewidth * expansion < HAIRLINE_WIDTH {
+        linewidth = HAIRLINE_WIDTH / expansion;
+    }
+    let flatness = (DEVICE_FLATNESS / expansion).max(0.001);
+    let mut s = Stroker {
+        edges,
+        ctm,
+        flatness,
+        linejoin: stroke.join,
+        linewidth: linewidth * 0.5,
+        miterlimit: stroke.miter_limit as f32,
+        cap: stroke.cap,
+        beg: [[0.0; 2]; 2],
+        seg: [[0.0; 2]; 2],
+        sn: 0,
+        not_just_moves: false,
+        from_bezier: false,
+        cur: [0.0; 2],
+        dirn: [0.0; 2],
+    };
+    let mut dashing = None;
+    if let Some(dash) = stroke
+        .dash
+        .as_ref()
+        .filter(|d| !d.array.is_empty() && d.array.iter().all(|v| v.is_finite() && *v >= 0.0))
+    {
+        let total = dash.array.iter().fold(0.0f32, |t, &v| t + v as f32);
+        if total > 0.0 {
+            let Some(inv) = try_invert(&ctm) else {
+                return;
+            };
+            let mut rect = transform_rect(clip_rect(s.edges), &inv);
+            rect[0] -= linewidth;
+            rect[2] += linewidth;
+            rect[1] -= linewidth;
+            rect[3] += linewidth;
+            if total >= 0.01 && total * ctm.max_expansion() >= 0.5 {
+                dashing = Some(Dashing {
+                    rect,
+                    list: &dash.array,
+                    start_phase: dash.phase as f32 % total,
+                    total,
+                    toggle: false,
+                    offset: 0,
+                    phase: 0.0,
+                    cur: [0.0; 2],
+                    beg: [0.0; 2],
+                });
+            }
+        }
+    }
+    match dashing {
+        Some(mut d) => {
+            for el in path.elements() {
+                match *el {
+                    PathEl::MoveTo(p) => {
+                        let p = pt(p);
+                        d.moveto(&mut s, p);
+                        d.beg = p;
+                        s.cur = p;
+                    }
+                    PathEl::LineTo(p) => {
+                        let p = pt(p);
+                        d.lineto(&mut s, p, false);
+                        s.cur = p;
+                    }
+                    PathEl::QuadTo(c, p) => {
+                        let (a, c, p) = (s.cur, pt(c), pt(p));
+                        d.quad(&mut s, a, c, p);
+                        s.cur = p;
+                    }
+                    PathEl::CubicTo(c1, c2, p) => {
+                        let (a, c1, c2, p) = (s.cur, pt(c1), pt(c2), pt(p));
+                        d.bezier(&mut s, a, c1, c2, p);
+                        s.cur = p;
+                    }
+                    PathEl::Close => {
+                        let beg = d.beg;
+                        d.lineto(&mut s, beg, false);
+                        s.cur = beg;
+                    }
+                }
+            }
+        }
+        None => {
+            for el in path.elements() {
+                match *el {
+                    PathEl::MoveTo(p) => {
+                        let p = pt(p);
+                        s.flush();
+                        s.moveto(p);
+                        s.cur = p;
+                    }
+                    PathEl::LineTo(p) => {
+                        let p = pt(p);
+                        s.lineto(p, false);
+                        s.cur = p;
+                    }
+                    PathEl::QuadTo(c, p) => {
+                        let (a, c, p) = (s.cur, pt(c), pt(p));
+                        s.quad(a, c, p);
+                        s.cur = p;
+                    }
+                    PathEl::CubicTo(c1, c2, p) => {
+                        let (a, c1, c2, p) = (s.cur, pt(c1), pt(c2), pt(p));
+                        s.bezier(a, c1, c2, p);
+                        s.cur = p;
+                    }
+                    PathEl::Close => s.closepath(),
+                }
+            }
+        }
+    }
+    s.flush();
+}
+
+fn pt(p: Point) -> [f32; 2] {
+    [p.x as f32, p.y as f32]
+}
+
+/// `fz_try_invert_matrix`: the inverse in double precision, or `None` when
+/// the matrix is singular.
+fn try_invert(m: &M32) -> Option<M32> {
+    let (a, b, c, d, e, f) = (
+        f64::from(m.a),
+        f64::from(m.b),
+        f64::from(m.c),
+        f64::from(m.d),
+        f64::from(m.e),
+        f64::from(m.f),
+    );
+    let det = a * d - b * c;
+    if (-f64::EPSILON..=f64::EPSILON).contains(&det) {
+        return None;
+    }
+    let det = 1.0 / det;
+    let ia = d * det;
+    let ib = -b * det;
+    let ic = -c * det;
+    let id = a * det;
+    Some(M32 {
+        a: ia as f32,
+        b: ib as f32,
+        c: ic as f32,
+        d: id as f32,
+        e: (-e * ia - f * ic) as f32,
+        f: (-e * ib - f * id) as f32,
+    })
+}
+
+/// The device clip of `edges` as a float rectangle (`fz_scissor_rasterizer`).
+fn clip_rect(edges: &Edges) -> [f32; 4] {
+    let r = edges.clip();
+    [r.x0 as f32, r.y0 as f32, r.x1 as f32, r.y1 as f32]
+}
+
+/// Bounding box of the rectangle's corners mapped through `m`
+/// (`fz_transform_rect`).
+fn transform_rect([x0, y0, x1, y1]: [f32; 4], m: &M32) -> [f32; 4] {
+    let corners = [
+        m.point([x0, y0]),
+        m.point([x0, y1]),
+        m.point([x1, y1]),
+        m.point([x1, y0]),
+    ];
+    let mut out = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    for [x, y] in corners {
+        out[0] = out[0].min(x);
+        out[1] = out[1].min(y);
+        out[2] = out[2].max(x);
+        out[3] = out[3].max(y);
     }
     out
 }
 
-fn polyline_length(l: &Polyline) -> f64 {
-    let mut len: f64 = l.points.windows(2).map(|w| (w[1] - w[0]).length()).sum();
-    if l.closed
-        && let (Some(&first), Some(&last)) = (l.points.first(), l.points.last())
-    {
-        len += (first - last).length();
-    }
-    len
-}
-
-fn dash_one(l: &Polyline, pattern: &[f64], phase: f64, out: &mut Vec<Polyline>) {
-    let n = pattern.len();
-    let mut idx = 0;
-    let mut remaining = pattern[0];
-    let mut skip = phase;
-    while skip > 0.0 {
-        if skip >= remaining {
-            skip -= remaining;
-            idx = (idx + 1) % n;
-            remaining = pattern[idx];
-        } else {
-            remaining -= skip;
-            skip = 0.0;
+/// `find_normal_vectors`: the half-width normal of `(dx, dy)`, or `None`
+/// when the segment is too short to have a direction.
+fn normal_vectors(dx: f32, dy: f32, linewidth: f32) -> Option<[f32; 2]> {
+    if dx == 0.0 {
+        if dy < FLT_TINY && dy > -FLT_TINY {
+            return None;
         }
-    }
-    let on_at_start = idx % 2 == 0;
-    let mut on = on_at_start;
-    let first_out = out.len();
-    let mut piece = Polyline::default();
-    if on {
-        piece.points.push(l.points[0]);
-        piece.smooth.push(false);
-    }
-    let count = l.points.len();
-    let segs = if l.closed {
-        count
+        Some([if dy > 0.0 { linewidth } else { -linewidth }, 0.0])
+    } else if dy == 0.0 {
+        if dx < FLT_TINY && dx > -FLT_TINY {
+            return None;
+        }
+        Some([0.0, if dx > 0.0 { -linewidth } else { linewidth }])
     } else {
-        count.saturating_sub(1)
-    };
-    for i in 0..segs {
-        let a = l.points[i];
-        let j = (i + 1) % count;
-        let b = l.points[j];
-        let seg = b - a;
-        let len = seg.length();
-        let dir = if len > 0.0 {
-            seg * (1.0 / len)
-        } else {
-            Point::new(1.0, 0.0)
-        };
-        let mut t = 0.0;
-        while len - t > remaining {
-            t += remaining;
-            let q = a + seg * (t / len);
-            if on {
-                piece.points.push(q);
-                piece.smooth.push(false);
-                piece.zero_dir = dir;
-                piece.has_segments = true;
-                out.push(std::mem::take(&mut piece));
-            } else {
-                piece.points.push(q);
-                piece.smooth.push(false);
-                piece.zero_dir = dir;
-            }
-            on = !on;
-            idx = (idx + 1) % n;
-            remaining = pattern[idx];
+        let sq = dx.mul_add(dx, dy * dy);
+        if sq < f32::EPSILON {
+            return None;
         }
-        remaining -= len - t;
-        if on {
-            piece.points.push(b);
-            piece
-                .smooth
-                .push(l.smooth.get(j).copied().unwrap_or(false) && j != 0);
-            piece.zero_dir = dir;
-            piece.has_segments = true;
-        }
-    }
-    if on && piece.has_segments {
-        if l.closed && on_at_start && out.len() > first_out {
-            // The dash running through the start point continues into the
-            // first dash: join them instead of capping both.
-            let first = std::mem::take(&mut out[first_out]);
-            piece.points.extend_from_slice(&first.points[1..]);
-            piece.smooth.extend_from_slice(&first.smooth[1..]);
-            out[first_out] = piece;
-        } else if l.closed && on_at_start {
-            let mut whole = l.clone();
-            whole.zero_dir = piece.zero_dir;
-            out.push(whole);
-        } else {
-            out.push(piece);
-        }
+        let scale = linewidth / sq.sqrt();
+        Some([dy * scale, -dx * scale])
     }
 }
 
+/// `advance`: `a + (b - a) * i / n`, never overrunning `b`.
+fn advance(a: f32, b: f32, i: f32, n: f32) -> f32 {
+    let d = b - a;
+    let target = a + d * i / n;
+    if (d < 0.0 && target < b) || (d > 0.0 && target > b) {
+        b
+    } else {
+        target
+    }
+}
+
+/// Stroker state (`sctx`): the pen, the last two vertices of the current
+/// subpath and its first two, so joins and the closing join can be built.
 struct Stroker<'a> {
-    hw: f64,
-    tol: f64,
-    cap: LineCap,
-    join: LineJoin,
-    miter_limit: f64,
-    transform: Transform,
     edges: &'a mut Edges,
-    scratch: Vec<Point>,
-    pts: Vec<Point>,
-    smooth: Vec<bool>,
-    /// Inner corner of the join at each vertex, when the quads are cut there.
-    cuts: Vec<Option<Cut>>,
-}
-
-/// Where the inner offset lines of two joined segments meet, on the left
-/// (`left`) or right side of the path.
-#[derive(Clone, Copy)]
-struct Cut {
-    q: Point,
-    left: bool,
-}
-
-/// The inner corner of the join at `cur`, when it lies within the near half
-/// of both segments (so cuts from the two ends of a segment cannot cross).
-/// Straight continuations need no cut and reversals have no inner corner.
-fn inner_corner(prev: Point, cur: Point, next: Point, hw: f64) -> Option<Cut> {
-    let (v0, v1) = (cur - prev, next - cur);
-    let (d0, d1) = (unit(v0), unit(v1));
-    let cross = d0.cross(d1);
-    let k = 1.0 + d0.dot(d1);
-    if cross == 0.0 || k <= 1e-9 {
-        return None;
-    }
-    // Distance from the vertex back along each segment: hw * tan(θ / 2).
-    let t = hw * cross.abs() / k;
-    if t > 0.5 * v0.length().min(v1.length()) {
-        return None;
-    }
-    let left_turn = cross > 0.0;
-    let side = if left_turn { hw } else { -hw };
-    Some(Cut {
-        q: cur + left(d0) * side - d0 * t,
-        left: left_turn,
-    })
-}
-
-fn left(d: Point) -> Point {
-    Point::new(-d.y, d.x)
-}
-
-fn rotate(v: Point, angle: f64) -> Point {
-    let (s, c) = angle.sin_cos();
-    Point::new(v.x * c - v.y * s, v.x * s + v.y * c)
+    ctm: M32,
+    flatness: f32,
+    linejoin: LineJoin,
+    /// Half the line width.
+    linewidth: f32,
+    miterlimit: f32,
+    cap: LineCap,
+    beg: [[f32; 2]; 2],
+    seg: [[f32; 2]; 2],
+    sn: usize,
+    not_just_moves: bool,
+    from_bezier: bool,
+    cur: [f32; 2],
+    /// Direction of the last segment, for the caps of zero-length pieces.
+    dirn: [f32; 2],
 }
 
 impl Stroker<'_> {
-    fn polyline(&mut self, l: &Polyline, eps: f64) {
-        self.pts.clear();
-        self.smooth.clear();
-        for (i, &p) in l.points.iter().enumerate() {
-            if !p.is_finite() {
-                continue;
-            }
-            let smooth = l.smooth.get(i).copied().unwrap_or(false);
-            match self.pts.last() {
-                Some(&last) if (p - last).length() <= eps => {
-                    if let Some(s) = self.smooth.last_mut() {
-                        *s = *s && smooth;
-                    }
-                }
-                _ => {
-                    self.pts.push(p);
-                    self.smooth.push(smooth);
-                }
-            }
-        }
-        let closed = l.closed;
-        if closed && self.pts.len() > 1 {
-            let first = self.pts[0];
-            if let Some(&last) = self.pts.last()
-                && (first - last).length() <= eps
-            {
-                self.pts.pop();
-                self.smooth.pop();
-            }
-        }
-        match self.pts.len() {
-            0 => {}
-            1 => self.dot(self.pts[0], l.zero_dir),
-            _ => self.segments(closed),
+    /// `fz_add_line`: one user-space edge, mapped to device space.
+    fn add_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        let [tx0, ty0] = self.ctm.point([x0, y0]);
+        let [tx1, ty1] = self.ctm.point([x1, y1]);
+        self.edges.line(tx0, ty0, tx1, ty1);
+    }
+
+    /// `fz_add_horiz_rect`: a horizontal segment's quad; under an
+    /// axis-aligned transform it takes the anti-dropout rectangle route.
+    fn add_horiz_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        let m = self.ctm;
+        if m.b == 0.0 && m.c == 0.0 {
+            let tx0 = m.a.mul_add(x0, m.e);
+            let ty0 = m.d.mul_add(y0, m.f);
+            let tx1 = m.a.mul_add(x1, m.e);
+            let ty1 = m.d.mul_add(y1, m.f);
+            self.edges.rect(tx1, ty1, tx0, ty0);
+        } else if m.a == 0.0 && m.d == 0.0 {
+            let tx0 = m.c.mul_add(y0, m.e);
+            let ty0 = m.b.mul_add(x0, m.f);
+            let tx1 = m.c.mul_add(y1, m.e);
+            let ty1 = m.b.mul_add(x1, m.f);
+            self.edges.rect(tx1, ty0, tx0, ty1);
+        } else {
+            self.add_line(x0, y0, x1, y0);
+            self.add_line(x1, y1, x0, y1);
         }
     }
 
-    fn segments(&mut self, closed: bool) {
-        let count = self.pts.len();
-        let nseg = if closed { count } else { count - 1 };
-        self.cuts.clear();
-        for j in 0..count {
-            let cut = if closed || (j > 0 && j + 1 < count) {
-                let prev = self.pts[(j + count - 1) % count];
-                let next = self.pts[(j + 1) % count];
-                inner_corner(prev, self.pts[j], next, self.hw)
-            } else {
-                None
-            };
-            self.cuts.push(cut);
-        }
-        let mut first_dir = Point::default();
-        let mut last_dir = Point::default();
-        let mut piece = std::mem::take(&mut self.scratch);
-        for i in 0..nseg {
-            let j = (i + 1) % count;
-            let a = self.pts[i];
-            let b = self.pts[j];
-            let d = unit(b - a);
-            if i == 0 {
-                first_dir = d;
+    /// `fz_add_arc`: the arc of the pen about `c` from offset `p0` to
+    /// offset `p1`, walked backwards when `rev`.
+    fn add_arc(&mut self, [xc, yc]: [f32; 2], [x0, y0]: [f32; 2], [x1, y1]: [f32; 2], rev: bool) {
+        let r = self.linewidth.abs();
+        let theta = 2.0 * SQRT_2 * (self.flatness / r).sqrt();
+        let mut th0 = y0.atan2(x0);
+        let mut th1 = y1.atan2(x1);
+        let n = if r > 0.0 {
+            if th0 < th1 {
+                th0 += PI * 2.0;
             }
-            last_dir = d;
-            let n = left(d) * self.hw;
-            // Left side from a to b, then right side back from b to a.
-            piece.clear();
-            match self.cuts[i] {
-                Some(Cut { q, left: true }) => piece.extend([a, q]),
-                _ => piece.push(a + n),
+            ((th0 - th1) / theta).ceil() as i32
+        } else {
+            if th1 < th0 {
+                th1 += PI * 2.0;
             }
-            match self.cuts[j] {
-                Some(Cut { q, left: true }) => piece.extend([q, b, b - n]),
-                Some(Cut { q, left: false }) => piece.extend([b + n, b, q]),
-                None => piece.extend([b + n, b - n]),
+            ((th1 - th0) / theta).ceil() as i32
+        };
+        let nf = n as f32;
+        if rev {
+            let (mut ox, mut oy) = (x1, y1);
+            for i in (1..n).rev() {
+                let theta = th0 + (th1 - th0) * i as f32 / nf;
+                let nx = theta.cos() * r;
+                let ny = theta.sin() * r;
+                self.add_line(xc + nx, yc + ny, xc + ox, yc + oy);
+                ox = nx;
+                oy = ny;
             }
-            match self.cuts[i] {
-                Some(Cut { q, left: false }) => piece.extend([q, a]),
-                _ => piece.push(a - n),
+            self.add_line(xc + x0, yc + y0, xc + ox, yc + oy);
+        } else {
+            let (mut ox, mut oy) = (x0, y0);
+            for i in 1..n {
+                let theta = th0 + (th1 - th0) * i as f32 / nf;
+                let nx = theta.cos() * r;
+                let ny = theta.sin() * r;
+                self.add_line(xc + ox, yc + oy, xc + nx, yc + ny);
+                ox = nx;
+                oy = ny;
             }
-            self.emit(&piece);
-        }
-        self.scratch = piece;
-        let joins = if closed { 0..count } else { 1..count - 1 };
-        for j in joins {
-            let prev = self.pts[(j + count - 1) % count];
-            let cur = self.pts[j];
-            let next = self.pts[(j + 1) % count];
-            let smooth = self.smooth[j];
-            self.join_at(cur, unit(cur - prev), unit(next - cur), smooth);
-        }
-        if !closed {
-            let start = self.pts[0];
-            let end = self.pts[count - 1];
-            self.cap_at(start, -first_dir);
-            self.cap_at(end, last_dir);
+            self.add_line(xc + ox, yc + oy, xc + x1, yc + y1);
         }
     }
 
-    fn join_at(&mut self, p: Point, d0: Point, d1: Point, smooth: bool) {
-        let cross = d0.cross(d1);
-        let dot = d0.dot(d1);
-        if cross.abs() <= 1e-12 && dot > 0.0 {
-            return;
+    /// `fz_add_line_join`: the join at `b` between segments `a→b` and
+    /// `b→c`. `join_under` fills the inner side with one edge when both
+    /// segments come from the same curve.
+    fn add_line_join(
+        &mut self,
+        [ax, ay]: [f32; 2],
+        [bx, by]: [f32; 2],
+        [cx, cy]: [f32; 2],
+        join_under: bool,
+    ) {
+        let miterlimit = self.miterlimit;
+        let linewidth = self.linewidth;
+        let mut linejoin = self.linejoin;
+        let mut dx0 = bx - ax;
+        let mut dy0 = by - ay;
+        let mut dx1 = cx - bx;
+        let mut dy1 = cy - by;
+        let mut cross = dx1.mul_add(dy0, -(dx0 * dy1));
+        let mut rev = false;
+        if cross < 0.0 {
+            let tmp = dx1;
+            dx1 = -dx0;
+            dx0 = -tmp;
+            let tmp = dy1;
+            dy1 = -dy0;
+            dy0 = -tmp;
+            cross = -cross;
+            rev = true;
         }
-        // The outer side is right of the path for a left turn.
-        let side = if cross > 0.0 { -1.0 } else { 1.0 };
-        let n0 = left(d0) * (self.hw * side);
-        let n1 = left(d1) * (self.hw * side);
-        let join = if smooth { LineJoin::Round } else { self.join };
-        match join {
-            LineJoin::Bevel => self.emit(&[p, p + n0, p + n1]),
+        let [dlx0, dly0] = normal_vectors(dx0, dy0, linewidth).unwrap_or_else(|| {
+            linejoin = LineJoin::Bevel;
+            [0.0, 0.0]
+        });
+        let [dlx1, dly1] = normal_vectors(dx1, dy1, linewidth).unwrap_or_else(|| {
+            linejoin = LineJoin::Bevel;
+            [0.0, 0.0]
+        });
+        let mut dmx = (dlx0 + dlx1) * 0.5;
+        let mut dmy = (dly0 + dly1) * 0.5;
+        let dmr2 = dmx.mul_add(dmx, dmy * dmy);
+        if cross * cross < f32::EPSILON && dx0.mul_add(dx1, dy0 * dy1) >= 0.0 {
+            linejoin = LineJoin::Bevel;
+        }
+        if linejoin == LineJoin::Miter && dmr2 * miterlimit * miterlimit < linewidth * linewidth {
+            linejoin = LineJoin::Bevel;
+        }
+        if join_under {
+            self.add_line(bx + dlx1, by + dly1, bx + dlx0, by + dly0);
+        } else {
+            self.edges.polyline(
+                &[[bx + dlx1, by + dly1], [bx, by], [bx + dlx0, by + dly0]],
+                &self.ctm,
+            );
+        }
+        match linejoin {
             LineJoin::Miter => {
-                let k = 1.0 + dot;
-                if k > 1e-12 && k * self.miter_limit * self.miter_limit >= 2.0 {
-                    let tip = p + (n0 + n1) * (1.0 / k);
-                    self.emit(&[p, p + n0, tip, p + n1]);
-                } else {
-                    self.emit(&[p, p + n0, p + n1]);
-                }
+                let scale = linewidth * linewidth / dmr2;
+                dmx *= scale;
+                dmy *= scale;
+                self.edges.polyline(
+                    &[
+                        [bx - dlx0, by - dly0],
+                        [bx - dmx, by - dmy],
+                        [bx - dlx1, by - dly1],
+                    ],
+                    &self.ctm,
+                );
+            }
+            LineJoin::Bevel => {
+                self.add_line(bx - dlx0, by - dly0, bx - dlx1, by - dly1);
             }
             LineJoin::Round => {
-                let angle = n0.cross(n1).atan2(n0.dot(n1)).abs() * -side;
-                self.scratch.clear();
-                self.scratch.push(p);
-                self.scratch.push(p + n0);
-                self.push_arc(p, n0, angle);
-                let pts = std::mem::take(&mut self.scratch);
-                self.emit(&pts);
-                self.scratch = pts;
+                self.add_arc([bx, by], [-dlx0, -dly0], [-dlx1, -dly1], rev);
             }
         }
     }
 
-    /// Cap at `p` bulging towards the outward direction `d`.
-    fn cap_at(&mut self, p: Point, d: Point) {
-        let n = left(d) * self.hw;
+    /// `do_linecap`: the cap at `b` for a segment whose half-width normal
+    /// is `(dlx, dly)`.
+    fn linecap(&mut self, bx: f32, by: f32, dlx: f32, dly: f32) {
         match self.cap {
-            LineCap::Butt => {}
-            LineCap::Square => {
-                let e = d * self.hw;
-                self.emit(&[p + n, p + n + e, p - n + e, p - n]);
+            LineCap::Butt => {
+                self.add_line(bx - dlx, by - dly, bx + dlx, by + dly);
             }
             LineCap::Round => {
-                self.scratch.clear();
-                self.scratch.push(p + n);
-                self.push_arc(p, n, -PI);
-                let pts = std::mem::take(&mut self.scratch);
-                self.emit(&pts);
-                self.scratch = pts;
+                let n =
+                    (PI / (2.0 * SQRT_2 * (self.flatness / self.linewidth).sqrt())).ceil() as i32;
+                let mut ox = bx - dlx;
+                let mut oy = by - dly;
+                for i in 1..n {
+                    let theta = PI * i as f32 / n as f32;
+                    let cth = theta.cos();
+                    let sth = theta.sin();
+                    let nx = (-dly).mul_add(sth, (-dlx).mul_add(cth, bx));
+                    let ny = dlx.mul_add(sth, (-dly).mul_add(cth, by));
+                    self.add_line(ox, oy, nx, ny);
+                    ox = nx;
+                    oy = ny;
+                }
+                self.add_line(ox, oy, bx + dlx, by + dly);
             }
-        }
-    }
-
-    /// Zero-length subpath: a round or square cap on both sides.
-    fn dot(&mut self, p: Point, dir: Point) {
-        let d = if dir.length() > 0.0 {
-            unit(dir)
-        } else {
-            Point::new(1.0, 0.0)
-        };
-        match self.cap {
-            LineCap::Butt => {}
             LineCap::Square => {
-                let e = d * self.hw;
-                let n = left(d) * self.hw;
-                self.emit(&[p + n + e, p - n + e, p - n - e, p + n - e]);
-            }
-            LineCap::Round => {
-                let v = Point::new(self.hw, 0.0);
-                self.scratch.clear();
-                self.scratch.push(p + v);
-                self.push_arc(p, v, -2.0 * PI);
-                self.scratch.pop();
-                let pts = std::mem::take(&mut self.scratch);
-                self.emit(&pts);
-                self.scratch = pts;
+                self.edges.polyline(
+                    &[
+                        [bx - dlx, by - dly],
+                        [bx - dlx - dly, by - dly + dlx],
+                        [bx + dlx - dly, by + dly + dlx],
+                        [bx + dlx, by + dly],
+                    ],
+                    &self.ctm,
+                );
             }
         }
     }
 
-    /// Pushes points of the arc that rotates `v` around `c` by `angle`,
-    /// excluding the start point.
-    fn push_arc(&mut self, c: Point, v: Point, angle: f64) {
-        let r = self.hw;
-        let step = if self.tol < r {
-            2.0 * (1.0 - self.tol / r).acos()
+    /// `fz_add_line_cap`: the cap at `b` of the segment `a→b`.
+    fn add_line_cap(&mut self, [ax, ay]: [f32; 2], [bx, by]: [f32; 2]) {
+        let dx = bx - ax;
+        let dy = by - ay;
+        let scale = self.linewidth / dx.mul_add(dx, dy * dy).sqrt();
+        self.linecap(bx, by, dy * scale, -dx * scale);
+    }
+
+    /// `fz_add_zero_len_cap`: a cap at `a` facing along (or, when `rev`,
+    /// against) the last known direction.
+    fn add_zero_len_cap(&mut self, [ax, ay]: [f32; 2], rev: bool) {
+        let [dx, dy] = if rev {
+            [-self.dirn[0], -self.dirn[1]]
         } else {
-            PI / 2.0
+            self.dirn
         };
-        let steps = if step > 0.0 {
-            ((angle.abs() / step).ceil() as usize).clamp(1, MAX_ARC_STEPS)
-        } else {
-            MAX_ARC_STEPS
-        };
-        for k in 1..=steps {
-            self.scratch
-                .push(c + rotate(v, angle * k as f64 / steps as f64));
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        let scale = self.linewidth / dx.mul_add(dx, dy * dy).sqrt();
+        self.linecap(ax, ay, dy * scale, -dx * scale);
+    }
+
+    /// `fz_add_line_dot`: the round dot a degenerate subpath gets.
+    fn add_line_dot(&mut self, [ax, ay]: [f32; 2]) {
+        let linewidth = self.linewidth;
+        let n = ((PI / (SQRT_2 * (self.flatness / linewidth).sqrt())).ceil() as i32).max(3);
+        let mut ox = ax - linewidth;
+        let mut oy = ay;
+        for i in 1..n {
+            let theta = PI * 2.0 * i as f32 / n as f32;
+            let cth = theta.cos();
+            let sth = theta.sin();
+            let nx = (-cth).mul_add(linewidth, ax);
+            let ny = sth.mul_add(linewidth, ay);
+            self.add_line(ox, oy, nx, ny);
+            ox = nx;
+            oy = ny;
+        }
+        self.add_line(ox, oy, ax - linewidth, ay);
+    }
+
+    /// `fz_stroke_flush`: caps the subpath built so far.
+    fn flush(&mut self) {
+        if self.sn == 1 {
+            let [b0, b1] = self.beg;
+            let [s0, s1] = self.seg;
+            self.add_line_cap(b1, b0);
+            self.add_line_cap(s0, s1);
+        } else if self.not_just_moves {
+            let b0 = self.beg[0];
+            if self.cap == LineCap::Round {
+                self.add_line_dot(b0);
+            } else {
+                self.add_zero_len_cap(b0, true);
+                self.add_zero_len_cap(b0, false);
+            }
         }
     }
 
-    /// Adds one piece with negative orientation, mapped to device space.
-    fn emit(&mut self, pts: &[Point]) {
-        let mut area = 0.0;
-        for (i, &a) in pts.iter().enumerate() {
-            let b = pts[(i + 1) % pts.len()];
-            area += a.cross(b);
+    /// `fz_stroke_moveto`.
+    fn moveto(&mut self, p: [f32; 2]) {
+        self.seg[0] = p;
+        self.beg[0] = p;
+        self.sn = 0;
+        self.not_just_moves = false;
+        self.from_bezier = false;
+        self.dirn = [0.0; 2];
+    }
+
+    /// `fz_stroke_lineto_aux`: extends the subpath to `(x, y)`; `dirn` is
+    /// the direction caps of a following zero-length piece align to.
+    fn lineto_aux(&mut self, [x, y]: [f32; 2], from_bezier: bool, dirn: [f32; 2]) {
+        let [ox, oy] = self.seg[self.sn];
+        let dx = x - ox;
+        let dy = y - oy;
+        self.not_just_moves = true;
+        self.dirn = dirn;
+        let Some([dlx, dly]) = normal_vectors(dx, dy, self.linewidth) else {
+            return;
+        };
+        if self.sn == 1 {
+            let under = self.from_bezier && from_bezier;
+            self.add_line_join(self.seg[0], [ox, oy], [x, y], under);
         }
-        self.edges.add_polygon(pts, &self.transform, area > 0.0);
+        if dy == 0.0 {
+            self.add_horiz_rect(ox, oy - dly, x, y + dly);
+        } else {
+            self.add_line(ox - dlx, oy - dly, x - dlx, y - dly);
+            self.add_line(x + dlx, y + dly, ox + dlx, oy + dly);
+        }
+        if self.sn == 1 {
+            self.seg[0] = self.seg[1];
+            self.seg[1] = [x, y];
+        } else {
+            self.seg[1] = [x, y];
+            self.beg[1] = [x, y];
+            self.sn = 1;
+        }
+        self.from_bezier = from_bezier;
+    }
+
+    /// `fz_stroke_lineto`.
+    fn lineto(&mut self, [x, y]: [f32; 2], from_bezier: bool) {
+        let [ox, oy] = self.seg[self.sn];
+        self.lineto_aux([x, y], from_bezier, [x - ox, y - oy]);
+    }
+
+    /// `fz_stroke_closepath`: closes with a segment back to the start and
+    /// the join between it and the first segment.
+    fn closepath(&mut self) {
+        if self.sn == 1 {
+            let [b0, b1] = self.beg;
+            self.lineto(b0, false);
+            self.add_line_join(self.seg[0], b0, b1, false);
+        } else if self.not_just_moves && self.cap == LineCap::Round {
+            self.add_line_dot(self.beg[0]);
+        }
+        self.seg[0] = self.beg[0];
+        self.sn = 0;
+        self.not_just_moves = false;
+        self.from_bezier = false;
+        self.dirn = [0.0; 2];
+    }
+
+    /// `fz_stroke_bezier`: flattens into `lineto` pieces flagged as curve.
+    fn bezier(&mut self, a: [f32; 2], b: [f32; 2], c: [f32; 2], d: [f32; 2]) {
+        let flatness = self.flatness;
+        bezier(flatness, a, b, c, d, &mut |_, p| self.lineto(p, true));
+    }
+
+    /// `fz_stroke_quad`.
+    fn quad(&mut self, a: [f32; 2], b: [f32; 2], c: [f32; 2]) {
+        let flatness = self.flatness;
+        quadratic(flatness, a, b, c, &mut |_, p| self.lineto(p, true));
     }
 }
 
-fn unit(v: Point) -> Point {
-    let len = v.length();
-    if len > 0.0 {
-        v * (1.0 / len)
-    } else {
-        Point::new(1.0, 0.0)
+/// The dash walker (`fz_dash_*`): tracks the position within the dash
+/// pattern along the flattened path and feeds the stroker only the "on"
+/// pieces, each as its own capped subpath.
+struct Dashing<'a> {
+    /// User-space scissor: the device clip mapped back, grown by the line
+    /// width. Segments are clipped to it before being dashed.
+    rect: [f32; 4],
+    list: &'a [f64],
+    start_phase: f32,
+    total: f32,
+    /// Inside an "on" piece.
+    toggle: bool,
+    offset: usize,
+    phase: f32,
+    cur: [f32; 2],
+    beg: [f32; 2],
+}
+
+impl Dashing<'_> {
+    fn entry(&self) -> f32 {
+        self.list[self.offset] as f32
+    }
+
+    fn next_entry(&mut self) {
+        self.offset += 1;
+        if self.offset == self.list.len() {
+            self.offset = 0;
+        }
+    }
+
+    /// Skips the pattern over `len` units of path, keeping the on/off
+    /// state in step (the two "update the position in the dash array"
+    /// blocks of `fz_dash_lineto`). Returns the leftover phase.
+    fn skip(&mut self, len: f32, strict: bool) -> f32 {
+        let mut len = len + self.phase;
+        let n = (len / self.total) as i32;
+        len = (-(n as f32)).mul_add(self.total, len);
+        if (n & self.list.len() as i32 & 1) != 0 {
+            self.toggle = !self.toggle;
+        }
+        while if strict {
+            len > self.entry()
+        } else {
+            len >= self.entry()
+        } {
+            len -= self.entry();
+            self.next_entry();
+            self.toggle = !self.toggle;
+        }
+        len
+    }
+
+    /// `fz_dash_moveto`.
+    fn moveto(&mut self, s: &mut Stroker<'_>, p: [f32; 2]) {
+        self.toggle = true;
+        self.offset = 0;
+        self.phase = self.start_phase;
+        while self.phase > 0.0 && self.phase >= self.entry() {
+            self.toggle = !self.toggle;
+            self.phase -= self.entry();
+            self.next_entry();
+        }
+        self.cur = p;
+        if self.toggle {
+            s.flush();
+            s.moveto(p);
+        }
+    }
+
+    /// Either continues the "on" piece to `p` or starts one there. `dirn`
+    /// is the direction a following zero-length cap aligns to; `None`
+    /// takes it from the pen's last point (`fz_stroke_lineto`).
+    fn step(&self, s: &mut Stroker<'_>, p: [f32; 2], from_bezier: bool, dirn: Option<[f32; 2]>) {
+        if self.toggle {
+            match dirn {
+                Some(dirn) => s.lineto_aux(p, from_bezier, dirn),
+                None => s.lineto(p, from_bezier),
+            }
+        } else {
+            s.flush();
+            s.moveto(p);
+        }
+    }
+
+    /// `fz_dash_lineto`.
+    fn lineto(&mut self, s: &mut Stroker<'_>, [mut bx, mut by]: [f32; 2], from_bezier: bool) {
+        let [rx0, ry0, rx1, ry1] = self.rect;
+        let [mut ax, mut ay] = self.cur;
+        let mut dx = bx - ax;
+        let mut dy = by - ay;
+        let mut used = 0.0f32;
+        let mut tail;
+        let mut total = dx.mul_add(dx, dy * dy).sqrt();
+        let mut old_b = [0.0f32; 2];
+
+        // Bring `a` onto the screen, first horizontally, then vertically. A
+        // segment entirely off screen only advances the pattern.
+        let mut off_screen = false;
+        let mut d = rx0 - ax;
+        let mut moved = false;
+        if d > 0.0 {
+            if bx < rx0 {
+                off_screen = true;
+            } else {
+                ax = rx0;
+                moved = true;
+            }
+        } else if d < 0.0 {
+            d = rx1 - ax;
+            if d < 0.0 {
+                if bx > rx1 {
+                    off_screen = true;
+                } else {
+                    ax = rx1;
+                    moved = true;
+                }
+            }
+        }
+        if moved {
+            ay = advance(ay, by, d, dx);
+            used = total * d / dx;
+            total -= used;
+            dx = bx - ax;
+            dy = by - ay;
+        }
+        if !off_screen {
+            let mut d = ry0 - ay;
+            let mut moved = false;
+            if d > 0.0 {
+                if by < ry0 {
+                    off_screen = true;
+                } else {
+                    ay = ry0;
+                    moved = true;
+                }
+            } else if d < 0.0 {
+                d = ry1 - ay;
+                if d < 0.0 {
+                    if by > ry1 {
+                        off_screen = true;
+                    } else {
+                        ay = ry1;
+                        moved = true;
+                    }
+                }
+            }
+            if moved {
+                ax = advance(ax, bx, d, dy);
+                let d = total * d / dy;
+                total -= d;
+                used += d;
+                dx = bx - ax;
+                dy = by - ay;
+            }
+        }
+        if off_screen {
+            tail = total;
+            old_b = [bx, by];
+        } else {
+            if used != 0.0 {
+                self.step(s, [ax, ay], from_bezier, None);
+                self.phase = self.skip(used, false);
+                self.step(s, [ax, ay], from_bezier, None);
+                used = 0.0;
+            }
+
+            // Now if `b` is off screen, bring it back.
+            tail = 0.0;
+            if dx != 0.0 {
+                let mut d = bx - rx0;
+                let mut moved = false;
+                if d < 0.0 {
+                    old_b = [bx, by];
+                    bx = rx0;
+                    moved = true;
+                } else if d > 0.0 {
+                    d = bx - rx1;
+                    if d > 0.0 {
+                        old_b = [bx, by];
+                        bx = rx1;
+                        moved = true;
+                    }
+                }
+                if moved {
+                    by = advance(by, ay, d, dx);
+                    tail = total * d / dx;
+                    total -= tail;
+                    dx = bx - ax;
+                    dy = by - ay;
+                }
+            }
+            if dy != 0.0 {
+                let mut d = by - ry0;
+                let mut moved = false;
+                if d < 0.0 {
+                    old_b = [bx, by];
+                    by = ry0;
+                    moved = true;
+                } else if d > 0.0 {
+                    d = by - ry1;
+                    if d > 0.0 {
+                        old_b = [bx, by];
+                        by = ry1;
+                        moved = true;
+                    }
+                }
+                if moved {
+                    bx = advance(bx, ax, d, dy);
+                    let t = total * d / dy;
+                    tail += t;
+                    total -= t;
+                    dx = bx - ax;
+                    dy = by - ay;
+                }
+            }
+
+            while total - used > self.entry() - self.phase {
+                used += self.entry() - self.phase;
+                let ratio = used / total;
+                let mx = ratio.mul_add(dx, ax);
+                let my = ratio.mul_add(dy, ay);
+                self.step(s, [mx, my], from_bezier, Some([dx, dy]));
+                self.toggle = !self.toggle;
+                self.phase = 0.0;
+                self.next_entry();
+            }
+            self.phase += total - used;
+
+            if tail == 0.0 {
+                self.cur = [bx, by];
+                if self.toggle {
+                    s.lineto_aux([bx, by], from_bezier, [dx, dy]);
+                }
+                return;
+            }
+        }
+
+        // The rest of the segment lies off screen: skip the pattern over it.
+        self.cur = old_b;
+        self.step(s, old_b, from_bezier, Some([dx, dy]));
+        self.phase = self.skip(tail, true);
+        self.step(s, old_b, from_bezier, Some([dx, dy]));
+    }
+
+    /// `fz_dash_bezier`.
+    fn bezier(&mut self, s: &mut Stroker<'_>, a: [f32; 2], b: [f32; 2], c: [f32; 2], d: [f32; 2]) {
+        let flatness = s.flatness;
+        bezier(flatness, a, b, c, d, &mut |_, p| self.lineto(s, p, true));
+    }
+
+    /// `fz_dash_quad`.
+    fn quad(&mut self, s: &mut Stroker<'_>, a: [f32; 2], b: [f32; 2], c: [f32; 2]) {
+        let flatness = s.flatness;
+        quadratic(flatness, a, b, c, &mut |_, p| self.lineto(s, p, true));
     }
 }

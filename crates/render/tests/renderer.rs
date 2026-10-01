@@ -29,6 +29,33 @@ fn pixels(doc: &Document) -> pdf_raster::Pixmap {
     render_page(doc, &doc.page(0).unwrap(), &RenderOptions::default()).unwrap()
 }
 
+/// PyMuPDF 1.27.2: the bottom row has 14/15 coverage at 300 dpi.
+/// Keeping the dpi scale in double precision moves it onto the next sample.
+#[test]
+fn fractional_dpi_preserves_the_last_subscanline() {
+    let doc = document(b"0.5 g 5.25 6.4 29.5 27.3 re f", Dict::new());
+    let image = render_page(
+        &doc,
+        &doc.page(0).unwrap(),
+        &RenderOptions {
+            dpi: 300.0,
+            ..RenderOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(image.pixel(22, 139), Some([135, 135, 135, 255]));
+    assert_eq!(image.pixel(22, 138), Some([127, 127, 127, 255]));
+    assert_eq!(image.pixel(22, 140), Some([255, 255, 255, 255]));
+}
+
+#[test]
+fn round_cap_only_paints_an_open_zero_length_segment() {
+    let doc = document(b"0 g 4 w 1 J 10 10 m 10 10 l S 12 30 m h S", Dict::new());
+    let image = pixels(&doc);
+    assert_eq!(image.pixel(10, 30), Some([0, 0, 0, 255]));
+    assert_eq!(image.pixel(12, 10), Some([255, 255, 255, 255]));
+}
+
 #[test]
 fn nested_clip_is_restored_before_the_next_paint() {
     let doc = document(
@@ -106,7 +133,8 @@ fn image_rows_and_soft_mask_use_the_same_top_edge() {
     resources.insert("XObject", xobjects);
     set_resources(&mut doc, resources);
     let image = pixels(&doc);
-    assert_eq!(image.pixel(15, 15), Some([255, 127, 127, 255]));
+    // MuPDF source-over: 128 + (255 * 127 >> 8) = 254; green = 126.
+    assert_eq!(image.pixel(15, 15), Some([254, 126, 126, 255]));
     assert_eq!(image.pixel(15, 25), Some([0, 0, 255, 255]));
     assert_eq!(image.pixel(5, 5), Some([255, 255, 255, 255]));
 }
@@ -204,6 +232,41 @@ fn axial_shading_evaluates_its_function_across_the_page() {
     assert_eq!(image.pixel(0, 20), Some([255, 0, 0, 255]));
     let [r, g, b, a] = image.pixel(39, 20).unwrap();
     assert!((5..=6).contains(&r) && g == 0 && (248..=249).contains(&b) && a == 255);
+}
+
+/// Diagonal axial shading from the synthetic oracle fixture. Fusing the
+/// edge interpolation avoids crossing adjacent 16.16 colour-table bins.
+#[test]
+fn diagonal_axial_gradient_keeps_its_colour_bins() {
+    let mut function = Dict::new();
+    function.insert("FunctionType", 2);
+    function.insert("Domain", Object::Array(vec![0.into(), 1.into()]));
+    function.insert("C0", Object::Array(vec![1.into(), 0.into(), 0.into()]));
+    function.insert("C1", Object::Array(vec![0.into(), 0.into(), 1.into()]));
+    function.insert("N", 1);
+    let mut shading = Dict::new();
+    shading.insert("ShadingType", 2);
+    shading.insert("ColorSpace", name("DeviceRGB"));
+    shading.insert(
+        "Coords",
+        Object::Array(vec![8.into(), 8.into(), 56.into(), 56.into()]),
+    );
+    shading.insert("Function", function);
+    shading.insert("Extend", Object::Array(vec![true.into(), true.into()]));
+    let mut shadings = Dict::new();
+    shadings.insert("S", shading);
+    let mut resources = Dict::new();
+    resources.insert("Shading", shadings);
+    let mut doc = document(b"/S sh", resources);
+    let page = doc.page(0).unwrap();
+    let mut dict = page.dict;
+    dict.insert("MediaBox", Rect::new(0.0, 0.0, 64.0, 64.0).to_object());
+    doc.set(page.id, dict);
+    let image = pixels(&doc);
+    // PyMuPDF 1.27.2 row 46. Unfused interpolation gives [253,0,2]
+    // at its left end and shifts the entire row's colour-table bins.
+    assert_eq!(image.pixel(0, 46), Some([250, 0, 5, 255]));
+    assert_eq!(image.pixel(15, 46), Some([210, 0, 45, 255]));
 }
 
 /// MuPDF's model: the background fills the scissor, which its display list
@@ -319,18 +382,35 @@ fn tiling_cell_edge_inside_a_pixel_keeps_its_coverage_in_every_copy() {
     resources.insert("Pattern", patterns);
     set_resources(&mut doc, resources);
     let image = pixels(&doc);
-    // The cell's right edge covers 0.3 of pixel 7 (and of pixel 19 in the
-    // next copy): red over white at alpha 76 or 77 leaves green at 178..179.
+    // The 17×15 grid gives coverage 75, which paints premultiplied
+    // [74, 0, 0, 74]. MuPDF's tile source-over leaves 181 green over white.
     for x in [7, 19] {
-        let [r, g, b, _] = image.pixel(x, 37).unwrap();
-        assert!(
-            r == 255 && (177..=180).contains(&g) && g == b,
-            "pixel {x}: {:?}",
-            [r, g, b]
-        );
+        assert_eq!(image.pixel(x, 37), Some([255, 181, 181, 255]));
     }
     assert_eq!(image.pixel(8, 37), Some([255, 255, 255, 255]));
     assert_eq!(image.pixel(12, 37), Some([255, 0, 0, 255]));
+    let page = doc.page(0).unwrap();
+    let mut dict = page.dict;
+    dict.insert("MediaBox", Rect::new(0.0, 0.0, 64.0, 64.0).to_object());
+    dict.insert(
+        "Contents",
+        doc.add(Stream::new(
+            Dict::new(),
+            b"/Pattern cs /P scn 0 0 64 64 re f".to_vec(),
+        )),
+    );
+    doc.set(page.id, dict);
+    let image = render_page(
+        &doc,
+        &doc.page(0).unwrap(),
+        &RenderOptions {
+            dpi: 300.0,
+            ..RenderOptions::default()
+        },
+    )
+    .unwrap();
+    // MuPDF quantizes in page coordinates, before removing the cell origin.
+    assert_eq!(image.pixel(0, 33), Some([254, 84, 84, 255]));
 }
 
 #[test]
@@ -446,4 +526,147 @@ fn graphics_only_omits_text_paint_but_preserves_text_clipping() {
     assert_eq!(image.pixel(7, 30), Some([255, 0, 0, 255]));
     assert_eq!(image.pixel(12, 27), Some([0, 0, 255, 255]));
     assert_eq!(image.pixel(2, 30), Some([0, 0, 255, 255]));
+}
+
+fn standard_font(name: &str) -> Dict {
+    let mut font = Dict::new();
+    font.insert("Type", Object::name("Font"));
+    font.insert("Subtype", Object::name("Type1"));
+    font.insert("BaseFont", Object::name(name));
+    let mut fonts = Dict::new();
+    fonts.insert("F", font);
+    let mut resources = Dict::new();
+    resources.insert("Font", fonts);
+    resources
+}
+
+#[test]
+fn standard_fourteen_faces_keep_their_own_shapes() {
+    // Sum of 255-red over the 40×40 page, measured with PyMuPDF 1.27.2.
+    // Wrong host substitutions, swapped bold/italic faces, and Symbol or
+    // Dingbats encoding errors change the actual rendered ink.
+    for (face, ink) in [
+        ("Courier", 15650),
+        ("Courier-Bold", 30639),
+        ("Courier-BoldOblique", 30735),
+        ("Courier-Oblique", 15657),
+        ("Helvetica", 26538),
+        ("Helvetica-Bold", 39061),
+        ("Helvetica-BoldOblique", 39674),
+        ("Helvetica-Oblique", 26812),
+        ("Symbol", 16928),
+        ("Times-Bold", 25409),
+        ("Times-BoldItalic", 22796),
+        ("Times-Italic", 15877),
+        ("Times-Roman", 18351),
+        ("ZapfDingbats", 20725),
+    ] {
+        let doc = document(
+            b"BT /F 18 Tf 1 0 0 1 4 8 Tm (Ag) Tj ET",
+            standard_font(face),
+        );
+        let image = pixels(&doc);
+        let actual: u64 = image
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| u64::from(255 - p[0]))
+            .sum();
+        assert_eq!(actual, ink, "{face}");
+    }
+}
+
+#[test]
+fn stroked_glyph_cache_distinguishes_line_widths() {
+    let doc = document(
+        b"BT /F 12 Tf 1 Tr 0.2 w 1 0 0 1 2 14 Tm (R) Tj 2 w 1 0 0 1 22 14 Tm (R) Tj ET",
+        standard_font("Helvetica"),
+    );
+    let image = pixels(&doc);
+    let mut ink = [0_u64; 2];
+    for (i, pixel) in image.data().as_chunks::<4>().0.iter().enumerate() {
+        ink[(i % 40) / 20] += u64::from(255 - pixel[0]);
+    }
+    // PyMuPDF: thin and thick outlines, on otherwise identical glyphs.
+    assert_eq!(ink, [2455, 20039]);
+}
+
+#[test]
+fn glyph_above_bitmap_limit_uses_hinted_user_space_outline() {
+    let mut doc = document(
+        b"BT /F 72 Tf 1 0 0 1 4 6.3 Tm (R) Tj ET",
+        standard_font("Helvetica"),
+    );
+    let page = doc.page(0).unwrap();
+    let mut dict = page.dict;
+    dict.insert("MediaBox", Rect::new(0.0, 0.0, 64.0, 64.0).to_object());
+    doc.set(page.id, dict);
+    let image = render_page(
+        &doc,
+        &doc.page(0).unwrap(),
+        &RenderOptions {
+            dpi: 300.0,
+            ..RenderOptions::default()
+        },
+    )
+    .unwrap();
+    let ink: u64 = image
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| u64::from(255 - p[0]))
+        .sum();
+    // The 300px em exceeds the bitmap cache limit. MuPDF's hinted outline
+    // has this coverage over the 267×267 page, including fractional edges.
+    assert_eq!(ink, 4_332_752);
+}
+
+#[test]
+fn fractional_dpi_shading_box_does_not_leak_into_the_previous_column() {
+    let mut function = Dict::new();
+    function.insert("FunctionType", 2);
+    function.insert("Domain", Object::Array(vec![0.into(), 1.into()]));
+    function.insert("C0", Object::Array(vec![1.into(), 0.into(), 0.into()]));
+    function.insert("C1", Object::Array(vec![0.into(), 0.into(), 1.into()]));
+    function.insert("N", 1);
+    let mut shading = Dict::new();
+    shading.insert("ShadingType", 3);
+    shading.insert("ColorSpace", name("DeviceRGB"));
+    shading.insert(
+        "Coords",
+        Object::Array(vec![
+            32.into(),
+            32.into(),
+            0.into(),
+            32.into(),
+            32.into(),
+            40.into(),
+        ]),
+    );
+    shading.insert("Function", function);
+    shading.insert("Extend", Object::Array(vec![false.into(), false.into()]));
+    shading.insert("BBox", Rect::new(12.0, 4.0, 52.0, 60.0).to_object());
+    let mut shadings = Dict::new();
+    shadings.insert("S", shading);
+    let mut resources = Dict::new();
+    resources.insert("Shading", shadings);
+    let mut doc = document(b"/S sh", resources);
+    let page = doc.page(0).unwrap();
+    let mut dict = page.dict;
+    dict.insert("MediaBox", Rect::new(0.0, 0.0, 64.0, 64.0).to_object());
+    doc.set(page.id, dict);
+    let image = render_page(
+        &doc,
+        &doc.page(0).unwrap(),
+        &RenderOptions {
+            dpi: 300.0,
+            ..RenderOptions::default()
+        },
+    )
+    .unwrap();
+    // PyMuPDF: float32 12 × (300/72) is exactly 50, not 49.999998.
+    assert_eq!(image.pixel(49, 100), Some([255, 255, 255, 255]));
+    assert_eq!(image.pixel(50, 100), Some([118, 0, 136, 255]));
 }

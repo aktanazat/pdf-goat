@@ -1,10 +1,10 @@
-//! Path construction and curve flattening.
+//! Path construction and MuPDF-style curve flattening.
 
 use crate::geom::{Point, Rect, Transform};
 
-/// Upper bound on line segments produced for one curve, so a curve with huge
-/// control points cannot allocate without bound.
-const MAX_CURVE_SEGMENTS: usize = 512;
+/// Deepest midpoint subdivision of one curve (MuPDF `MAX_DEPTH`): at most
+/// 256 segments.
+const MAX_DEPTH: u32 = 8;
 
 /// One path element in user space.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -226,170 +226,185 @@ impl PathBuilder {
     }
 }
 
-/// Receiver for flattened geometry.
-pub(crate) trait FlattenSink {
-    fn move_to(&mut self, p: Point);
-    /// `smooth` marks a vertex inside a flattened curve.
-    fn line_to(&mut self, p: Point, smooth: bool);
-    fn close(&mut self);
+/// A transform in `f32` with the arithmetic MuPDF's compiled code uses:
+/// in `x * a + y * c + e` the first product fuses into a multiply-add, the
+/// `+ e` does not.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct M32 {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
 }
 
-/// Flattens `path` after mapping it through `t`, with at most `tolerance`
-/// distance between the curve and its polyline in the destination space.
-pub(crate) fn flatten(path: &Path, t: &Transform, tolerance: f64, sink: &mut impl FlattenSink) {
-    let tol = if tolerance.is_finite() && tolerance > 1e-6 {
-        tolerance
-    } else {
-        0.25
-    };
-    let mut current = Point::default();
-    let mut start = Point::default();
-    let mut has_current = false;
-    for el in path.elements() {
-        match *el {
-            PathEl::MoveTo(p) => {
-                current = t.apply(p);
-                start = current;
-                has_current = true;
-                sink.move_to(current);
-            }
-            PathEl::LineTo(p) => {
-                let p = t.apply(p);
-                if !has_current {
-                    start = p;
-                    has_current = true;
-                    sink.move_to(p);
-                } else {
-                    sink.line_to(p, false);
-                }
-                current = p;
-            }
-            PathEl::QuadTo(c, p) => {
-                let c = t.apply(c);
-                let p = t.apply(p);
-                if !has_current {
-                    start = c;
-                    current = c;
-                    has_current = true;
-                    sink.move_to(c);
-                }
-                let dd = (current - c * 2.0 + p).length();
-                let n = segment_count(0.25 * dd, tol);
-                for i in 1..n {
-                    let s = i as f64 / n as f64;
-                    let a = current.lerp(c, s);
-                    let b = c.lerp(p, s);
-                    sink.line_to(a.lerp(b, s), true);
-                }
-                sink.line_to(p, false);
-                current = p;
-            }
-            PathEl::CubicTo(c1, c2, p) => {
-                let c1 = t.apply(c1);
-                let c2 = t.apply(c2);
-                let p = t.apply(p);
-                if !has_current {
-                    start = c1;
-                    current = c1;
-                    has_current = true;
-                    sink.move_to(c1);
-                }
-                let dd1 = (current - c1 * 2.0 + c2).length();
-                let dd2 = (c1 - c2 * 2.0 + p).length();
-                let n = segment_count(0.75 * dd1.max(dd2), tol);
-                let p0 = current;
-                for i in 1..n {
-                    let s = i as f64 / n as f64;
-                    let u = 1.0 - s;
-                    let q = p0 * (u * u * u)
-                        + c1 * (3.0 * u * u * s)
-                        + c2 * (3.0 * u * s * s)
-                        + p * (s * s * s);
-                    sink.line_to(q, true);
-                }
-                sink.line_to(p, false);
-                current = p;
-            }
-            PathEl::Close => {
-                if has_current {
-                    sink.close();
-                    current = start;
-                }
-            }
+impl From<&Transform> for M32 {
+    fn from(t: &Transform) -> M32 {
+        M32 {
+            a: t.a as f32,
+            b: t.b as f32,
+            c: t.c as f32,
+            d: t.d as f32,
+            e: t.e as f32,
+            f: t.f as f32,
         }
     }
 }
 
-/// Wang's formula: segments needed so the chord error stays under `tol`,
-/// given `k * M` where `M` is the largest second difference.
-fn segment_count(km: f64, tol: f64) -> usize {
-    let n = (km / tol).sqrt().ceil();
-    if n.is_finite() && n >= 1.0 {
-        (n as usize).min(MAX_CURVE_SEGMENTS)
-    } else if n.is_finite() {
-        1
-    } else {
-        MAX_CURVE_SEGMENTS
+impl M32 {
+    /// `fz_transform_point`.
+    pub fn point(&self, [x, y]: [f32; 2]) -> [f32; 2] {
+        [
+            x.mul_add(self.a, y * self.c) + self.e,
+            x.mul_add(self.b, y * self.d) + self.f,
+        ]
+    }
+
+    /// `fz_matrix_expansion`: the geometric mean scale.
+    pub fn expansion(&self) -> f32 {
+        self.a.mul_add(self.d, -(self.b * self.c)).abs().sqrt()
+    }
+
+    /// `fz_matrix_max_expansion`: the largest coefficient magnitude.
+    pub fn max_expansion(&self) -> f32 {
+        self.a
+            .abs()
+            .max(self.b.abs())
+            .max(self.c.abs())
+            .max(self.d.abs())
     }
 }
 
-/// A flattened subpath: points plus per-vertex smoothness flags.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Polyline {
-    pub points: Vec<Point>,
-    pub smooth: Vec<bool>,
-    pub closed: bool,
-    /// Set when the subpath contains any drawing element, even if all its
-    /// points coincide (a zero-length subpath that still gets caps).
-    pub has_segments: bool,
-    /// Orientation for square caps when the subpath has zero length.
-    pub zero_dir: Point,
+/// Flattens the cubic `a b c d` by midpoint subdivision until the control
+/// polygon deviates less than `flatness`, emitting `line(from, to)` for each
+/// piece. Ported from MuPDF `draw-path.c` `bezier` (AGPL).
+pub(crate) fn bezier(
+    flatness: f32,
+    a: [f32; 2],
+    b: [f32; 2],
+    c: [f32; 2],
+    d: [f32; 2],
+    line: &mut impl FnMut([f32; 2], [f32; 2]),
+) {
+    bezier_depth(flatness, a, b, c, d, 0, line);
 }
 
-impl Polyline {
-    fn starting_at(p: Point) -> Polyline {
-        Polyline {
-            points: vec![p],
-            smooth: vec![false],
-            closed: false,
-            has_segments: false,
-            zero_dir: Point::new(1.0, 0.0),
-        }
+fn bezier_depth(
+    flatness: f32,
+    [xa, ya]: [f32; 2],
+    [xb, yb]: [f32; 2],
+    [xc, yc]: [f32; 2],
+    [xd, yd]: [f32; 2],
+    depth: u32,
+    line: &mut impl FnMut([f32; 2], [f32; 2]),
+) {
+    let dmax = (xa - xb)
+        .abs()
+        .max((ya - yb).abs())
+        .max((xd - xc).abs())
+        .max((yd - yc).abs());
+    if dmax < flatness || depth >= MAX_DEPTH {
+        line([xa, ya], [xd, yd]);
+        return;
     }
+    let mut xab = xa + xb;
+    let mut yab = ya + yb;
+    let xbc = xb + xc;
+    let ybc = yb + yc;
+    let mut xcd = xc + xd;
+    let mut ycd = yc + yd;
+    let mut xabc = xab + xbc;
+    let mut yabc = yab + ybc;
+    let mut xbcd = xbc + xcd;
+    let mut ybcd = ybc + ycd;
+    let mut xabcd = xabc + xbcd;
+    let mut yabcd = yabc + ybcd;
+    xab *= 0.5;
+    yab *= 0.5;
+    xcd *= 0.5;
+    ycd *= 0.5;
+    xabc *= 0.25;
+    yabc *= 0.25;
+    xbcd *= 0.25;
+    ybcd *= 0.25;
+    xabcd *= 0.125;
+    yabcd *= 0.125;
+    bezier_depth(
+        flatness,
+        [xa, ya],
+        [xab, yab],
+        [xabc, yabc],
+        [xabcd, yabcd],
+        depth + 1,
+        line,
+    );
+    bezier_depth(
+        flatness,
+        [xabcd, yabcd],
+        [xbcd, ybcd],
+        [xcd, ycd],
+        [xd, yd],
+        depth + 1,
+        line,
+    );
 }
 
-/// Collects flattened subpaths as polylines.
-#[derive(Default)]
-pub(crate) struct PolylineCollector {
-    pub lines: Vec<Polyline>,
+/// Flattens the quadratic `a b c` like [`bezier`]. Ported from MuPDF
+/// `draw-path.c` `quad` (AGPL).
+pub(crate) fn quadratic(
+    flatness: f32,
+    a: [f32; 2],
+    b: [f32; 2],
+    c: [f32; 2],
+    line: &mut impl FnMut([f32; 2], [f32; 2]),
+) {
+    quadratic_depth(flatness, a, b, c, 0, line);
 }
 
-impl FlattenSink for PolylineCollector {
-    fn move_to(&mut self, p: Point) {
-        if let Some(last) = self.lines.last_mut()
-            && !last.has_segments
-        {
-            *last = Polyline::starting_at(p);
-            return;
-        }
-        self.lines.push(Polyline::starting_at(p));
+fn quadratic_depth(
+    flatness: f32,
+    [xa, ya]: [f32; 2],
+    [xb, yb]: [f32; 2],
+    [xc, yc]: [f32; 2],
+    depth: u32,
+    line: &mut impl FnMut([f32; 2], [f32; 2]),
+) {
+    let dmax = (xa - xb)
+        .abs()
+        .max((ya - yb).abs())
+        .max((xc - xb).abs())
+        .max((yc - yb).abs());
+    if dmax < flatness || depth >= MAX_DEPTH {
+        line([xa, ya], [xc, yc]);
+        return;
     }
-
-    fn line_to(&mut self, p: Point, smooth: bool) {
-        if let Some(last) = self.lines.last_mut() {
-            last.points.push(p);
-            last.smooth.push(smooth);
-            last.has_segments = true;
-        }
-    }
-
-    fn close(&mut self) {
-        if let Some(last) = self.lines.last_mut() {
-            last.closed = true;
-            last.has_segments = true;
-            let start = last.points[0];
-            // A following drawing element continues from the start in a new subpath.
-            self.lines.push(Polyline::starting_at(start));
-        }
-    }
+    let mut xab = xa + xb;
+    let mut yab = ya + yb;
+    let mut xbc = xb + xc;
+    let mut ybc = yb + yc;
+    let mut xabc = xab + xbc;
+    let mut yabc = yab + ybc;
+    xab *= 0.5;
+    yab *= 0.5;
+    xbc *= 0.5;
+    ybc *= 0.5;
+    xabc *= 0.25;
+    yabc *= 0.25;
+    quadratic_depth(
+        flatness,
+        [xa, ya],
+        [xab, yab],
+        [xabc, yabc],
+        depth + 1,
+        line,
+    );
+    quadratic_depth(
+        flatness,
+        [xabc, yabc],
+        [xbc, ybc],
+        [xc, yc],
+        depth + 1,
+        line,
+    );
 }

@@ -53,14 +53,14 @@ impl Edge {
         let t = (y - top.y) * r;
         let diff = bottom.x - top.x;
         let mut edge = Edge {
-            x: top.x + diff * t,
+            x: diff.mul_add(t, top.x),
             dx: diff * r,
             v: [0; MAXN],
             dv: [0; MAXN],
         };
         for i in 0..n {
             let diff = bottom.value[i] - top.value[i];
-            edge.v[i] = (65536.0 * (top.value[i] + diff * t)) as i32;
+            edge.v[i] = (65536.0 * diff.mul_add(t, top.value[i])) as i32;
             edge.dv[i] = (65536.0 * diff * r) as i32;
         }
         edge
@@ -184,7 +184,7 @@ impl<'a> ShadePainter<'a> {
         let mut dc = [0i32; MAXN];
         for k in 0..n {
             dc[k] = ((v1[k] - v0[k]) as f32 * div) as i32;
-            c[k] = (v0[k] as f32 + dc[k] as f32 * mul) as i32;
+            c[k] = (dc[k] as f32).mul_add(mul, v0[k] as f32) as i32;
         }
         let width = self.area.width() as usize;
         let start = ((y - self.area.y0) as usize * width + (x0 - self.area.x0) as usize) * 4;

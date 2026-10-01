@@ -3,6 +3,7 @@
 
 mod command;
 mod device;
+mod glyph;
 
 use std::fmt;
 
@@ -98,7 +99,9 @@ fn render_area(
     if bounds.is_empty() {
         return Err(InterpError::Limit("render region has no area".to_owned()).into());
     }
-    let scale = options.dpi / 72.0;
+    // MuPDF constructs its dpi matrix in float precision before composing
+    // it with the page transform; later rounding shifts exact subsamples.
+    let scale = f64::from(options.dpi as f32 / 72.0_f32);
     let x0 = (bounds.x0 * scale + 0.001).floor();
     let y0 = (bounds.y0 * scale + 0.001).floor();
     let x1 = (bounds.x1 * scale - 0.001).ceil();

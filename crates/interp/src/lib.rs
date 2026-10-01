@@ -34,10 +34,11 @@ pub use device::{
     MarkedContentEvent, Paint, Provenance, Quad, Rgb, ShadingEvent, StrokeEvent, TextRun,
     Type3GlyphEvent,
 };
-pub use font::{FontFlags, FontSubtype, PdfFont};
+pub use font::{FontFlags, FontSubtype, GlyphOutline, PdfFont};
 pub use image::{AlphaChannel, ColorFamily, ImagePixels, ImageSamples, PdfImage, StencilPixels};
 pub use path::{FillRule, LineCap, LineJoin, Path, PathEl, StrokeStyle};
 pub use pattern::{ShadingPaint, SoftMask, TilingPaint};
+pub use pdf_font::PathOp as GlyphOp;
 pub use shading::{ShadeVertex, Shading};
 
 /// Why a run stopped.

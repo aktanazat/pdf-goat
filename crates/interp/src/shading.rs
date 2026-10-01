@@ -504,28 +504,30 @@ impl M32 {
             f: m.f as f32,
         }
     }
-    /// `self` then `other`.
+    /// `self` then `other`, with the fused multiply-adds clang emits for
+    /// MuPDF's `fz_concat`.
     fn concat(&self, other: &M32) -> M32 {
         M32 {
-            a: self.a * other.a + self.b * other.c,
-            b: self.a * other.b + self.b * other.d,
-            c: self.c * other.a + self.d * other.c,
-            d: self.c * other.b + self.d * other.d,
-            e: self.e * other.a + self.f * other.c + other.e,
-            f: self.e * other.b + self.f * other.d + other.f,
+            a: self.a.mul_add(other.a, self.b * other.c),
+            b: self.a.mul_add(other.b, self.b * other.d),
+            c: self.c.mul_add(other.a, self.d * other.c),
+            d: self.c.mul_add(other.b, self.d * other.d),
+            e: self.e.mul_add(other.a, self.f * other.c) + other.e,
+            f: self.e.mul_add(other.b, self.f * other.d) + other.f,
         }
     }
+    /// `fz_transform_point` as compiled: `x * a + y * c` fuses, `+ e` does not.
     fn point(&self, [x, y]: [f32; 2]) -> [f32; 2] {
         [
-            x * self.a + y * self.c + self.e,
-            x * self.b + y * self.d + self.f,
+            x.mul_add(self.a, y * self.c) + self.e,
+            x.mul_add(self.b, y * self.d) + self.f,
         ]
     }
     fn vector(&self, [x, y]: [f32; 2]) -> [f32; 2] {
-        [x * self.a + y * self.c, x * self.b + y * self.d]
+        [x.mul_add(self.a, y * self.c), x.mul_add(self.b, y * self.d)]
     }
     fn expansion(&self) -> f32 {
-        (self.a * self.d - self.b * self.c).abs().sqrt()
+        self.a.mul_add(self.d, -(self.b * self.c)).abs().sqrt()
     }
 }
 fn vertex([x, y]: [f32; 2], t: f32) -> ShadeVertex {
@@ -540,8 +542,9 @@ fn quad(v: [ShadeVertex; 4], emit: &mut dyn FnMut([ShadeVertex; 3])) {
     emit([v[0], v[1], v[3]]);
     emit([v[3], v[2], v[1]]);
 }
+/// `fz_point_on_circle` as compiled: `p.x + cosf(theta) * r` fuses.
 fn on_circle([x, y]: [f32; 2], r: f32, theta: f32) -> [f32; 2] {
-    [x + theta.cos() * r, y + theta.sin() * r]
+    [theta.cos().mul_add(r, x), theta.sin().mul_add(r, y)]
 }
 fn axial(
     coords: &[f64; 4],

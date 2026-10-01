@@ -8,6 +8,7 @@
 mod blend;
 mod canvas;
 mod geom;
+mod glyph;
 mod image;
 mod mask;
 mod path;
@@ -18,9 +19,12 @@ mod stroke;
 
 pub use blend::BlendMode;
 pub use canvas::{
-    Canvas, Composite, FillStyle, ImageOptions, MAX_GROUP_BYTES, MAX_GROUP_DEPTH, Paint, Source,
+    Canvas, Composite, ImageOptions, MAX_GROUP_BYTES, MAX_GROUP_DEPTH, Paint, Source,
 };
 pub use geom::{IntRect, Point, Rect, Transform};
+pub use glyph::{
+    Glyph, GlyphCache, GlyphPlacement, MAX_GLYPH_SIZE, glyph_placement, rasterize_outline,
+};
 pub use image::{Filter, FnShader, Image, ImageFormat, MaskImage, PixmapShader, Shader};
 pub use mask::Mask;
 pub use path::{Path, PathBuilder, PathEl};
