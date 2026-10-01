@@ -146,9 +146,25 @@ fn meta_set_writes_info_keys_and_strip_removes_them() {
         serde_json::json!({"format": "PDF 1.7"}),
         "only PyMuPDF's synthetic format key survives"
     );
+}
+
+#[test]
+fn meta_get_reports_xmp_only_while_the_catalog_has_a_metadata_stream() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = plain_pdf(dir.path());
+    let with_xmp = run(
+        dir.path(),
+        &["accessibility", "set", &src, "--title", "Has XMP"],
+    )
+    .expect("accessibility set writes XMP");
+    let stripped =
+        run(dir.path(), &["meta", "strip", &output(&with_xmp)]).expect("meta strip succeeds");
+    let has_xmp = [src, output(&with_xmp), output(&stripped)].map(|file| {
+        run(dir.path(), &["meta", "get", &file]).expect("meta get succeeds")["has_xmp"].clone()
+    });
     assert_eq!(
-        read["has_xmp"], true,
-        "the reference CLI tests the bound method, not its result"
+        has_xmp,
+        [Value::Bool(false), Value::Bool(true), Value::Bool(false)]
     );
 }
 

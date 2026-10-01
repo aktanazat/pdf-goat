@@ -74,9 +74,14 @@ fn metadata_none() -> GoatError {
     GoatError::exception("TypeError", "'NoneType' object is not iterable")
 }
 
-/// The reference CLI computes `bool(doc.xref_xml_metadata)` on the bound method rather
-/// than its result, so `has_xmp` is `true` for every document that opens.
-const HAS_XMP: bool = true;
+/// Whether the catalog's `/Metadata` resolves to an XMP stream.
+fn has_xmp(document: &Document) -> Result<bool, GoatError> {
+    let catalog = document.catalog().map_err(doc::pdf_error)?;
+    Ok(catalog
+        .get(b"Metadata")
+        .and_then(|value| document.resolve_stream(value).ok().flatten())
+        .is_some())
+}
 
 fn meta_get(matches: &ArgMatches, _ctx: &Ctx) -> Result<Map<String, Value>, GoatError> {
     let opened = doc::open(required::<String>(matches, "file")?, Lib::PyMuPdf)?;
@@ -88,7 +93,7 @@ fn meta_get(matches: &ArgMatches, _ctx: &Ctx) -> Result<Map<String, Value>, Goat
         "metadata".to_owned(),
         Value::Object(doc::truthy(doc::metadata(&opened.doc))),
     );
-    result.insert("has_xmp".to_owned(), Value::Bool(HAS_XMP));
+    result.insert("has_xmp".to_owned(), Value::Bool(has_xmp(&opened.doc)?));
     Ok(result)
 }
 
