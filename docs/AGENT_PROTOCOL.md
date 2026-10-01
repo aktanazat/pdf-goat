@@ -538,7 +538,7 @@ Worker-produced text first returns as a file-backed artifact with a digest and s
 | `run` | `command`, `args?` | the words of `command`, then `args`, one token per item | destructive, not idempotent, open world |
 | `render` | `file`, `page?` (1), `dpi?` (96), `clip?`, `marks?` | `render FILE --pages PAGE --dpi DPI [--clip=CLIP] [--mark=MARK]... -o SESSION/render-N` | read-only, idempotent, closed world |
 
-`run` is destructive because a command replaces an existing `-o` file and `office run` executes scripts, and open world because results carry timestamps and `setup` downloads. `clip` and each of `marks` are `"x0,y0,x1,y1"` strings in the frames given under [Rectangle coordinates](#rectangle-coordinates).
+`run` is destructive because a command replaces an existing `-o` file and `office run` executes scripts, and open world because results carry timestamps and `setup` downloads. `clip` and each of `marks` are `"x0,y0,x1,y1"` strings or `[x0, y0, x1, y1]` arrays, so a `search` `rect` or an edit's `bbox` passes as given, in the frames given under [Rectangle coordinates](#rectangle-coordinates).
 
 The resource `pdf-goat://capabilities` and the template `pdf-goat://capabilities/{selector}` return the same JSON as the `capabilities` tool, typed `application/json`. A selector `pdf-goat` rejects returns a resource-not-found error carrying its message.
 

@@ -463,6 +463,13 @@ fn render_shows_the_requested_page_region_and_marks() {
             (288, 144),
             json!([[-4.0, 10.0, 50.0, 50.0], [60.0, 10.0, 100.0, 50.0]]),
         ),
+        // A rectangle may also be the array that search and edit bboxes carry.
+        (json!({ "clip": [18, 9, 90, 45] }), (96, 48), json!([])),
+        (
+            json!({ "marks": [[-4, 10, 50, 50], "60,10,100,50"] }),
+            (288, 144),
+            json!([[-4.0, 10.0, 50.0, 50.0], [60.0, 10.0, 100.0, 50.0]]),
+        ),
     ];
     let mut client = Client::start(&scratch.home());
     for (mut arguments, size, marks) in cases {

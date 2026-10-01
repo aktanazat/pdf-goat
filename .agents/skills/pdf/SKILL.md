@@ -37,7 +37,7 @@ render {"file": "$IN", "page": 1, "dpi": 144, "clip": "50,180,420,215", "marks":
 ```
 
 - `run`: `command` is the command path (`info`, `edit add-text`, `security sign`); `args` is the rest of the command line, one token per item, exactly as the CLI takes it. It returns pdf-goat's JSON; a nonzero exit or `ok: false` comes back as an error result with pdf-goat's message. The first 4 PNG or JPEG outputs (up to 5 MiB each) come back as images. It replaces an existing `-o` file, and `office run` executes scripts.
-- `render`: `page` (default 1), `dpi` (default 96), optional `clip` and `marks` as in the CLI; returns the PNG and the JSON.
+- `render`: `page` (default 1), `dpi` (default 96), optional `clip` and `marks` as in the CLI, each rectangle as `"x0,y0,x1,y1"` or as an array such as a search `rect`, passed as is; returns the PNG and the JSON.
 
 ## Ground rules
 

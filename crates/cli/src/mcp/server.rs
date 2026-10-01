@@ -57,12 +57,12 @@ an existing -o file; `office run` executes scripts; `setup` downloads models.";
 
 const RENDER: &str = "\
 Render one page to a PNG and return the image, to look at a page or check a change. \
-`page` counts from 1 (default 1); `dpi` defaults to 96. `clip` is \"x0,y0,x1,y1\" in \
-points on the page as displayed (rotation applied, top-left, y down) and renders only \
-that region. `marks` outlines rectangles, each \"x0,y0,x1,y1\", to check positions, for \
-example search hits or the bbox an add-text or add-image call returned. Marks use \
-search's frame (the unrotated crop box, top-left, y down) and can be passed as given, \
-also on rotated pages.";
+`page` counts from 1 (default 1); `dpi` defaults to 96. A rectangle is \"x0,y0,x1,y1\" \
+or [x0, y0, x1, y1] in points, from the top-left, y down. `clip` renders only that \
+rectangle of the page as displayed (rotation applied). `marks` outlines rectangles to \
+check positions, for example search hits or the bbox an add-text or add-image call \
+returned. Marks use search's frame (the unrotated crop box) and take a search `rect` or \
+a returned `bbox` as is, also on rotated pages.";
 
 const CAPABILITIES_URI: &str = "pdf-goat://capabilities";
 const CAPABILITIES_TEMPLATE: &str = "pdf-goat://capabilities/{selector}";
@@ -129,12 +129,12 @@ impl Server {
             dpi.unwrap_or(96).to_string().into(),
         ];
         // The `=` form keeps a negative first coordinate from reading as a flag.
-        argv.extend(clip.map(|clip| format!("--clip={clip}").into()));
+        argv.extend(clip.map(|clip| format!("--clip={}", clip.arg()).into()));
         argv.extend(
             marks
                 .unwrap_or_default()
                 .into_iter()
-                .map(|mark| format!("--mark={mark}").into()),
+                .map(|mark| format!("--mark={}", mark.arg()).into()),
         );
         argv.extend(["-o".into(), self.session.fresh("render", "").into()]);
         argv
@@ -160,8 +160,30 @@ struct RenderArgs {
     file: String,
     page: Option<u32>,
     dpi: Option<u32>,
-    clip: Option<String>,
-    marks: Option<Vec<String>>,
+    clip: Option<Rect>,
+    marks: Option<Vec<Rect>>,
+}
+
+/// A rectangle as the CLI's `"x0,y0,x1,y1"` text or as the `[x0, y0, x1, y1]` array a
+/// `search` hit's `rect` and an edit's `bbox` carry.
+#[derive(Deserialize)]
+#[serde(
+    untagged,
+    expecting = "a rectangle, \"x0,y0,x1,y1\" or [x0, y0, x1, y1]"
+)]
+enum Rect {
+    Text(String),
+    Points([f64; 4]),
+}
+
+impl Rect {
+    /// The rectangle as the CLI's `x0,y0,x1,y1` argument.
+    fn arg(self) -> String {
+        match self {
+            Rect::Text(text) => text,
+            Rect::Points([x0, y0, x1, y1]) => format!("{x0},{y0},{x1},{y1}"),
+        }
+    }
 }
 
 fn capabilities_args(selector: Option<String>) -> Vec<OsString> {
@@ -184,7 +206,15 @@ fn parse<T: DeserializeOwned>(arguments: JsonObject) -> Result<T, String> {
 }
 
 fn tools() -> Vec<Tool> {
-    let rect = "\"x0,y0,x1,y1\" in PDF points";
+    let rect = |description: &str| {
+        json!({
+            "anyOf": [
+                { "type": "string" },
+                { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
+            ],
+            "description": format!("\"x0,y0,x1,y1\" or [x0, y0, x1, y1] in PDF points, {description}"),
+        })
+    };
     vec![
         Tool::new(
             "capabilities",
@@ -242,14 +272,11 @@ fn tools() -> Vec<Tool> {
                     "file": { "type": "string", "description": "absolute path of the PDF" },
                     "page": { "type": "integer", "minimum": 1, "default": 1 },
                     "dpi": { "type": "integer", "minimum": 1, "default": 96 },
-                    "clip": {
-                        "type": "string",
-                        "description": format!("{rect}, on the page as displayed"),
-                    },
+                    "clip": rect("on the page as displayed"),
                     "marks": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": format!("rectangles to outline, each {rect}, in search's frame"),
+                        "items": rect("in search's frame"),
+                        "description": "rectangles to outline",
                     },
                 },
                 "required": ["file"],
