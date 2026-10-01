@@ -21,7 +21,8 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 fn verify(name: &str) -> Vec<Map<String, Value>> {
-    pdf_sign::verify_file(&fixture(name)).unwrap_or_else(|error| panic!("{name}: {error}"))
+    pdf_sign::verify_file(&fixture(name), &pdf_sign::Checks::default())
+        .unwrap_or_else(|error| panic!("{name}: {error}"))
 }
 
 fn expect(

@@ -1,14 +1,28 @@
 //! `security verify`: pyhanko's `validate_pdf_signature` for every filled signature field,
-//! reported as `cmd_sec_verify` does. Integrity comes from [`crate::pkcs7`]; coverage and
-//! the incremental-update review follow `pdf_embedded.evaluate_signature_coverage` and
-//! `diff_analysis.StandardDiffPolicy` with pyhanko's default rules.
+//! reported as `cmd_sec_verify` does, and `validate_pdf_timestamp` for a field holding a
+//! document time-stamp. Integrity comes from [`crate::pkcs7`] and [`crate::tsp`]; coverage
+//! and the incremental-update review follow `pdf_embedded.evaluate_signature_coverage` and
+//! `diff_analysis.StandardDiffPolicy` with pyhanko's default rules, under the DocMDP
+//! permission and field lock the signature sets ([`crate::mdp`]). One deliberate
+//! difference: a lock forbids changes to the fields it names only, where pyhanko also
+//! refuses any later revision once a locked field has an appearance stream it left alone.
+//! Beyond pyhanko's command, each row also judges the signer's certificate chain against
+//! the trust anchors and its revocation status from the document security store, or live
+//! with `--online` ([`crate::ltv`]), and reports the PAdES level up to B-LTA.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::time::SystemTime;
 
-use pdf_core::{Dict, Document, ObjRef, Object};
+use const_oid::db::rfc5911;
+use pdf_core::{Dict, Document, ObjRef, Object, PdfDate, Rect};
 use serde_json::{Map, Value};
+use x509_cert::Certificate;
 
-use crate::pkcs7::Signature;
+use crate::ltv::{self, Context, Judgement, Store};
+use crate::mdp::{self, Permission, Policy};
+use crate::net::Http;
+use crate::pkcs7::{Hash, Signature, Verdict};
+use crate::tsp;
 use crate::xref::{Chain, startxref_at_eof};
 
 const MAX_FIELD_DEPTH: usize = 32;
@@ -68,14 +82,22 @@ impl Level {
 }
 
 /// A form field with its fully qualified name and inherited type.
-struct Field {
-    name: String,
-    id: ObjRef,
-    dict: Dict,
-    field_type: Option<Vec<u8>>,
+pub struct Field {
+    pub name: String,
+    pub id: ObjRef,
+    pub dict: Dict,
+    pub field_type: Option<Vec<u8>>,
 }
 
-fn list_fields(doc: &Document) -> Result<Vec<Field>, String> {
+impl Field {
+    /// The field has a value; a signature field holds a signature.
+    pub fn filled(&self) -> bool {
+        self.dict.get(b"V").is_some_and(|v| !v.is_null())
+    }
+}
+
+/// Every field of the document's form, children before their parents.
+pub fn list_fields(doc: &Document) -> Result<Vec<Field>, String> {
     let catalog = doc.catalog().map_err(|e| e.to_string())?;
     let Some(form) = doc
         .resolve_dict(catalog.get(b"AcroForm").unwrap_or(&Object::Null))
@@ -161,15 +183,100 @@ fn walk_fields(
     Ok(())
 }
 
+/// What a filled signature field holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Signature,
+    /// A document time-stamp (PAdES B-LTA): an RFC 3161 token over the revision it ends.
+    DocumentTimeStamp,
+}
+
+impl Kind {
+    /// `/Type /DocTimeStamp` or SubFilter `ETSI.RFC3161` mark a document time-stamp.
+    fn of(sig: &Dict) -> Kind {
+        if sig.has_type(b"DocTimeStamp") || sig.get_name(b"SubFilter") == Some(b"ETSI.RFC3161") {
+            Kind::DocumentTimeStamp
+        } else {
+            Kind::Signature
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Kind::Signature => "signature",
+            Kind::DocumentTimeStamp => "document_timestamp",
+        }
+    }
+
+    /// The `/Type` and `/SubFilter` the dictionary must have.
+    fn check(self, sig: &Dict) -> Result<(), String> {
+        let sub_filter = sig.get_name(b"SubFilter");
+        let unknown = |kind: &str| {
+            format!(
+                "{} is not a recognized SubFilter type in {kind}.",
+                sub_filter.map_or("None".to_owned(), |name| format!(
+                    "/{}",
+                    String::from_utf8_lossy(name)
+                ))
+            )
+        };
+        match self {
+            Kind::Signature => {
+                if sig.get_name(b"Type").is_some_and(|t| t != b"Sig") {
+                    return Err("Signature object type must be /Sig".to_owned());
+                }
+                if !matches!(
+                    sub_filter,
+                    Some(b"adbe.pkcs7.detached" | b"ETSI.CAdES.detached")
+                ) {
+                    return Err(unknown("signatures"));
+                }
+            }
+            Kind::DocumentTimeStamp => {
+                if !sig.has_type(b"DocTimeStamp") {
+                    return Err("Signature object type must be /DocTimeStamp".to_owned());
+                }
+                if sub_filter != Some(b"ETSI.RFC3161") {
+                    return Err(unknown("document time-stamps"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One signature to report: the field and its signature dictionary.
 struct Embedded {
     field: String,
+    /// The field's dictionary, for its `/Lock`.
+    field_dict: Dict,
+    kind: Kind,
+    sig_ref: ObjRef,
     sig: Dict,
     signed_revision: usize,
 }
 
+/// What `security verify` judges certificate chains with.
+#[derive(Default)]
+pub struct Checks {
+    /// The trust anchors: the system's roots and those `--trust` adds.
+    pub anchors: Vec<Certificate>,
+    /// Where `--online` asks for the revocation answers the document lacks; `None` stays
+    /// offline.
+    pub online: Option<Http>,
+}
+
+/// What one verification judges chains with.
+struct Judging<'a> {
+    /// The document security store as the file ends.
+    store: Option<&'a Store>,
+    context: Context<'a>,
+    /// `context` without the network, for the long-term levels.
+    offline: Context<'a>,
+}
+
 /// `cmd_sec_verify`: the `signatures` list, in signing order.
-pub fn verify_file(data: &[u8]) -> Result<Vec<Map<String, Value>>, String> {
+pub fn verify_file(data: &[u8], checks: &Checks) -> Result<Vec<Map<String, Value>>, String> {
     let doc = Document::load(data.to_vec()).map_err(|e| e.to_string())?;
     let chain = Chain::read(data)?;
     let mut embedded = Vec::new();
@@ -194,63 +301,396 @@ pub fn verify_file(data: &[u8]) -> Result<Vec<Map<String, Value>>, String> {
             .ok_or_else(|| format!("Could not determine history of {sig_ref} in xref sections"))?;
         embedded.push(Embedded {
             field: field.name,
+            field_dict: field.dict,
+            kind: Kind::of(&sig),
+            sig_ref,
             sig,
             signed_revision,
         });
     }
     embedded.sort_by_key(|e| e.signed_revision);
+    // pyhanko's validation ignores `/Perms`; one it cannot read certifies nothing.
+    let certification = mdp::certification(&doc)
+        .ok()
+        .flatten()
+        .and_then(|c| c.signature);
+    let store = Store::read(&doc);
+    let now = SystemTime::now();
+    let judging = Judging {
+        store: store.as_ref(),
+        context: Context {
+            anchors: &checks.anchors,
+            online: checks.online.as_ref(),
+            now,
+        },
+        offline: Context {
+            anchors: &checks.anchors,
+            online: None,
+            now,
+        },
+    };
     let mut out = Vec::with_capacity(embedded.len());
+    // The signatures at B-LT, by row, and the revisions document time-stamps that check
+    // out end: a later one over a store that still completes both chains makes B-LTA.
+    let mut long_term = Vec::new();
+    let mut archived = Vec::new();
     for entry in &embedded {
         let contents = entry
             .sig
             .get_string(b"Contents")
-            .ok_or("Could not read /Contents entry in signature")?;
-        let signature = Signature::parse(contents.as_bytes())?;
-        let mut row = Map::new();
-        row.insert("field".into(), entry.field.clone().into());
-        row.insert("signer".into(), signature.signer.clone().into());
-        match validate(data, &doc, &chain, entry, &signature) {
-            Ok((verdict, coverage, modified)) => {
-                row.insert("intact".into(), verdict.intact.into());
-                row.insert("valid".into(), verdict.valid.into());
-                row.insert("trusted".into(), verdict.trusted.into());
-                row.insert("coverage".into(), coverage.as_str().into());
-                row.insert("modified".into(), modified.into());
+            .ok_or("Could not read /Contents entry in signature")?
+            .as_bytes();
+        let certified = certification == Some(entry.sig_ref);
+        match entry.kind {
+            Kind::Signature => {
+                let (row, lt) =
+                    signature_row(data, &doc, &chain, entry, contents, certified, &judging)?;
+                long_term.extend(lt.map(|lt| (out.len(), lt)));
+                out.push(row);
             }
-            Err(error) => {
-                row.insert("validation_error".into(), error.into());
+            Kind::DocumentTimeStamp => {
+                let (row, checks_out) =
+                    time_stamp_row(data, &doc, &chain, entry, contents, certified, &judging);
+                if checks_out {
+                    archived.push(entry.signed_revision);
+                }
+                out.push(row);
             }
         }
-        out.push(row);
+    }
+    for (index, lt) in long_term {
+        let covered = archived
+            .iter()
+            .filter(|&&revision| revision > lt.revision)
+            .any(|&revision| {
+                store_at(data, &chain, revision)
+                    .is_some_and(|store| lt.complete(&store, &judging.offline))
+            });
+        if covered && let Some(row) = out.get_mut(index) {
+            row.insert("pades_level".into(), "B-LTA".into());
+        }
     }
     Ok(out)
 }
 
+/// What a signature at B-LT needs a later document time-stamp's store to hold for B-LTA.
+struct LongTerm {
+    /// The revision the signature signs.
+    revision: usize,
+    signer: Certificate,
+    signer_certs: Vec<Certificate>,
+    authority: Certificate,
+    authority_certs: Vec<Certificate>,
+    /// The time its signature time-stamp attests.
+    time: SystemTime,
+}
+
+impl LongTerm {
+    /// `store` completes the chains of the signer and of its time-stamp authority.
+    fn complete(&self, store: &Store, context: &Context<'_>) -> bool {
+        ltv::judge(
+            &self.signer,
+            &self.signer_certs,
+            Some(store),
+            context,
+            self.time,
+        )
+        .complete
+            && ltv::judge(
+                &self.authority,
+                &self.authority_certs,
+                Some(store),
+                context,
+                self.time,
+            )
+            .complete
+    }
+}
+
+/// The document security store as revision `revision` left it.
+fn store_at(data: &[u8], chain: &Chain, revision: usize) -> Option<Store> {
+    let end = chain.revision_end(data, revision)?;
+    let doc = Document::load(data.get(..end)?.to_vec()).ok()?;
+    Store::read(&doc)
+}
+
+/// The row of a signature: what [`validate`] finds, its signature time-stamp, and the
+/// judgement of its chain; with what B-LTA needs when it reaches B-LT.
+fn signature_row(
+    data: &[u8],
+    doc: &Document,
+    chain: &Chain,
+    entry: &Embedded,
+    contents: &[u8],
+    certified: bool,
+    judging: &Judging<'_>,
+) -> Result<(Map<String, Value>, Option<LongTerm>), String> {
+    let signature = Signature::parse(contents)?;
+    let mut row = Map::new();
+    row.insert("field".into(), entry.field.clone().into());
+    row.insert("kind".into(), entry.kind.as_str().into());
+    row.insert("signer".into(), signature.signer.clone().into());
+    let checked = validate(data, doc, chain, entry, signature.digest, |digest| {
+        signature.verify(digest)
+    });
+    insert_validation(&mut row, &checked, certified);
+    let token = tsp::embedded_token(&signature).map(|token| {
+        token.and_then(|token| token.check(signature.signature_value()).map(|()| token))
+    });
+    let stamp = token.as_ref().map(|token| {
+        token
+            .as_ref()
+            .map(|token| token.time)
+            .map_err(String::clone)
+    });
+    insert_time_stamp(&mut row, stamp.as_ref());
+    let level = pades_level(&entry.sig, &signature, matches!(stamp, Some(Ok(_))));
+    let stamped = match &token {
+        Some(Ok(token)) => Some(token),
+        _ => None,
+    };
+    let time = stamped.map_or(judging.context.now, |token| ltv::system_time(&token.time));
+    let judgement = ltv::judge(
+        signature.certificate(),
+        signature.certificates(),
+        judging.store,
+        &judging.context,
+        time,
+    );
+    insert_judgement(&mut row, &judgement);
+    // B-LT: a B-T signature whose store completes its chain and its time-stamp
+    // authority's.
+    let long_term = stamped
+        .filter(|_| level == "B-T" && judgement.complete)
+        .map(|token| LongTerm {
+            revision: entry.signed_revision,
+            signer: signature.certificate().clone(),
+            signer_certs: signature.certificates().to_vec(),
+            authority: token.signature.certificate().clone(),
+            authority_certs: token.signature.certificates().to_vec(),
+            time,
+        })
+        .filter(|lt| {
+            ltv::judge(
+                &lt.authority,
+                &lt.authority_certs,
+                judging.store,
+                &judging.offline,
+                time,
+            )
+            .complete
+        });
+    row.insert(
+        "pades_level".into(),
+        if long_term.is_some() {
+            "B-LT".into()
+        } else {
+            level
+        },
+    );
+    Ok((row, long_term))
+}
+
+/// The row of a document time-stamp, as `validate_pdf_timestamp` checks one: the
+/// authority is the signer, its token must cover the revision the `/ByteRange` ends, and
+/// the revisions after it are reviewed as after a signature. `timestamp` is the time the
+/// token attests to. Also whether it checks out: intact, valid, and over its revision.
+fn time_stamp_row(
+    data: &[u8],
+    doc: &Document,
+    chain: &Chain,
+    entry: &Embedded,
+    contents: &[u8],
+    certified: bool,
+    judging: &Judging<'_>,
+) -> (Map<String, Value>, bool) {
+    let mut row = Map::new();
+    row.insert("field".into(), entry.field.clone().into());
+    row.insert("kind".into(), entry.kind.as_str().into());
+    let token = tsp::Token::parse(contents);
+    row.insert(
+        "signer".into(),
+        token
+            .as_ref()
+            .map_or(Value::Null, |token| token.signature.signer.clone().into()),
+    );
+    let checked = token.as_ref().map_err(String::clone).and_then(|token| {
+        validate(data, doc, chain, entry, token.imprint_hash()?, |digest| {
+            token.verdict(digest)
+        })
+    });
+    insert_validation(&mut row, &checked, certified);
+    let stamp = match (&token, &checked) {
+        (Ok(token), Ok(checked)) => token.check_revision(&checked.digest).map(|()| token.time),
+        (Err(error), _) | (_, Err(error)) => Err(error.clone()),
+    };
+    insert_time_stamp(&mut row, Some(&stamp));
+    if let Ok(token) = &token {
+        let time = stamp.as_ref().map_or(judging.context.now, ltv::system_time);
+        let judgement = ltv::judge(
+            token.signature.certificate(),
+            token.signature.certificates(),
+            judging.store,
+            &judging.context,
+            time,
+        );
+        insert_judgement(&mut row, &judgement);
+    }
+    row.insert("pades_level".into(), Value::Null);
+    let checks_out = stamp.is_ok()
+        && checked
+            .as_ref()
+            .is_ok_and(|checked| checked.verdict.intact && checked.verdict.valid);
+    (row, checks_out)
+}
+
+/// The keys [`validate`] decides, or its error as `validation_error`.
+fn insert_validation(
+    row: &mut Map<String, Value>,
+    checked: &Result<Validation, String>,
+    certified: bool,
+) {
+    let checked = match checked {
+        Ok(checked) => checked,
+        Err(error) => {
+            row.insert("validation_error".into(), error.clone().into());
+            return;
+        }
+    };
+    row.insert("intact".into(), checked.verdict.intact.into());
+    row.insert("valid".into(), checked.verdict.valid.into());
+    row.insert("trusted".into(), checked.verdict.trusted.into());
+    row.insert("coverage".into(), checked.coverage.as_str().into());
+    row.insert(
+        "modified".into(),
+        checked
+            .modification
+            .as_ref()
+            .map_or("OTHER", |level| level.name())
+            .into(),
+    );
+    row.insert("certified".into(), certified.into());
+    row.insert(
+        "docmdp_level".into(),
+        checked
+            .policy
+            .doc_mdp
+            .map_or(Value::Null, |permission| permission.p().into()),
+    );
+    row.insert("changes_allowed".into(), checked.changes_allowed().into());
+    if let Err(reason) = &checked.modification {
+        row.insert("modification_error".into(), reason.clone().into());
+    }
+}
+
+/// `timestamp`, `timestamp_valid`, and `timestamp_error` for the time-stamp check
+/// `stamp`; all null for a row without a time-stamp.
+fn insert_time_stamp(row: &mut Map<String, Value>, stamp: Option<&Result<PdfDate, String>>) {
+    row.insert(
+        "timestamp".into(),
+        match stamp {
+            Some(Ok(time)) => tsp::iso_utc(time).into(),
+            _ => Value::Null,
+        },
+    );
+    row.insert(
+        "timestamp_valid".into(),
+        stamp.map_or(Value::Null, |s| s.is_ok().into()),
+    );
+    if let Some(Err(error)) = stamp {
+        row.insert("timestamp_error".into(), error.clone().into());
+    }
+}
+
+/// `chain_trusted` and `revocation`, with `revocation_source` and the errors behind them.
+fn insert_judgement(row: &mut Map<String, Value>, judgement: &Judgement) {
+    row.insert(
+        "chain_trusted".into(),
+        judgement.trust_error.is_none().into(),
+    );
+    if let Some(error) = &judgement.trust_error {
+        row.insert("trust_error".into(), error.clone().into());
+    }
+    row.insert(
+        "revocation".into(),
+        judgement
+            .revocation
+            .map_or(Value::Null, |revocation| revocation.as_str().into()),
+    );
+    row.insert(
+        "revocation_source".into(),
+        judgement.source.map_or(Value::Null, Value::from),
+    );
+    if let Some(error) = &judgement.revocation_error {
+        row.insert("revocation_error".into(), error.clone().into());
+    }
+}
+
+/// The PAdES baseline level the signature meets: B-B for a CAdES signature whose signed
+/// attributes bind the signing certificate, B-T once a valid time-stamp covers it; null
+/// for other signatures.
+fn pades_level(sig: &Dict, signature: &Signature, stamped: bool) -> Value {
+    let cades = sig.get_name(b"SubFilter") == Some(b"ETSI.CAdES.detached".as_slice());
+    let bound = [
+        rfc5911::ID_AA_SIGNING_CERTIFICATE_V_2,
+        rfc5911::ID_AA_SIGNING_CERTIFICATE,
+    ]
+    .into_iter()
+    .any(|oid| signature.signed_attribute(oid).is_some());
+    match (cades && bound, stamped) {
+        (false, _) => Value::Null,
+        (true, false) => "B-B".into(),
+        (true, true) => "B-T".into(),
+    }
+}
+
+/// What [`validate`] found for one signature.
+struct Validation {
+    verdict: Verdict,
+    coverage: Coverage,
+    policy: Policy,
+    /// The modification level of the revisions after the signed one, or why they count as
+    /// OTHER.
+    modification: Result<Level, String>,
+    /// The digest of the `/ByteRange`, under the hash the signature or token uses.
+    digest: Vec<u8>,
+}
+
+impl Validation {
+    /// pyhanko's `docmdp_ok`: nothing changed beyond what the signature's DocMDP permission
+    /// allows, and nothing at level OTHER.
+    fn changes_allowed(&self) -> bool {
+        match (&self.modification, self.policy.doc_mdp) {
+            (Err(_), _) => false,
+            (Ok(_), None) => true,
+            (Ok(level), Some(permission)) => {
+                *level
+                    <= match permission {
+                        Permission::NoChanges => Level::LtaUpdates,
+                        Permission::FillForms | Permission::Annotate => Level::FormFilling,
+                    }
+            }
+        }
+    }
+}
+
+/// Checks the signature dictionary of `entry`, digests its `/ByteRange` with `hash`, takes
+/// the integrity verdict of that digest from `verdict`, and reviews the later revisions.
 fn validate(
     data: &[u8],
     doc: &Document,
     chain: &Chain,
     entry: &Embedded,
-    signature: &Signature,
-) -> Result<(crate::pkcs7::Verdict, Coverage, &'static str), String> {
-    if entry.sig.get_name(b"Type").is_some_and(|t| t != b"Sig") {
-        return Err("Signature object type must be /Sig".to_owned());
-    }
-    match entry.sig.get_name(b"SubFilter") {
-        Some(b"adbe.pkcs7.detached" | b"ETSI.CAdES.detached") => {}
-        Some(other) => {
-            return Err(format!(
-                "/{} is not a recognized SubFilter type in signatures.",
-                String::from_utf8_lossy(other)
-            ));
-        }
-        None => return Err("None is not a recognized SubFilter type in signatures.".to_owned()),
-    }
+    hash: Hash,
+    verdict: impl FnOnce(&[u8]) -> Result<Verdict, String>,
+) -> Result<Validation, String> {
+    entry.kind.check(&entry.sig)?;
     if chain.sections.iter().any(|s| s.hybrid) {
         return Err(
             "Settings do not permit validation of signatures in hybrid-reference files.".to_owned(),
         );
     }
+    let policy = Policy::read(doc, &entry.sig, &entry.field_dict)?;
     let byte_range: Vec<i64> = doc
         .resolve_array(
             entry
@@ -279,8 +719,8 @@ fn validate(
             ))
         })
         .collect::<Result<Vec<_>, &str>>()?;
-    let digest = signature.digest.digest_ranges(data, &ranges);
-    let verdict = signature.verify(&digest)?;
+    let digest = hash.digest_ranges(data, &ranges);
+    let verdict = verdict(&digest)?;
     let coverage = coverage(
         data,
         chain,
@@ -288,15 +728,20 @@ fn validate(
         &byte_range,
         contents_len,
     );
-    let modified = match coverage {
-        Coverage::EntireFile => "NONE",
-        Coverage::Unclear | Coverage::ContiguousBlockFromStart => "OTHER",
-        Coverage::EntireRevision => match review(data, chain, entry.signed_revision) {
-            Ok(level) => level.name(),
-            Err(_) => "OTHER",
-        },
+    let modification = match coverage {
+        Coverage::EntireFile => Ok(Level::None),
+        Coverage::Unclear | Coverage::ContiguousBlockFromStart => {
+            Err("Nonstandard signature coverage level".to_owned())
+        }
+        Coverage::EntireRevision => review(data, chain, entry.signed_revision, &policy),
     };
-    Ok((verdict, coverage, modified))
+    Ok(Validation {
+        verdict,
+        coverage,
+        policy,
+        modification,
+        digest,
+    })
 }
 
 fn coverage(
@@ -346,8 +791,13 @@ fn coverage(
 }
 
 /// `StandardDiffPolicy.review_file`: the highest modification level any revision after the
-/// signed one needs; an error is a `SuspiciousModification`.
-fn review(data: &[u8], chain: &Chain, signed_revision: usize) -> Result<Level, String> {
+/// signed one needs under the signature's `policy`; an error is a `SuspiciousModification`.
+fn review(
+    data: &[u8],
+    chain: &Chain,
+    signed_revision: usize,
+    policy: &Policy,
+) -> Result<Level, String> {
     let mut level = Level::None;
     let mut old = load_revision(data, chain, signed_revision)?;
     for index in signed_revision + 1..chain.sections.len() {
@@ -362,6 +812,7 @@ fn review(data: &[u8], chain: &Chain, signed_revision: usize) -> Result<Level, S
             index,
             chain,
             fresh,
+            policy,
         };
         level = level.max(revision.apply()?);
         old = new;
@@ -383,6 +834,8 @@ struct RevisionDiff<'a> {
     chain: &'a Chain,
     /// Objects introduced after the signed revision, up to and including this one.
     fresh: BTreeSet<u32>,
+    /// The DocMDP permission and field lock of the signature under review.
+    policy: &'a Policy,
 }
 
 impl RevisionDiff<'_> {
@@ -524,17 +977,20 @@ impl RevisionDiff<'_> {
                     } else {
                         Level::LtaUpdates
                     };
+                    self.field_update(name, field.id.num, !visible, !visible)?;
                     explain(field.id.num, level);
                     new_widgets.insert(field.id.num);
                     for key in [b"AP".as_slice(), b"Lock", b"SV"] {
                         if let Some(value) = field.dict.get(key) {
                             for dep in self.dependencies(value) {
+                                self.field_update(name, dep, false, true)?;
                                 explain(dep, Level::FormFilling);
                             }
                         }
                     }
                     if let Some(kids) = field.dict.get(b"Kids") {
                         if let Some(kids_ref) = kids.as_reference() {
+                            self.field_update(name, kids_ref.num, !visible, true)?;
                             explain(kids_ref.num, level);
                         }
                         for kid in self
@@ -552,10 +1008,12 @@ impl RevisionDiff<'_> {
                                 if kid_dict.contains_key(b"T") {
                                     continue;
                                 }
+                                self.field_update(name, kid_ref.num, !visible, true)?;
                                 explain(kid_ref.num, level);
                                 new_widgets.insert(kid_ref.num);
                                 if let Some(ap) = kid_dict.get(b"AP") {
                                     for dep in self.dependencies(ap) {
+                                        self.field_update(name, dep, false, true)?;
                                         explain(dep, Level::FormFilling);
                                     }
                                 }
@@ -570,14 +1028,17 @@ impl RevisionDiff<'_> {
                         let locked_ok =
                             compare_dicts(&old.dict, &field.dict, ALWAYS_MODIFIABLE).is_ok();
                         if is_sig && (!previously_signed && now_signed || locked_ok) {
+                            self.field_update(name, field.id.num, locked_ok, true)?;
                             explain(field.id.num, Level::LtaUpdates);
                         } else if !is_sig {
+                            self.field_update(name, field.id.num, locked_ok, true)?;
                             explain(field.id.num, Level::FormFilling);
                         }
                         if (!is_sig || (!previously_signed && now_signed))
                             && let Some(ap) = field.dict.get(b"AP")
                         {
                             for dep in self.dependencies(ap) {
+                                self.field_update(name, dep, false, true)?;
                                 explain(dep, Level::FormFilling);
                             }
                         }
@@ -586,6 +1047,7 @@ impl RevisionDiff<'_> {
                             && old.dict.get(b"V") != Some(value)
                         {
                             for dep in self.dependencies(value) {
+                                self.field_update(name, dep, false, true)?;
                                 explain(dep, Level::FormFilling);
                             }
                         }
@@ -608,6 +1070,7 @@ impl RevisionDiff<'_> {
                     })?;
                 let timestamp = sig.get_name(b"Type") == Some(b"DocTimeStamp")
                     && !self.field_visible(&field.dict);
+                self.field_update(name, value_ref.num, timestamp, true)?;
                 explain(
                     value_ref.num,
                     if timestamp {
@@ -676,6 +1139,35 @@ impl RevisionDiff<'_> {
             }
         }
         Ok(level)
+    }
+
+    /// The checks `StandardDiffPolicy.apply` makes of a form update to field `name`: an
+    /// update a lock forbids (`valid_when_locked` false) must not touch a field the
+    /// signature locks, and some are allowed only after an approval signature.
+    fn field_update(
+        &self,
+        name: &str,
+        num: u32,
+        valid_when_locked: bool,
+        valid_when_certifying: bool,
+    ) -> Result<(), String> {
+        if !valid_when_locked
+            && self
+                .policy
+                .lock
+                .as_ref()
+                .is_some_and(|lock| lock.locks(name))
+        {
+            return Err(format!(
+                "Update of object {num} is not allowed because the form field {name} is locked."
+            ));
+        }
+        if !valid_when_certifying && self.policy.doc_mdp.is_some() {
+            return Err(format!(
+                "Update of object {num} is only allowed after an approval signature, not a certification signature."
+            ));
+        }
+        Ok(())
     }
 
     /// `safe_whitelist`: the same reference as before, or a number the old revision could
@@ -777,13 +1269,16 @@ impl RevisionDiff<'_> {
 }
 
 fn annot_visible(dict: &Dict) -> bool {
-    match dict.get_array(b"Rect") {
-        Some([x0, y0, x1, y1]) => {
-            let values = [x0, y0, x1, y1].map(|v| v.as_f64().unwrap_or(0.0));
-            (values[2] - values[0]).abs() > 0.0 && (values[3] - values[1]).abs() > 0.0
-        }
-        _ => false,
-    }
+    widget_box(dict).is_some()
+}
+
+/// A widget's `/Rect`, normalized, when it has area.
+pub fn widget_box(widget: &Dict) -> Option<Rect> {
+    let Some([x0, y0, x1, y1]) = widget.get_array(b"Rect") else {
+        return None;
+    };
+    let rect = Rect::new(x0.as_f64()?, y0.as_f64()?, x1.as_f64()?, y1.as_f64()?).normalized();
+    (!rect.is_empty()).then_some(rect)
 }
 
 /// `compare_dicts`: every key outside `ignored` must be present in both with the same raw

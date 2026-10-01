@@ -64,11 +64,19 @@ lists their verbs. Every run is appended to a SQLite ledger at
 
 To sign a flat form, one without fillable fields, find each label with
 `search` and draw beside its rectangle with `edit add-text`: a typed signature
-in a script font such as `--font 'Brush Script MT'`, a date in the default
-Helvetica, and `--text ✔ --font ZapfDingbats` for a printed check box. `--at`
-is the start of the text's baseline, in the coordinates `search` returns.
-`edit add-image` places a PNG or JPEG signature inside `--rect`. Each run
-writes a new file; check the result with `render --clip`.
+in a script font such as `--font 'Brush Script MT'` or `--font 'Snell
+Roundhand'`, a date in the default Helvetica, and `--text ✔ --font
+ZapfDingbats` for a printed check box. `--at` is the start of the text's
+baseline, in the coordinates `search` returns; `--fit --rect x0,y0,x1,y1`
+instead draws at the largest size that fits the box. TrueType, OpenType, and
+Type 1 fonts are embedded as subsets and kerned by their own tables, and
+`--face` picks one face of a `.ttc` collection. `\n` in `--text` breaks a line,
+`--width` wraps inside a width, and `--align`, `--rotate`, `--opacity`, and a
+gray, RGB, or CMYK `--color` shape the result. `edit add-image` places a PNG or
+JPEG signature inside `--rect`, keeping its aspect ratio unless `--stretch`, and
+also takes `--rotate` and `--opacity`. `--pages 1,3` draws the same thing on
+each listed page. Each run writes a new file; check the result with
+`render --clip`.
 
 Page-by-page verbs such as `text`, `search`, `count`, and `render` start
 sequentially. After 200 ms, they use worker threads if at least eight pages
@@ -183,9 +191,26 @@ PDF before replacing an original. The native PDF viewer does not edit Office fil
 - `convert pdfa` prepares PDF/A-2b output but does not run an external validator.
   Its `conformance_validated: false` result is deliberate. Validate archival
   deliverables with an independent tool such as veraPDF.
-- `security sign` creates a self-signed demonstration signature, not an identity
-  certificate. In `security verify`, `trusted` checks the local signature policy;
-  it does not establish a public trust chain or check revocation.
+- `security sign` signs with your own certificate from a .p12/.pfx file (`--p12`, with
+  the password in the environment variable `--password-env` names) as a PAdES B-B
+  signature, or B-T with a time-stamp from `--tsa <url>`. `--rect` (in the `search`
+  frame) and `--page` make it visible, showing `--appearance-text` and/or
+  `--appearance-image`. Without `--p12` it makes a self-signed demonstration signature.
+  `--field <name>` signs an existing empty signature field in place, inside its box when
+  it has one; a name the form does not have makes a new field. `--certify 1|2|3` makes a
+  certification signature that allows, after signing, no changes, form filling and
+  signing, or also annotations; it must be the document's first signature.
+  `--ltv` (with `--p12`) also stores the certificate chain and each certificate's OCSP
+  or CRL answer in the document, so the signature can be checked offline later; with
+  `--tsa` it then adds a document time-stamp over them (PAdES B-LTA).
+  In `security verify`, `trusted` checks the local signature policy. `chain_trusted`
+  checks the certificate chain against the system's roots and any `--trust` files, and
+  `revocation` reports the answers the document stores, or those `--online` fetches.
+  `timestamp`, `timestamp_valid`, and `pades_level` report the signature time-stamp and
+  the PAdES level reached, up to B-LTA.
+  `certified`, `docmdp_level`, and `changes_allowed` report whether the signature
+  certifies the document, at which level, and whether every later change stays within
+  what it allows, field locks included.
 
 ## Native macOS app
 

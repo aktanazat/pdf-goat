@@ -10,26 +10,35 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+aes = "0.8.4"
+cbc = { version = "0.1.2", features = ["alloc"] }
 clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context"] }
 cms = { version = "0.2.3", features = ["builder"] }
 const-oid = { version = "0.9.6", features = ["db"] }
 der = { version = "0.7.10", features = ["alloc", "derive", "oid", "std"] }
+des = "0.8.1"
 dsa = "0.6.3"
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "pkcs8"] }
 ed448-goldilocks-plus = { version = "0.16.0", default-features = false, features = ["std", "signing", "pkcs8"] }
 goat-common = { workspace = true }
+hmac = "0.12.1"
 k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "std"] }
-p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"] }
-p384 = { version = "0.13.1", default-features = false, features = ["ecdsa", "std"] }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+p384 = { version = "0.13.1", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 p521 = { version = "0.13.3", default-features = false, features = ["ecdsa", "std"] }
+pbkdf2 = { version = "0.12.2", default-features = false, features = ["hmac"] }
+pdf-codec = { workspace = true }
 pdf-core = { workspace = true }
 pdf-font = { workspace = true }
+pdf-edit = { workspace = true }
 pdf-interp = { workspace = true }
 pdf-inspect = { workspace = true }
 pdf-ocr = { workspace = true }
 pdf-raster = { workspace = true }
 pdf-render = { workspace = true }
+pkcs12 = { version = "0.1.0", features = ["kdf"] }
 rand = "0.8.5"
+rc2 = "0.8.1"
 rsa = { version = "0.9.10", features = ["sha2", "hazmat"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha1 = { version = "0.10.6", features = ["oid"] }
@@ -37,7 +46,12 @@ sha2 = { version = "0.10.9", features = ["oid"] }
 sha3 = "0.10.8"
 signature = "2.2.0"
 spki = { version = "0.7.3", features = ["alloc"] }
-x509-cert = { version = "0.2.5", features = ["builder", "hazmat"] }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+x509-cert = { version = "0.2.5", features = ["builder", "hazmat", "pem"] }
+x509-ocsp = { version = "0.2.1", features = ["builder", "std"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7.0", default-features = false }
 
 [dev-dependencies]
 goat-fixtures = { workspace = true }

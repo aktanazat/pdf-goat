@@ -139,7 +139,7 @@ Build the proof before committing to a renderer, transport, storage layout, or f
 4. Add dry-run previews for annotation and form flattening.
 5. Add encryption, decryption, permission flags, sanitization, compression, linearization, repair, PDF/A, JSON and XFDF form data, page boxes, headers, footers, watermarks, Bates numbering, n-up, and booklet jobs.
 6. Add Scanner and Continuity Camera import through reviewed page insertion.
-7. Add certificate signing and verification only after Keychain, byte-range, timestamp, chain, and later-change tests pass.
+7. Add certificate signing and verification only after Keychain, byte-range, timestamp, chain, revocation, long-term validation, and later-change tests pass.
 8. Add accessibility checks and the metadata edits that preserve valid output.
 9. Run every transformer job through the worker boundary in [`SYSTEM.md`](SYSTEM.md#existing-rust-transformer).
 

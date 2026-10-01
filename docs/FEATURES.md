@@ -125,8 +125,8 @@ Apple PDFKit supports text, button, and choice widgets. Full Acrobat form parity
 | Fill a noninteractive form with text, marks, images, and signatures | Native | 3 | Added objects remain editable until flatten or export |
 | Import and export field data | Extended | 5 | Supports JSON and XFDF with explicit field mismatch errors |
 | Flatten forms | Prove | 5 | Values remain visible and no editable field survives |
-| Certificate signing | Prove | 5 | Uses Keychain identities, preserves the signed byte range, and passes independent validation |
-| Signature verification | Prove | 5 | Reports signer, chain, timestamp, covered revision, trust result, and later changes |
+| Certificate signing | Prove | 5 | Uses Keychain identities, preserves the signed byte range, stores the chain and revocation answers for long-term validation up to PAdES B-LTA, and passes independent validation |
+| Signature verification | Prove | 5 | Reports signer, chain trust against system and supplied roots, revocation from the document or online, timestamp, PAdES level, covered revision, and later changes |
 | Request signatures from remote people | Excluded | None | Requires accounts, identity, email delivery, tracking, and cloud audit infrastructure |
 | XFA forms | Excluded | None | Requires a separate runtime and has no current user workflow |
 
