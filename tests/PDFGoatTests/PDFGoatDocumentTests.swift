@@ -571,7 +571,7 @@ struct PDFGoatDocumentTests {
         let pageReferences = (0..<pageCount).map { "\($0 + 3) 0 R" }.joined(separator: " ")
         appendObject("2 0 obj\n<< /Type /Pages /Kids [\(pageReferences)] /Count \(pageCount) >>\nendobj\n")
         for index in 0..<pageCount {
-            appendObject("\(index + 3) 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> >>\nendobj\n")
+            appendObject("\(index + 3) 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [] /Resources << >> >>\nendobj\n")
         }
 
         let xrefOffset = body.count
