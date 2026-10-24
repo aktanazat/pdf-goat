@@ -571,7 +571,7 @@ struct PDFGoatDocumentTests {
         let pageReferences = (0..<pageCount).map { "\($0 + 3) 0 R" }.joined(separator: " ")
         appendObject("2 0 obj\n<< /Type /Pages /Kids [\(pageReferences)] /Count \(pageCount) >>\nendobj\n")
         for index in 0..<pageCount {
-            appendObject("\(index + 3) 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << >> >>\nendobj\n")
+            appendObject("\(index + 3) 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [] /Resources << >> >>\nendobj\n")
         }
 
         let xrefOffset = body.count
@@ -590,10 +590,10 @@ struct PDFGoatDocumentTests {
     }
 
     private func displayedPDFView(of controller: DocumentWindowController) -> PDFView? {
-        splitViewController(of: controller)?
-            .splitViewItems
-            .compactMap { $0.viewController.view as? PDFView }
-            .first
+        guard let splitView = splitViewController(of: controller)?.view else {
+            return nil
+        }
+        return firstSubview(of: PDFView.self, in: splitView)
     }
 
     private func pageField(of controller: DocumentWindowController) -> NSTextField? {
