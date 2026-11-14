@@ -51,10 +51,6 @@ impl Outline {
         &self.ops
     }
 
-    pub fn into_ops(self) -> Vec<PathOp> {
-        self.ops
-    }
-
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
