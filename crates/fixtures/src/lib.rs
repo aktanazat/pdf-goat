@@ -50,11 +50,6 @@ impl TextStyle {
             color: [0.0; 3],
         }
     }
-
-    pub fn with_color(mut self, color: [f64; 3]) -> TextStyle {
-        self.color = color;
-        self
-    }
 }
 
 impl Default for TextStyle {
@@ -88,14 +83,6 @@ impl Paint {
             width,
         }
     }
-
-    pub fn fill_stroke(fill: [f64; 3], stroke: [f64; 3], width: f64) -> Paint {
-        Paint {
-            fill: Some(fill),
-            stroke: Some(stroke),
-            width,
-        }
-    }
 }
 
 /// An optional content group made by [`PdfBuilder::layer`].
@@ -124,11 +111,6 @@ enum Annot {
         rect: [f64; 4],
         kind: FieldKind,
     },
-    FileAttachment {
-        rect: [f64; 4],
-        name: String,
-        data: Vec<u8>,
-    },
     Raw(Dict),
 }
 
@@ -153,11 +135,6 @@ impl PdfBuilder {
     pub fn page(&mut self, width: f64, height: f64) -> &mut PageBuilder {
         let index = self.pages.len();
         self.pages.push(PageBuilder::new(width, height));
-        &mut self.pages[index]
-    }
-
-    /// The page at `index` (0-based). Panics when out of range.
-    pub fn page_at(&mut self, index: usize) -> &mut PageBuilder {
         &mut self.pages[index]
     }
 
@@ -537,17 +514,6 @@ impl PageBuilder {
         self.flate_image(rect, width, height, "DeviceRGB", 3, rgb)
     }
 
-    /// An 8-bit DeviceGray Flate image stretched over `rect`.
-    pub fn image_gray(
-        &mut self,
-        rect: [f64; 4],
-        width: u32,
-        height: u32,
-        gray: &[u8],
-    ) -> &mut Self {
-        self.flate_image(rect, width, height, "DeviceGray", 1, gray)
-    }
-
     /// JPEG bytes stored as-is in a `/DCTDecode` image stretched over
     /// `rect`. Adobe CMYK gets `/Decode [1 0 1 0 1 0 1 0]`.
     pub fn image_jpeg(&mut self, rect: [f64; 4], jpeg: &[u8]) -> &mut Self {
@@ -638,21 +604,6 @@ impl PageBuilder {
                 value: value.to_string(),
             },
         )
-    }
-
-    /// A `/FileAttachment` annotation embedding `data` as `name`.
-    pub fn file_attachment_annotation(
-        &mut self,
-        rect: [f64; 4],
-        name: &str,
-        data: &[u8],
-    ) -> &mut Self {
-        self.annots.push(Annot::FileAttachment {
-            rect,
-            name: name.to_string(),
-            data: data.to_vec(),
-        });
-        self
     }
 
     /// Any annotation dictionary, added to `/Annots` as given (raw PDF
@@ -839,17 +790,6 @@ impl PageBuilder {
                 }
                 Annot::Widget { name, rect, kind } => {
                     self.build_widget(doc, ctx, page_ref, name, *rect, kind)
-                }
-                Annot::FileAttachment { rect, name, data } => {
-                    let spec = add_filespec(doc, name, data);
-                    let mut dict = Dict::new();
-                    dict.insert("Type", Object::name("Annot"));
-                    dict.insert("Subtype", Object::name("FileAttachment"));
-                    dict.insert("Rect", self.pdf_rect(*rect));
-                    dict.insert("FS", spec);
-                    dict.insert("Contents", Object::text(name));
-                    dict.insert("Name", Object::name("PushPin"));
-                    doc.add(dict)
                 }
                 Annot::Raw(dict) => match lift_streams(doc, Object::Dict(dict.clone()), 0) {
                     Object::Dict(dict) => doc.add(dict),
