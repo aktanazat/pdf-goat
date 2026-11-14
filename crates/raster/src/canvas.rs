@@ -460,11 +460,6 @@ impl Canvas {
         self.edges.bounds().intersect(&self.top_clip().bounds)
     }
 
-    /// Paints a precomputed coverage mask (for example a cached glyph).
-    pub fn fill_mask(&mut self, mask: &Mask, paint: &Paint<'_>) {
-        self.paint(mask, &[], (0, 0), paint.source, None, &paint.composite);
-    }
-
     /// Paints `mask` moved by whole pixels `(dx, dy)`: a glyph bitmap
     /// rendered relative to its origin, placed at the origin's pixel.
     pub fn fill_mask_at(&mut self, mask: &Mask, dx: i32, dy: i32, paint: &Paint<'_>) {
@@ -627,30 +622,6 @@ impl Canvas {
         let rect = top.rect.intersect(&device);
         let clip = Clip::from_rect(rect, top.mask.clone(), top.bounds);
         self.clips.push(clip);
-    }
-
-    /// Intersects the clip with a device-space coverage mask.
-    pub fn push_clip_mask(&mut self, mask: &Mask) {
-        let top = self.top_clip().clone();
-        let region = top.bounds;
-        let mut combined = Mask::new(region, 255, 0).unwrap_or_default();
-        let w = region.width() as usize;
-        if w > 0 {
-            for (ry, row) in combined.data_mut().chunks_exact_mut(w).enumerate() {
-                let y = region.y0 + ry as i32;
-                mask.mul_row(region.x0, y, row);
-                if let Some(prev) = &top.mask {
-                    prev.mul_row(region.x0, y, row);
-                }
-            }
-        }
-        let bounds = combined.nonzero_bounds().intersect(&top.bounds);
-        self.clips.push(Clip {
-            rect: top.rect,
-            inner: top.inner,
-            bounds,
-            mask: Some(Arc::new(combined)),
-        });
     }
 
     /// Removes the innermost clip. Cannot remove canvas bounds or clips

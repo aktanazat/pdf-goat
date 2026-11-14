@@ -186,14 +186,6 @@ impl BlendMode {
             _ => return None,
         })
     }
-
-    /// True for modes that act on each colour channel independently.
-    pub fn is_separable(self) -> bool {
-        !matches!(
-            self,
-            BlendMode::Hue | BlendMode::Saturation | BlendMode::Color | BlendMode::Luminosity
-        )
-    }
 }
 
 /// Source colours for one row.

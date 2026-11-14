@@ -96,15 +96,6 @@ impl Color {
         Color { r, g, b, a: 1.0 }
     }
 
-    pub fn from_rgba8(r: u8, g: u8, b: u8, a: u8) -> Color {
-        Color::new(
-            f32::from(r) / 255.0,
-            f32::from(g) / 255.0,
-            f32::from(b) / 255.0,
-            f32::from(a) / 255.0,
-        )
-    }
-
     /// Straight RGB bytes, `trunc(255 * c)` like MuPDF's `colorfv * 255`.
     pub fn to_rgb8(self) -> [u8; 3] {
         [color_byte(self.r), color_byte(self.g), color_byte(self.b)]
@@ -217,10 +208,6 @@ impl Pixmap {
 
     pub fn data_mut(&mut self) -> &mut [u8] {
         &mut self.data
-    }
-
-    pub fn into_data(self) -> Vec<u8> {
-        self.data
     }
 
     /// Premultiplied RGBA of one pixel, or `None` outside the pixmap.
