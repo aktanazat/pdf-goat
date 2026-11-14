@@ -187,31 +187,6 @@ pub fn luma(r: u8, g: u8, b: u8) -> u8 {
     ((299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) + 500) / 1000) as u8
 }
 
-/// Gray to RGB by replication.
-pub fn gray_to_rgb(gray: &[u8]) -> Vec<u8> {
-    gray.iter().flat_map(|&g| [g, g, g]).collect()
-}
-
-/// RGB to luma gray.
-pub fn rgb_to_gray(rgb: &[u8]) -> Vec<u8> {
-    rgb.as_chunks::<3>()
-        .0
-        .iter()
-        .map(|px| luma(px[0], px[1], px[2]))
-        .collect()
-}
-
-/// RGB plus an optional alpha plane to straight RGBA; a missing plane means
-/// opaque.
-pub fn rgb_to_rgba(rgb: &[u8], alpha: Option<&[u8]>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
-    for (i, px) in rgb.as_chunks::<3>().0.iter().enumerate() {
-        let a = alpha.and_then(|a| a.get(i).copied()).unwrap_or(255);
-        out.extend_from_slice(&[px[0], px[1], px[2], a]);
-    }
-    out
-}
-
 /// Straight RGBA to RGB by dropping alpha.
 pub fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
     rgba.as_chunks::<4>()
@@ -219,32 +194,6 @@ pub fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
         .iter()
         .flat_map(|px| [px[0], px[1], px[2]])
         .collect()
-}
-
-/// Straight RGBA composited onto white, as Pillow's paste onto a white
-/// background does in `from-images`.
-pub fn rgba_to_rgb_on_white(rgba: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
-    for px in rgba.as_chunks::<4>().0.iter() {
-        let a = u32::from(px[3]);
-        for &c in &px[..3] {
-            out.push(((u32::from(c) * a + 255 * (255 - a) + 127) / 255) as u8);
-        }
-    }
-    out
-}
-
-/// Straight RGBA to premultiplied RGBA (the rasterizer's pixmap convention).
-pub fn premultiply_rgba(rgba: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgba.len());
-    for px in rgba.as_chunks::<4>().0.iter() {
-        let a = u32::from(px[3]);
-        for &c in &px[..3] {
-            out.push(((u32::from(c) * a + 127) / 255) as u8);
-        }
-        out.push(px[3]);
-    }
-    out
 }
 
 /// Premultiplied RGBA back to straight RGBA.

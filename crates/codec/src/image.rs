@@ -220,20 +220,6 @@ impl DecodedImage {
             .collect()
     }
 
-    /// The 8-bit alpha plane, if the image has alpha.
-    pub fn alpha8(&self) -> Option<Vec<u8>> {
-        if !self.has_alpha() {
-            return None;
-        }
-        let ch = self.layout.channels();
-        Some(
-            self.samples8()
-                .chunks_exact(ch)
-                .map(|px| px[ch - 1])
-                .collect(),
-        )
-    }
-
     /// Every sample as one byte, in row-major interleaved order (no row
     /// padding): 16-bit samples keep their high byte, sub-byte gray samples
     /// scale to 0..=255, and indices stay as they are.
