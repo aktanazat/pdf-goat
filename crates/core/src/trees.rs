@@ -163,18 +163,4 @@ impl Document {
             None => Ok(Vec::new()),
         }
     }
-
-    /// Replace `/PageLabels`; empty `entries` removes it.
-    pub fn set_page_labels(&mut self, entries: Vec<(i64, Object)>) -> Result<()> {
-        let root = self.catalog_ref()?;
-        let mut catalog = self.catalog()?;
-        if entries.is_empty() {
-            catalog.remove(b"PageLabels");
-        } else {
-            let node = self.add(build_number_tree(entries));
-            catalog.insert("PageLabels", node);
-        }
-        self.set(root, catalog);
-        Ok(())
-    }
 }

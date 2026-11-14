@@ -302,10 +302,6 @@ impl Dict {
         self.get(key)?.as_array()
     }
 
-    pub fn get_dict(&self, key: &[u8]) -> Option<&Dict> {
-        self.get(key)?.as_dict()
-    }
-
     pub fn get_ref(&self, key: &[u8]) -> Option<ObjRef> {
         self.get(key)?.as_reference()
     }
@@ -522,13 +518,6 @@ impl Object {
     }
 
     pub fn as_stream(&self) -> Option<&Stream> {
-        match self {
-            Object::Stream(stream) => Some(stream),
-            _ => None,
-        }
-    }
-
-    pub fn as_stream_mut(&mut self) -> Option<&mut Stream> {
         match self {
             Object::Stream(stream) => Some(stream),
             _ => None,

@@ -1001,18 +1001,6 @@ impl Document {
     pub fn mark_modified(&mut self) {
         self.modified = true;
     }
-
-    /// Numbers set or deleted since loading, with their generations.
-    pub fn changed_ids(&self) -> Vec<ObjRef> {
-        self.changes
-            .iter()
-            .map(|(&num, change)| match change {
-                Change::Set { generation, .. } | Change::Deleted { generation } => {
-                    ObjRef::new(num, *generation)
-                }
-            })
-            .collect()
-    }
 }
 
 /// A string or stream transformation: encryption or decryption of one

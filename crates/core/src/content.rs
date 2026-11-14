@@ -25,11 +25,6 @@ impl Operation {
         }
     }
 
-    /// The operator as text; an operator that is not UTF-8 gives "".
-    pub fn operator_str(&self) -> &str {
-        std::str::from_utf8(&self.operator).unwrap_or("")
-    }
-
     /// The inline image of a `BI` operation.
     pub fn inline_image(&self) -> Option<&Stream> {
         match (self.operator.as_slice(), self.operands.as_slice()) {
