@@ -215,19 +215,9 @@ impl Page {
             .unwrap_or_else(|| self.crop_box())
     }
 
-    /// `/BleedBox` clipped to the media box; the crop box by default.
-    pub fn bleed_box(&self) -> Rect {
-        self.box_or_crop(b"BleedBox")
-    }
-
     /// `/TrimBox` clipped to the media box; the crop box by default.
     pub fn trim_box(&self) -> Rect {
         self.box_or_crop(b"TrimBox")
-    }
-
-    /// `/ArtBox` clipped to the media box; the crop box by default.
-    pub fn art_box(&self) -> Rect {
-        self.box_or_crop(b"ArtBox")
     }
 
     /// `/Rotate` normalized to 0, 90, 180, or 270 (other values round to
