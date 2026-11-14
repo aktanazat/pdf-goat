@@ -4,7 +4,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::GoatError;
-use crate::ledger::LEDGER_FILE;
 use crate::pool::PoolTuning;
 use crate::textcache::{CACHE_FILE, DEFAULT_CAP_BYTES, cache_limit_bytes};
 
@@ -42,30 +41,9 @@ impl Ctx {
         }
     }
 
-    /// The same context with a cache budget of `bytes`; zero disables the cache.
-    pub fn with_cache_cap(self, bytes: u64) -> Self {
-        Self {
-            cache_cap_bytes: bytes,
-            ..self
-        }
-    }
-
-    /// The same context with this pool tuning.
-    pub fn with_pool(self, tuning: PoolTuning) -> Self {
-        Self {
-            pool: Ok(tuning),
-            ..self
-        }
-    }
-
     /// The state directory that holds the ledger and the text cache.
     pub fn home(&self) -> &Path {
         &self.home
-    }
-
-    /// The ledger database.
-    pub fn ledger_path(&self) -> PathBuf {
-        self.home.join(LEDGER_FILE)
     }
 
     /// The text cache database.

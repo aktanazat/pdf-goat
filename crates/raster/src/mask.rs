@@ -1,9 +1,7 @@
 //! 8-bit coverage masks: fill coverage, clip masks, and soft masks.
 
-use crate::geom::{IntRect, Transform};
-use crate::path::Path;
+use crate::geom::IntRect;
 use crate::pixmap::{Pixmap, RasterError, check_size, luma, mul255};
-use crate::raster::{Edges, FillRule, Rasterizer};
 
 /// An 8-bit mask over a device rectangle. `255` means fully covered or
 /// opaque. Pixels outside `rect` read as `outside`.
@@ -27,19 +25,6 @@ impl Mask {
             data: vec![value; n],
             outside,
         })
-    }
-
-    /// Anti-aliased coverage of `path` under `transform`, limited to
-    /// `bounds`. Outside reads 0.
-    pub fn from_path(path: &Path, transform: &Transform, rule: FillRule, bounds: IntRect) -> Mask {
-        let mut edges = Edges::default();
-        edges.reset(bounds);
-        edges.add_path(path, transform);
-        let mut out = Mask::default();
-        if !Rasterizer::default().rasterize(&mut edges, rule, &mut out) {
-            out = Mask::default();
-        }
-        out
     }
 
     /// Moves the mask by whole pixels.

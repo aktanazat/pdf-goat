@@ -359,22 +359,6 @@ impl Model {
     }
 }
 
-/// The `model` object in a `search --meaning` result.
-pub fn search_model_json(model: &Model) -> Value {
-    json!({
-        "id": MODEL_ID,
-        "revision": MODEL_REVISION,
-        "dim": model.dim(),
-    })
-}
-
-/// A score rounded to 4 decimals exactly as Python's `round(score, 4)` does
-/// (correctly rounded from the binary value, ties to even), which is how a
-/// `search --meaning` hit reports its `score`.
-pub fn round_score(score: f64) -> f64 {
-    format!("{score:.4}").parse().unwrap_or(score)
-}
-
 /// One file handled by [`install`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InstalledFile {
