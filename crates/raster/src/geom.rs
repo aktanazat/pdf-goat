@@ -159,34 +159,6 @@ impl Transform {
         )
     }
 
-    /// Applies the linear part only (no translation).
-    pub fn apply_vector(&self, v: Point) -> Point {
-        Point::new(self.a * v.x + self.c * v.y, self.b * v.x + self.d * v.y)
-    }
-
-    /// Largest singular value of the linear part: the most a unit length can grow.
-    pub fn max_scale(&self) -> f64 {
-        let (s_max, _) = self.singular_values();
-        s_max
-    }
-
-    /// Smallest singular value of the linear part.
-    pub fn min_scale(&self) -> f64 {
-        let (_, s_min) = self.singular_values();
-        s_min
-    }
-
-    fn singular_values(&self) -> (f64, f64) {
-        let p = self.a * self.a + self.b * self.b;
-        let q = self.a * self.c + self.b * self.d;
-        let r = self.c * self.c + self.d * self.d;
-        let mean = 0.5 * (p + r);
-        let diff = (0.25 * (p - r) * (p - r) + q * q).sqrt();
-        let hi = (mean + diff).max(0.0).sqrt();
-        let lo = (mean - diff).max(0.0).sqrt();
-        (hi, lo)
-    }
-
     /// True when axis-aligned rectangles stay axis-aligned (no rotation or skew
     /// other than multiples of 90 degrees).
     pub fn is_axis_aligned(&self) -> bool {
@@ -222,10 +194,6 @@ impl Rect {
         let (x0, x1) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
         let (y0, y1) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
         Rect { x0, y0, x1, y1 }
-    }
-
-    pub fn from_xywh(x: f64, y: f64, w: f64, h: f64) -> Rect {
-        Rect::new(x, y, x + w, y + h)
     }
 
     /// Bounding box of the finite points; `None` when there are none.
