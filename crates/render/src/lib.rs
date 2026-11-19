@@ -1,6 +1,7 @@
 //! Page rasterisation: runs a page through pdf-interp onto a pdf-raster
 //! canvas, and the `render` and `compare visual` verbs.
 
+mod budget;
 mod command;
 mod device;
 mod glyph;
@@ -96,18 +97,11 @@ fn render_area(
     if !options.dpi.is_finite() || options.dpi <= 0.0 {
         return Err(InterpError::Limit("dpi must be positive and finite".to_owned()).into());
     }
-    let page_bounds = pdf_interp::page_bounds(page);
-    let bounds = clip.map_or(page_bounds, |clip| page_bounds.intersect(&clip));
+    let bounds = area_bounds(page, clip);
     if bounds.is_empty() {
         return Err(InterpError::Limit("render region has no area".to_owned()).into());
     }
-    // MuPDF constructs its dpi matrix in float precision before composing
-    // it with the page transform; later rounding shifts exact subsamples.
-    let scale = f64::from(options.dpi as f32 / 72.0_f32);
-    let x0 = (bounds.x0 * scale + 0.001).floor();
-    let y0 = (bounds.y0 * scale + 0.001).floor();
-    let x1 = (bounds.x1 * scale - 0.001).ceil();
-    let y1 = (bounds.y1 * scale - 0.001).ceil();
+    let (scale, [x0, y0, x1, y1]) = pixel_box(bounds, options.dpi);
     let mut device =
         device::RasterDevice::new((x1 - x0) as u32, (y1 - y0) as u32, options.alpha, draw_text)?;
     let to_pixels = Matrix::scale(scale, scale).concat(&Matrix::translate(-x0, -y0));
@@ -122,6 +116,35 @@ fn render_area(
         },
     )?;
     Ok((device.finish()?, to_pixels))
+}
+
+/// The page as displayed, cut to `clip` when given.
+fn area_bounds(page: &Page, clip: Option<Rect>) -> Rect {
+    let page_bounds = pdf_interp::page_bounds(page);
+    clip.map_or(page_bounds, |clip| page_bounds.intersect(&clip))
+}
+
+/// The points-to-pixels scale at `dpi`, and the whole pixels `bounds` covers.
+fn pixel_box(bounds: Rect, dpi: f64) -> (f64, [f64; 4]) {
+    // MuPDF constructs its dpi matrix in float precision before composing
+    // it with the page transform; later rounding shifts exact subsamples.
+    let scale = f64::from(dpi as f32 / 72.0_f32);
+    let x0 = (bounds.x0 * scale + 0.001).floor();
+    let y0 = (bounds.y0 * scale + 0.001).floor();
+    let x1 = (bounds.x1 * scale - 0.001).ceil();
+    let y1 = (bounds.y1 * scale - 0.001).ceil();
+    (scale, [x0, y0, x1, y1])
+}
+
+/// How many pixels [`render_area`] gives the page, or its part inside `clip`, at `dpi`;
+/// zero for a region it refuses.
+fn area_pixels(page: &Page, dpi: f64, clip: Option<Rect>) -> u64 {
+    let bounds = area_bounds(page, clip);
+    if !dpi.is_finite() || dpi <= 0.0 || bounds.is_empty() {
+        return 0;
+    }
+    let (_, [x0, y0, x1, y1]) = pixel_box(bounds, dpi);
+    ((x1 - x0).max(0.0) * (y1 - y0).max(0.0)) as u64
 }
 
 /// Registers `render` and `compare visual`.

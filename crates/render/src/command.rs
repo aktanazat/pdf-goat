@@ -11,7 +11,8 @@ use pdf_interp::{Interpreter, page_transform, unrotated_transform};
 use pdf_raster::Pixmap;
 use serde_json::{Map, Value, json};
 
-use crate::{RenderOptions, render_area};
+use crate::budget::{BYTES_PER_PIXEL, Budget, DEFAULT_BYTES};
+use crate::{RenderOptions, area_pixels, render_area};
 
 pub(crate) fn register(registry: &mut Registry) {
     registry.command(Verb::new(
@@ -85,6 +86,12 @@ impl RenderDoc {
         })
     }
 
+    /// Bytes page `index` holds while it renders and saves at `dpi`, cut to `clip`.
+    fn footprint(&self, index: usize, dpi: f64, clip: Option<Rect>) -> Result<u64, GoatError> {
+        let page = self.doc.page(index).map_err(error)?;
+        Ok(area_pixels(&page, dpi, clip).saturating_mul(BYTES_PER_PIXEL))
+    }
+
     /// Page `index` at `dpi`, cut to `clip` (points on the page as displayed), with each
     /// of `marks` outlined where it shows. Marks are in the frame `search` reports.
     fn page(
@@ -129,6 +136,7 @@ struct RenderTask {
     dpi: f64,
     clip: Option<Rect>,
     marks: Vec<Rect>,
+    budget: Budget,
 }
 
 impl PageTask for RenderTask {
@@ -140,6 +148,9 @@ impl PageTask for RenderTask {
     }
 
     fn page(&self, doc: &mut Self::Doc, index: usize) -> Result<Self::Value, GoatError> {
+        let _reservation = self
+            .budget
+            .reserve(doc.footprint(index, self.dpi, self.clip)?);
         let pixmap = doc.page(index, self.dpi, self.clip, &self.marks)?;
         let output =
             self.directory
@@ -284,6 +295,7 @@ fn render(args: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError>
         dpi: dpi as f64,
         clip,
         marks,
+        budget: Budget::new(DEFAULT_BYTES),
     };
     let outputs = map_pages(&task, &mut doc, &indices, &ctx.pool()?)?;
     let marks: Vec<[f64; 4]> = task
@@ -307,6 +319,7 @@ struct VisualTask {
     right: PathBuf,
     directory: PathBuf,
     dpi: f64,
+    budget: Budget,
 }
 
 impl PageTask for VisualTask {
@@ -318,6 +331,11 @@ impl PageTask for VisualTask {
     }
 
     fn page(&self, doc: &mut Self::Doc, index: usize) -> Result<Self::Value, GoatError> {
+        let footprint = doc
+            .0
+            .footprint(index, self.dpi, None)?
+            .saturating_add(doc.1.footprint(index, self.dpi, None)?);
+        let _reservation = self.budget.reserve(footprint);
         let left = doc.0.page(index, self.dpi, None, &[])?;
         let right = doc.1.page(index, self.dpi, None, &[])?;
         let (width, height) = (left.width(), left.height());
@@ -389,6 +407,7 @@ fn visual(args: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError>
         right,
         directory,
         dpi: *required::<i64>(args, "dpi")? as f64,
+        budget: Budget::new(DEFAULT_BYTES),
     };
     let mut docs = task.open()?;
     let count = docs
@@ -498,7 +517,13 @@ mod tests {
     use pdf_core::{Dict, Document, Object, Rect, Stream};
     use pdf_interp::Interpreter;
 
-    use super::{RenderDoc, resize_rgb};
+    use std::time::Duration;
+
+    use goat_common::pool::{PoolTuning, map_pages};
+    use pdf_core::SaveOptions;
+
+    use super::{RenderDoc, RenderTask, resize_rgb};
+    use crate::budget::Budget;
 
     /// A 40 pt square page turned `rotation` degrees whose content fills PDF x 8..20,
     /// y 4..24 black.
@@ -552,6 +577,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Workers that wait on a budget too small for two pages at once still write the
+    /// files the sequential run writes, byte for byte.
+    #[test]
+    fn pooled_renders_under_a_tight_budget_match_the_sequential_files() {
+        let mut doc = Document::new();
+        for index in 0..24 {
+            let size = 30.0 + f64::from(index % 5) * 10.0;
+            let page = doc
+                .insert_blank_page(index as usize, Rect::new(0.0, 0.0, size, size + 8.0))
+                .unwrap();
+            let paint = format!(
+                "{} g {} 4 12 20 re f 1 0 0 rg 2 2 {} 6 re f",
+                f64::from(index) / 24.0,
+                index % 9,
+                size / 2.0
+            );
+            let content = doc.add(Stream::new(Dict::new(), paint.into_bytes()));
+            let mut dict = doc.get(page).unwrap().as_dict().unwrap().clone();
+            dict.insert("Contents", content);
+            dict.insert("Rotate", Object::Integer(i64::from(index % 4) * 90));
+            doc.set(page, dict);
+        }
+        let root = std::env::temp_dir().join(format!("pdf-render-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("pages.pdf");
+        doc.save(&source, &SaveOptions::default()).unwrap();
+        let indices: Vec<usize> = (0..24).collect();
+        let run = |name: &str, tuning: PoolTuning, budget: u64| {
+            let directory = root.join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            let task = RenderTask {
+                source: source.clone(),
+                directory,
+                stem: "pages".to_owned(),
+                format: "png".to_owned(),
+                dpi: 300.0,
+                clip: None,
+                marks: vec![Rect::new(2.0, 2.0, 10.0, 10.0)],
+                budget: Budget::new(budget),
+            };
+            let mut handle = RenderDoc::open(&source).unwrap();
+            map_pages(&task, &mut handle, &indices, &tuning)
+                .unwrap()
+                .into_iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let sequential = run(
+            "sequential",
+            PoolTuning {
+                max_workers: 1,
+                min_pages: 1,
+                switch_after: Duration::MAX,
+            },
+            u64::MAX,
+        );
+        // A 70 x 78 pt page at 300 dpi is about 1.04 MB at 11 bytes per pixel.
+        let pooled = run(
+            "pooled",
+            PoolTuning {
+                max_workers: 6,
+                min_pages: 1,
+                switch_after: Duration::ZERO,
+            },
+            1_500_000,
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(sequential.len(), 24);
+        assert!(
+            sequential == pooled,
+            "pooled files differ from sequential ones"
+        );
     }
 
     #[test]
