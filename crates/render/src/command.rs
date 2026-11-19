@@ -335,23 +335,15 @@ impl PageTask for VisualTask {
     fn page(&self, doc: &mut Self::Doc, index: usize) -> Result<Self::Value, GoatError> {
         let (left_width, left_height) = doc.0.size(index, self.dpi, None)?;
         let (right_width, right_height) = doc.1.size(index, self.dpi, None)?;
-        // Both pages, plus the RGB rows `resize_rgb` holds between its two passes.
-        let resized = if left_width == right_width {
-            0
-        } else {
-            left_width.saturating_mul(right_height).saturating_mul(3)
-        };
-        let footprint = left_width
-            .saturating_mul(left_height)
-            .saturating_add(right_width.saturating_mul(right_height))
-            .saturating_mul(BYTES_PER_PIXEL)
-            .saturating_add(resized);
-        let _reservation = self.budget.reserve(footprint);
+        let _reservation = self.budget.reserve(visual_footprint(
+            (left_width, left_height),
+            (right_width, right_height),
+        ));
         let left = doc.0.page(index, self.dpi, None, &[])?;
-        let right = doc.1.page(index, self.dpi, None, &[])?;
         let (width, height) = (left.width(), left.height());
         let mut difference = left.to_rgb8([255; 3]);
         drop(left);
+        let right = doc.1.page(index, self.dpi, None, &[])?;
         let (right_width, right_height) = (right.width() as usize, right.height() as usize);
         let right_rgb = right.to_rgb8([255; 3]);
         drop(right);
@@ -390,6 +382,7 @@ impl PageTask for VisualTask {
                 ];
             }
         }
+        drop(right_rgb);
         let output = self.directory.join(format!("diff_p{}.png", index + 1));
         let png = pdf_codec::encode_png(&difference, width, height, pdf_codec::PngColor::Rgb, None)
             .map_err(error)?;
@@ -405,6 +398,25 @@ impl PageTask for VisualTask {
             }),
         ))
     }
+}
+
+/// The most a comparison of a `left` and a `right` page (width, height in pixels) holds at
+/// once: the left page renders and saves within [`BYTES_PER_PIXEL`], the right one renders
+/// beside the left's RGB copy, and `resize_rgb` holds both RGB copies with its rows.
+fn visual_footprint(left: (u64, u64), right: (u64, u64)) -> u64 {
+    let rgb = |width: u64, height: u64| width.saturating_mul(height).saturating_mul(3);
+    let rendering =
+        |(width, height): (u64, u64)| width.saturating_mul(height).saturating_mul(BYTES_PER_PIXEL);
+    let mut resizing = rgb(left.0, left.1).saturating_add(rgb(right.0, right.1));
+    if left.0 != right.0 {
+        resizing = resizing.saturating_add(rgb(left.0, right.1));
+    }
+    if left.1 != right.1 {
+        resizing = resizing.saturating_add(rgb(left.0, left.1));
+    }
+    rendering(left)
+        .max(rgb(left.0, left.1).saturating_add(rendering(right)))
+        .max(resizing)
 }
 
 fn visual(args: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError> {
@@ -535,8 +547,19 @@ mod tests {
     use goat_common::pool::{PoolTuning, map_pages};
     use pdf_core::SaveOptions;
 
-    use super::{RenderDoc, RenderTask, resize_rgb};
+    use super::{RenderDoc, RenderTask, resize_rgb, visual_footprint};
     use crate::budget::Budget;
+
+    #[test]
+    fn a_visual_comparison_reserves_its_peak_not_two_pages() {
+        // Rendering the right page beside the left page's RGB copy: 3 + 11 bytes a pixel.
+        assert_eq!(visual_footprint((100, 200), (100, 200)), 100 * 200 * 14);
+        // A wide page against a tall one also holds the width pass of the resize.
+        assert_eq!(
+            visual_footprint((1000, 10), (10, 1000)),
+            3 * (1000 * 10 + 10 * 1000 + 1000 * 1000 + 1000 * 10)
+        );
+    }
 
     /// A 40 pt square page turned `rotation` degrees whose content fills PDF x 8..20,
     /// y 4..24 black.
