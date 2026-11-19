@@ -103,7 +103,7 @@ fn audio(matches: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatErro
     let out = out_path(matches, &source, "audio", "aiff")?;
     let say = on_path("say")
         .ok_or_else(|| GoatError::message("convert audio requires macOS say on PATH"))?;
-    let (_, pages) = texts(&source, true, ctx)?;
+    let (_, pages) = texts(&source, None, true, ctx)?;
     let joined = pages.join("\n");
     let text = goat_common::py::strip(&joined);
     if text.is_empty() {

@@ -19,9 +19,10 @@ pdf-goat --agent inspect "$IN"
 ```bash
 pdf-goat --agent text "$IN"
 pdf-goat --agent text "$IN" -o "$W/agreement.txt"
+pdf-goat --agent text "$IN" --pages 1
 ```
 
-- The first returns `pages[]` with `page` and `text`. For a long document use the second: the JSON carries only `outputs`, `page_count` and `char_count`, and you read the file with Read.
+- The first returns `pages[]` with `page` and `text`. For a long document use the second: the JSON carries only `outputs`, `page_count` and `char_count`, and you read the file with Read. The third reads only the pages `--pages` names (`2-5,9` form); each entry keeps its document page number.
 - Text comes out in reading order, not layout. Add `--layout` when columns matter.
 
 ## 3. Find and cite

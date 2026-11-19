@@ -279,6 +279,55 @@ fn invalid_mask_is_rejected_before_reading_or_releasing_text() {
 }
 
 #[test]
+fn text_pages_reads_only_the_selected_pages_in_every_form() {
+    let work = work();
+    let dir = work.path();
+    let source = document(dir, "input.pdf", &[&["one"], &["two"], &["three"]]);
+    let expected = json!([{"page":3,"text":"three\n"},{"page":1,"text":"one\n"}]);
+    for extra in [vec!["--no-cache"], vec![], vec![]] {
+        let mut args = vec!["text", &source, "--pages", "3,1"];
+        args.extend(extra);
+        let value = run(dir, &args).expect("selected pages");
+        assert_eq!(value["pages"], expected);
+        assert_eq!(value["char_count"], 11);
+    }
+    let all = run(dir, &["text", &source]).expect("all pages after a primed range");
+    assert_eq!(
+        all["pages"],
+        json!([{"page":1,"text":"one\n"},{"page":2,"text":"two\n"},{"page":3,"text":"three\n"}])
+    );
+    let output = dir.join("range.txt");
+    let output = output.to_str().expect("UTF-8 path");
+    let exported =
+        run(dir, &["text", &source, "--pages", "2-3", "-o", output]).expect("export range");
+    assert_eq!(exported["page_count"], 3);
+    assert_eq!(exported["selected_pages"], json!([2, 3]));
+    assert!(exported.get("pages").is_none());
+    assert_eq!(
+        fs::read_to_string(output).expect("text output"),
+        "two\n\nthree\n"
+    );
+    let plain = run(dir, &["text", &source, "-o", output]).expect("export all");
+    assert!(plain.get("selected_pages").is_none());
+    let layout = run(dir, &["text", &source, "--layout", "--pages", "2"]).expect("layout range");
+    let pages = layout["pages"].as_array().expect("layout pages");
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0]["page"], 2);
+    assert!(
+        pages[0]["text"]
+            .as_str()
+            .expect("layout text")
+            .contains("two")
+    );
+    for extra in [vec!["--no-cache"], vec![], vec!["--layout"]] {
+        let mut args = vec!["text", &source, "--pages", "4"];
+        args.extend(extra);
+        let error = run(dir, &args).expect_err("page outside the document");
+        assert!(error.to_string().contains('4'), "{error}");
+    }
+}
+
+#[test]
 fn mask_phrase_with_a_plain_space_also_masks_it_across_a_line_break() {
     let work = work();
     let dir = work.path();

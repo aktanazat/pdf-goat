@@ -184,6 +184,16 @@ fn info(result: &Map<String, Value>, out: &mut Out) -> Result<(), GoatError> {
 }
 
 fn text(result: &Map<String, Value>, out: &mut Out) -> Result<(), GoatError> {
+    if let Some(selected) = result.get("selected_pages") {
+        out.line(format_args!(
+            "# {} chars across {} of {} pages -> {}",
+            field(result, "char_count")?,
+            selected.as_array().map_or(0, Vec::len),
+            field(result, "page_count")?,
+            first(result, "outputs")?
+        ));
+        return Ok(());
+    }
     if result.contains_key("page_count") {
         out.line(format_args!(
             "# {} chars across {} pages -> {}",
