@@ -139,7 +139,7 @@ Every `rect` a result carries is `[x0, y0, x1, y1]` in points on the page's crop
 
 `preflight` reports a page in its `empty_pages` finding when the page declares no font and no image. It does not extract page text, so a page that declares a font but draws no glyphs is not reported empty, and neither is a blank page whose font resources are inherited from the page tree.
 
-`text` with `-o` and without `--layout` streams the page text to that file. The result then reports `page_count` and the file path in `outputs`, and carries no `pages` list. Without `-o` the result carries the per-page text in `pages`. `--layout` always returns the per-page layout in `pages`, with or without `-o`.
+`text` with `-o` and without `--layout` streams the page text to that file. The result then reports `page_count` and the file path in `outputs`, and carries no `pages` list. Without `-o` the result carries the per-page text in `pages`. `--layout` always returns the per-page layout in `pages`, with or without `-o`. `--pages RANGE` restricts every form to the listed pages, in the order given, and reads only those pages; each `pages` entry keeps its document page number. With `-o` the file holds the selected pages joined as before, `page_count` stays the document's page count, and `selected_pages` lists the page numbers written. A range outside the document fails before any text is written.
 
 `get images` preserves stored compression where possible: `.jpg` for DCT, `.jp2` for JPX, `.tif` for CCITT, `.tiff` for CMYK rasters, and `.png` otherwise. A stencil mask is written with the PDF's sample values, not its painted appearance. Other supported streams are decoded and re-encoded by the native codecs; an unsupported encoding returns an error.
 

@@ -120,7 +120,7 @@ fn compare(matches: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatEr
     let mut all = HashMap::new();
     for path in std::iter::once(&left).chain(&others) {
         if !all.contains_key(path) {
-            let (_, values) = texts(path, no_cache, ctx)?;
+            let (_, values) = texts(path, None, no_cache, ctx)?;
             all.insert(
                 path.clone(),
                 values.iter().map(|s| text_lines(s)).collect::<Vec<_>>(),

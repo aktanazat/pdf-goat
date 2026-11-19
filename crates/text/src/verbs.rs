@@ -25,6 +25,7 @@ pub fn register(registry: &mut Registry) {
                     .help("write text to a file"),
             )
             .arg(toggle("layout").help("preserve positioned columns and lines"))
+            .arg(Arg::new("pages").long("pages").help("default: all pages"))
             .arg(
                 Arg::new("mask")
                     .long("mask")
@@ -186,10 +187,11 @@ pub(crate) fn cached(
 
 pub(crate) fn texts(
     source: &Path,
+    pages: Option<&str>,
     no_cache: bool,
     ctx: &Ctx,
 ) -> Result<(usize, Vec<String>), GoatError> {
-    let (count, entries) = cached(source, Form::Text, None, no_cache, ctx)?;
+    let (count, entries) = cached(source, Form::Text, pages, no_cache, ctx)?;
     let values = entries
         .into_iter()
         .map(|entry| match entry {
@@ -210,20 +212,23 @@ fn text(matches: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError
         .filter(|s| !s.is_empty())
         .map(|s| hit_pattern(s))
         .transpose()?;
+    let spec = optional::<String>(matches, "pages")?
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
     let mut result = json!({"verb":"text","inputs":[path_value(&source)],"outputs":output.iter().map(|p|path_value(p)).collect::<Vec<_>>()});
     if flag(matches, "layout")? {
         let task = LayoutTask {
             source: source.clone(),
         };
         let mut doc = task.open()?;
-        let indices: Vec<usize> = (0..doc.count).collect();
+        let indices = selected(spec, doc.count)?;
         let values = goat_common::pool::map_pages(&task, &mut doc, &indices, &ctx.pool()?)?;
         let mut pages = Vec::with_capacity(values.len());
         let mut full = String::new();
-        for (index, value) in values.into_iter().enumerate() {
+        for (position, (index, value)) in indices.into_iter().zip(values).enumerate() {
             let mut value = mask_text(value, pattern.as_ref())?;
             value["page"] = (index + 1).into();
-            if index != 0 {
+            if position != 0 {
                 full.push('\n');
             }
             if let Some(text) = value["text"].as_str() {
@@ -238,7 +243,8 @@ fn text(matches: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError
             fs::write(out, full).map_err(|e| GoatError::os(&e, out))?;
         }
     } else {
-        let (page_count, mut values) = texts(&source, flag(matches, "no_cache")?, ctx)?;
+        let (page_count, mut values) = texts(&source, spec, flag(matches, "no_cache")?, ctx)?;
+        let indices = selected(spec, page_count)?;
         if let Some(pattern) = pattern {
             for text in &mut values {
                 *text = pattern.replace_all(text, "[REDACTED]")?;
@@ -260,15 +266,25 @@ fn text(matches: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError
                     .map_err(|e| GoatError::os(&e, &out))?;
             }
             result["page_count"] = page_count.into();
+            if spec.is_some() {
+                result["selected_pages"] = indices.iter().map(|index| index + 1).collect();
+            }
         } else {
-            result["pages"] = values
+            result["pages"] = indices
                 .into_iter()
-                .enumerate()
-                .map(|(i, text)| json!({"page":i+1,"text":text}))
+                .zip(values)
+                .map(|(index, text)| json!({"page":index+1,"text":text}))
                 .collect();
         }
     }
     object(result)
+}
+
+fn selected(spec: Option<&str>, count: usize) -> Result<Vec<usize>, GoatError> {
+    match spec {
+        Some(spec) => goat_common::parse::parse_pages(spec, count),
+        None => Ok((0..count).collect()),
+    }
 }
 
 struct LayoutTask {
