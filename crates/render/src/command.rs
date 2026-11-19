@@ -12,7 +12,7 @@ use pdf_raster::Pixmap;
 use serde_json::{Map, Value, json};
 
 use crate::budget::{BYTES_PER_PIXEL, Budget, DEFAULT_BYTES};
-use crate::{RenderOptions, area_pixels, render_area};
+use crate::{RenderOptions, area_size, render_area};
 
 pub(crate) fn register(registry: &mut Registry) {
     registry.command(Verb::new(
@@ -86,10 +86,10 @@ impl RenderDoc {
         })
     }
 
-    /// Bytes page `index` holds while it renders and saves at `dpi`, cut to `clip`.
-    fn footprint(&self, index: usize, dpi: f64, clip: Option<Rect>) -> Result<u64, GoatError> {
+    /// The width and height in pixels of page `index` at `dpi`, cut to `clip`.
+    fn size(&self, index: usize, dpi: f64, clip: Option<Rect>) -> Result<(u64, u64), GoatError> {
         let page = self.doc.page(index).map_err(error)?;
-        Ok(area_pixels(&page, dpi, clip).saturating_mul(BYTES_PER_PIXEL))
+        Ok(area_size(&page, dpi, clip))
     }
 
     /// Page `index` at `dpi`, cut to `clip` (points on the page as displayed), with each
@@ -148,9 +148,10 @@ impl PageTask for RenderTask {
     }
 
     fn page(&self, doc: &mut Self::Doc, index: usize) -> Result<Self::Value, GoatError> {
+        let (width, height) = doc.size(index, self.dpi, self.clip)?;
         let _reservation = self
             .budget
-            .reserve(doc.footprint(index, self.dpi, self.clip)?);
+            .reserve(width.saturating_mul(height).saturating_mul(BYTES_PER_PIXEL));
         let pixmap = doc.page(index, self.dpi, self.clip, &self.marks)?;
         let output =
             self.directory
@@ -332,24 +333,35 @@ impl PageTask for VisualTask {
     }
 
     fn page(&self, doc: &mut Self::Doc, index: usize) -> Result<Self::Value, GoatError> {
-        let footprint = doc
-            .0
-            .footprint(index, self.dpi, None)?
-            .saturating_add(doc.1.footprint(index, self.dpi, None)?);
+        let (left_width, left_height) = doc.0.size(index, self.dpi, None)?;
+        let (right_width, right_height) = doc.1.size(index, self.dpi, None)?;
+        // Both pages, plus the RGB rows `resize_rgb` holds between its two passes.
+        let resized = if left_width == right_width {
+            0
+        } else {
+            left_width.saturating_mul(right_height).saturating_mul(3)
+        };
+        let footprint = left_width
+            .saturating_mul(left_height)
+            .saturating_add(right_width.saturating_mul(right_height))
+            .saturating_mul(BYTES_PER_PIXEL)
+            .saturating_add(resized);
         let _reservation = self.budget.reserve(footprint);
         let left = doc.0.page(index, self.dpi, None, &[])?;
         let right = doc.1.page(index, self.dpi, None, &[])?;
         let (width, height) = (left.width(), left.height());
         let mut difference = left.to_rgb8([255; 3]);
         drop(left);
+        let (right_width, right_height) = (right.width() as usize, right.height() as usize);
+        let right_rgb = right.to_rgb8([255; 3]);
+        drop(right);
         let right_rgb = resize_rgb(
-            right.to_rgb8([255; 3]),
-            right.width() as usize,
-            right.height() as usize,
+            right_rgb,
+            right_width,
+            right_height,
             width as usize,
             height as usize,
         );
-        drop(right);
         let mut changed = 0u64;
         let mut bbox = [width, height, 0, 0];
         for (i, (a, b)) in difference

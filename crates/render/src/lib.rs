@@ -136,15 +136,15 @@ fn pixel_box(bounds: Rect, dpi: f64) -> (f64, [f64; 4]) {
     (scale, [x0, y0, x1, y1])
 }
 
-/// How many pixels [`render_area`] gives the page, or its part inside `clip`, at `dpi`;
-/// zero for a region it refuses.
-fn area_pixels(page: &Page, dpi: f64, clip: Option<Rect>) -> u64 {
+/// The width and height in pixels [`render_area`] gives the page, or its part inside
+/// `clip`, at `dpi`; zero for a region it refuses.
+fn area_size(page: &Page, dpi: f64, clip: Option<Rect>) -> (u64, u64) {
     let bounds = area_bounds(page, clip);
     if !dpi.is_finite() || dpi <= 0.0 || bounds.is_empty() {
-        return 0;
+        return (0, 0);
     }
     let (_, [x0, y0, x1, y1]) = pixel_box(bounds, dpi);
-    ((x1 - x0).max(0.0) * (y1 - y0).max(0.0)) as u64
+    ((x1 - x0).max(0.0) as u64, (y1 - y0).max(0.0) as u64)
 }
 
 /// Registers `render` and `compare visual`.
