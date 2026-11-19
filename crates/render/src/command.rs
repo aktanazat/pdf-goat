@@ -11,7 +11,8 @@ use pdf_interp::{Interpreter, page_transform, unrotated_transform};
 use pdf_raster::Pixmap;
 use serde_json::{Map, Value, json};
 
-use crate::{RenderOptions, render_area};
+use crate::budget::{BYTES_PER_PIXEL, Budget, DEFAULT_BYTES};
+use crate::{RenderOptions, area_size, render_area};
 
 pub(crate) fn register(registry: &mut Registry) {
     registry.command(Verb::new(
@@ -85,6 +86,12 @@ impl RenderDoc {
         })
     }
 
+    /// The width and height in pixels of page `index` at `dpi`, cut to `clip`.
+    fn size(&self, index: usize, dpi: f64, clip: Option<Rect>) -> Result<(u64, u64), GoatError> {
+        let page = self.doc.page(index).map_err(error)?;
+        Ok(area_size(&page, dpi, clip))
+    }
+
     /// Page `index` at `dpi`, cut to `clip` (points on the page as displayed), with each
     /// of `marks` outlined where it shows. Marks are in the frame `search` reports.
     fn page(
@@ -129,6 +136,7 @@ struct RenderTask {
     dpi: f64,
     clip: Option<Rect>,
     marks: Vec<Rect>,
+    budget: Budget,
 }
 
 impl PageTask for RenderTask {
@@ -140,38 +148,43 @@ impl PageTask for RenderTask {
     }
 
     fn page(&self, doc: &mut Self::Doc, index: usize) -> Result<Self::Value, GoatError> {
+        let (width, height) = doc.size(index, self.dpi, self.clip)?;
+        let _reservation = self
+            .budget
+            .reserve(width.saturating_mul(height).saturating_mul(BYTES_PER_PIXEL));
         let pixmap = doc.page(index, self.dpi, self.clip, &self.marks)?;
         let output =
             self.directory
                 .join(format!("{}_p{:03}.{}", self.stem, index + 1, self.format));
-        save_image(&output, &pixmap, &self.format, self.dpi)?;
+        save_image(&output, pixmap, &self.format, self.dpi)?;
         Ok(output.to_string_lossy().into_owned())
     }
 }
 
-fn save_image(path: &Path, pixmap: &Pixmap, format: &str, dpi: f64) -> Result<(), GoatError> {
+fn save_image(path: &Path, pixmap: Pixmap, format: &str, dpi: f64) -> Result<(), GoatError> {
     let rgb = pixmap.to_rgb8([255; 3]);
+    let (width, height) = (pixmap.width(), pixmap.height());
+    drop(pixmap);
     let data = match format {
         "png" => pdf_codec::encode_png(
             &rgb,
-            pixmap.width(),
-            pixmap.height(),
+            width,
+            height,
             pdf_codec::PngColor::Rgb,
             Some((dpi, dpi)),
         )
         .map_err(error)?,
         "jpg" => pdf_codec::encode_jpeg(
             &rgb,
-            pixmap.width(),
-            pixmap.height(),
+            width,
+            height,
             pdf_codec::JpegColor::Rgb,
             95,
             Some((dpi, dpi)),
         )
         .map_err(error)?,
         "ppm" => {
-            let mut bytes =
-                format!("P6\n{} {}\n255\n", pixmap.width(), pixmap.height()).into_bytes();
+            let mut bytes = format!("P6\n{} {}\n255\n", width, height).into_bytes();
             bytes.extend_from_slice(&rgb);
             bytes
         }
@@ -284,6 +297,7 @@ fn render(args: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError>
         dpi: dpi as f64,
         clip,
         marks,
+        budget: Budget::new(DEFAULT_BYTES),
     };
     let outputs = map_pages(&task, &mut doc, &indices, &ctx.pool()?)?;
     let marks: Vec<[f64; 4]> = task
@@ -307,6 +321,7 @@ struct VisualTask {
     right: PathBuf,
     directory: PathBuf,
     dpi: f64,
+    budget: Budget,
 }
 
 impl PageTask for VisualTask {
@@ -318,19 +333,27 @@ impl PageTask for VisualTask {
     }
 
     fn page(&self, doc: &mut Self::Doc, index: usize) -> Result<Self::Value, GoatError> {
+        let (left_width, left_height) = doc.0.size(index, self.dpi, None)?;
+        let (right_width, right_height) = doc.1.size(index, self.dpi, None)?;
+        let _reservation = self.budget.reserve(visual_footprint(
+            (left_width, left_height),
+            (right_width, right_height),
+        ));
         let left = doc.0.page(index, self.dpi, None, &[])?;
-        let right = doc.1.page(index, self.dpi, None, &[])?;
         let (width, height) = (left.width(), left.height());
         let mut difference = left.to_rgb8([255; 3]);
         drop(left);
+        let right = doc.1.page(index, self.dpi, None, &[])?;
+        let (right_width, right_height) = (right.width() as usize, right.height() as usize);
+        let right_rgb = right.to_rgb8([255; 3]);
+        drop(right);
         let right_rgb = resize_rgb(
-            right.to_rgb8([255; 3]),
-            right.width() as usize,
-            right.height() as usize,
+            right_rgb,
+            right_width,
+            right_height,
             width as usize,
             height as usize,
         );
-        drop(right);
         let mut changed = 0u64;
         let mut bbox = [width, height, 0, 0];
         for (i, (a, b)) in difference
@@ -359,6 +382,7 @@ impl PageTask for VisualTask {
                 ];
             }
         }
+        drop(right_rgb);
         let output = self.directory.join(format!("diff_p{}.png", index + 1));
         let png = pdf_codec::encode_png(&difference, width, height, pdf_codec::PngColor::Rgb, None)
             .map_err(error)?;
@@ -376,6 +400,25 @@ impl PageTask for VisualTask {
     }
 }
 
+/// The most a comparison of a `left` and a `right` page (width, height in pixels) holds at
+/// once: the left page renders and saves within [`BYTES_PER_PIXEL`], the right one renders
+/// beside the left's RGB copy, and `resize_rgb` holds both RGB copies with its rows.
+fn visual_footprint(left: (u64, u64), right: (u64, u64)) -> u64 {
+    let rgb = |width: u64, height: u64| width.saturating_mul(height).saturating_mul(3);
+    let rendering =
+        |(width, height): (u64, u64)| width.saturating_mul(height).saturating_mul(BYTES_PER_PIXEL);
+    let mut resizing = rgb(left.0, left.1).saturating_add(rgb(right.0, right.1));
+    if left.0 != right.0 {
+        resizing = resizing.saturating_add(rgb(left.0, right.1));
+    }
+    if left.1 != right.1 {
+        resizing = resizing.saturating_add(rgb(left.0, left.1));
+    }
+    rendering(left)
+        .max(rgb(left.0, left.1).saturating_add(rendering(right)))
+        .max(resizing)
+}
+
 fn visual(args: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError> {
     let left = paths::resolve(required::<String>(args, "file")?)?;
     let right = paths::resolve(required::<String>(args, "other")?)?;
@@ -389,6 +432,7 @@ fn visual(args: &ArgMatches, ctx: &Ctx) -> Result<Map<String, Value>, GoatError>
         right,
         directory,
         dpi: *required::<i64>(args, "dpi")? as f64,
+        budget: Budget::new(DEFAULT_BYTES),
     };
     let mut docs = task.open()?;
     let count = docs
@@ -498,7 +542,24 @@ mod tests {
     use pdf_core::{Dict, Document, Object, Rect, Stream};
     use pdf_interp::Interpreter;
 
-    use super::{RenderDoc, resize_rgb};
+    use std::time::Duration;
+
+    use goat_common::pool::{PoolTuning, map_pages};
+    use pdf_core::SaveOptions;
+
+    use super::{RenderDoc, RenderTask, resize_rgb, visual_footprint};
+    use crate::budget::Budget;
+
+    #[test]
+    fn a_visual_comparison_reserves_its_peak_not_two_pages() {
+        // Rendering the right page beside the left page's RGB copy: 3 + 11 bytes a pixel.
+        assert_eq!(visual_footprint((100, 200), (100, 200)), 100 * 200 * 14);
+        // A wide page against a tall one also holds the width pass of the resize.
+        assert_eq!(
+            visual_footprint((1000, 10), (10, 1000)),
+            3 * (1000 * 10 + 10 * 1000 + 1000 * 1000 + 1000 * 10)
+        );
+    }
 
     /// A 40 pt square page turned `rotation` degrees whose content fills PDF x 8..20,
     /// y 4..24 black.
@@ -552,6 +613,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Workers that wait on a budget too small for two pages at once still write the
+    /// files the sequential run writes, byte for byte.
+    #[test]
+    fn pooled_renders_under_a_tight_budget_match_the_sequential_files() {
+        let mut doc = Document::new();
+        for index in 0..24 {
+            let size = 30.0 + f64::from(index % 5) * 10.0;
+            let page = doc
+                .insert_blank_page(index as usize, Rect::new(0.0, 0.0, size, size + 8.0))
+                .unwrap();
+            let paint = format!(
+                "{} g {} 4 12 20 re f 1 0 0 rg 2 2 {} 6 re f",
+                f64::from(index) / 24.0,
+                index % 9,
+                size / 2.0
+            );
+            let content = doc.add(Stream::new(Dict::new(), paint.into_bytes()));
+            let mut dict = doc.get(page).unwrap().as_dict().unwrap().clone();
+            dict.insert("Contents", content);
+            dict.insert("Rotate", Object::Integer(i64::from(index % 4) * 90));
+            doc.set(page, dict);
+        }
+        let root = std::env::temp_dir().join(format!("pdf-render-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("pages.pdf");
+        doc.save(&source, &SaveOptions::default()).unwrap();
+        let indices: Vec<usize> = (0..24).collect();
+        let run = |name: &str, tuning: PoolTuning, budget: u64| {
+            let directory = root.join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            let task = RenderTask {
+                source: source.clone(),
+                directory,
+                stem: "pages".to_owned(),
+                format: "png".to_owned(),
+                dpi: 300.0,
+                clip: None,
+                marks: vec![Rect::new(2.0, 2.0, 10.0, 10.0)],
+                budget: Budget::new(budget),
+            };
+            let mut handle = RenderDoc::open(&source).unwrap();
+            map_pages(&task, &mut handle, &indices, &tuning)
+                .unwrap()
+                .into_iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let sequential = run(
+            "sequential",
+            PoolTuning {
+                max_workers: 1,
+                min_pages: 1,
+                switch_after: Duration::MAX,
+            },
+            u64::MAX,
+        );
+        // A 70 x 78 pt page at 300 dpi is about 1.04 MB at 11 bytes per pixel.
+        let pooled = run(
+            "pooled",
+            PoolTuning {
+                max_workers: 6,
+                min_pages: 1,
+                switch_after: Duration::ZERO,
+            },
+            1_500_000,
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(sequential.len(), 24);
+        assert!(
+            sequential == pooled,
+            "pooled files differ from sequential ones"
+        );
     }
 
     #[test]

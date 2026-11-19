@@ -83,7 +83,11 @@ Page-by-page verbs such as `text`, `search`, `count`, and `render` start
 sequentially. After 200 ms, they use worker threads if at least eight pages
 remain. The worker ceiling is eight by default, or `PDF_GOAT_WORKERS`, capped
 at the CPU count. Each worker opens its own document handle.
-`PDF_GOAT_WORKERS=1` keeps page work sequential.
+`PDF_GOAT_WORKERS=1` keeps page work sequential. `render` and
+`compare visual` also share a 2 GiB pixel budget, about 11 bytes per output
+pixel, so pages at high `--dpi` wait for one another instead of each worker
+holding a full page; a page larger than the budget renders alone. The files are
+the same as a sequential run's.
 
 The CLI stores a derived text cache at `PDF_GOAT_HOME/cache.sqlite`. The
 `PDF_GOAT_CACHE_MB` setting limits cached row payloads to 256 MiB by default.

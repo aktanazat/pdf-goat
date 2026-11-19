@@ -575,6 +575,7 @@ pub fn encode_png(
         prev.copy_from_slice(row);
     }
     let compressed = deflate_zlib(&raw);
+    drop(raw);
 
     let mut out = Vec::with_capacity(compressed.len() + 128);
     out.extend_from_slice(&SIGNATURE);
@@ -601,7 +602,9 @@ pub fn encode_png(
 /// numbered levels.
 fn deflate_zlib(raw: &[u8]) -> Vec<u8> {
     let mut compressor = CompressorOxide::new(DEFLATE_FLAGS);
-    let mut out = vec![0u8; (raw.len() / 2).max(64)];
+    // Room for stored blocks, deflate's worst case (5 bytes per 65535), so the buffer is
+    // not doubled and copied mid-stream; untouched zeroed pages cost no memory.
+    let mut out = vec![0u8; raw.len() + raw.len() / 8192 + 64];
     let mut input = raw;
     let mut out_pos = 0;
     loop {
