@@ -155,34 +155,35 @@ impl PageTask for RenderTask {
         let output =
             self.directory
                 .join(format!("{}_p{:03}.{}", self.stem, index + 1, self.format));
-        save_image(&output, &pixmap, &self.format, self.dpi)?;
+        save_image(&output, pixmap, &self.format, self.dpi)?;
         Ok(output.to_string_lossy().into_owned())
     }
 }
 
-fn save_image(path: &Path, pixmap: &Pixmap, format: &str, dpi: f64) -> Result<(), GoatError> {
+fn save_image(path: &Path, pixmap: Pixmap, format: &str, dpi: f64) -> Result<(), GoatError> {
     let rgb = pixmap.to_rgb8([255; 3]);
+    let (width, height) = (pixmap.width(), pixmap.height());
+    drop(pixmap);
     let data = match format {
         "png" => pdf_codec::encode_png(
             &rgb,
-            pixmap.width(),
-            pixmap.height(),
+            width,
+            height,
             pdf_codec::PngColor::Rgb,
             Some((dpi, dpi)),
         )
         .map_err(error)?,
         "jpg" => pdf_codec::encode_jpeg(
             &rgb,
-            pixmap.width(),
-            pixmap.height(),
+            width,
+            height,
             pdf_codec::JpegColor::Rgb,
             95,
             Some((dpi, dpi)),
         )
         .map_err(error)?,
         "ppm" => {
-            let mut bytes =
-                format!("P6\n{} {}\n255\n", pixmap.width(), pixmap.height()).into_bytes();
+            let mut bytes = format!("P6\n{} {}\n255\n", width, height).into_bytes();
             bytes.extend_from_slice(&rgb);
             bytes
         }

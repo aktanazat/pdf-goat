@@ -6,8 +6,10 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 /// Bytes the pages rendering at once may hold.
 pub(crate) const DEFAULT_BYTES: u64 = 2 << 30;
 
-/// Bytes one pixel costs while its page renders and saves: the RGBA pixmap (4), its RGB
-/// copy (3), and the filtered PNG rows (3), rounded up.
+/// Bytes one pixel costs while its page renders and saves: the RGBA pixmap (4) with its
+/// RGB copy (3), then, once the pixmap is dropped, the RGB copy with the filtered PNG rows
+/// (3) and the compressed stream (at most 3) or its copy into the file's bytes (3), with
+/// room to spare.
 pub(crate) const BYTES_PER_PIXEL: u64 = 11;
 
 pub(crate) struct Budget {
