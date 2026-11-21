@@ -1,6 +1,6 @@
 # Organize pages
 
-Set `IN` to the PDF, `OTHER` to a second PDF and `W` to an empty work directory, all absolute. The example `IN` has 3 A4 pages headed "Quarterly Report", "Second Page" and "Third Page"; `OTHER` is a one-page agreement. Pages are 1-based; ranges look like `2-5,9`.
+Set `IN` to the PDF, `OTHER` to a second PDF and `W` to an empty work directory, all absolute. The example `IN` has 3 A4 pages headed "Quarterly Report", "Second Page" and "Third Page"; `OTHER` is a one-page agreement.
 
 After any reshuffle, prove the order with `text` (first line of each page) and the count with `info`; prove rotation and size with `inspect`.
 
