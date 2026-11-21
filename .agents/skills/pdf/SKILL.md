@@ -1,11 +1,6 @@
 ---
 name: pdf
 description: "PDF jobs with pdf-goat (CLI `pdf-goat --agent ...` or MCP capabilities/run/render): read, search, cite page+rect; fill forms; sign paper forms; certificate-sign (PKCS#12, timestamp, LTV, certify) and verify; redact; OCR to PDF/A; compare; organize pages; create from Markdown/HTML/images; metadata, bookmarks, links, attachments, accessibility, encryption, size; Office conversion."
-allowed-tools: "Read Bash"
-argument-hint: "<command> [sub] <file> [options]"
-metadata:
-  bins:
-    - pdf-goat
 hide: true
 ---
 
