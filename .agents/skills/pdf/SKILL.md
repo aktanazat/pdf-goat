@@ -1,6 +1,6 @@
 ---
 name: pdf
-description: "PDF jobs with pdf-goat, through the CLI (`pdf-goat --agent ...`) or the `pdf-goat` MCP tools (capabilities, run, render): read, search and cite page plus rectangle; fill forms; sign paper forms; certificate-sign with PKCS#12, timestamp, LTV or certify, then verify; redact and prove it; OCR scans to searchable PDF/A; compare versions; organize pages; make PDFs from Markdown, HTML and images; metadata, bookmarks, links, attachments, accessibility, encryption, size; Office conversion. Every change is read back and looked at before it is reported."
+description: "PDF jobs with pdf-goat (CLI `pdf-goat --agent ...` or MCP capabilities/run/render): read, search, cite page+rect; fill forms; sign paper forms; certificate-sign (PKCS#12, timestamp, LTV, certify) and verify; redact; OCR to PDF/A; compare; organize pages; create from Markdown/HTML/images; metadata, bookmarks, links, attachments, accessibility, encryption, size; Office conversion."
 allowed-tools: "Read Bash"
 argument-hint: "<command> [sub] <file> [options]"
 metadata:
@@ -11,11 +11,9 @@ hide: true
 
 # PDF work with pdf-goat
 
-`pdf-goat` does every PDF step: 106 commands that read, render, edit, fill, sign, redact, OCR, convert, compare and optimize. Run it from PATH, or through the `pdf-goat` launcher in the root of its repository after `cargo build --release -p pdf-goat`. Each workflow has a reference file (listed at the end) with exact commands and the fields to check.
+`pdf-goat` does every PDF step. Each workflow's reference (end of file) has exact commands and fields to check.
 
 ## Calling it
-
-CLI: put `--agent` before the command and one JSON object comes back.
 
 ```bash
 pdf-goat --agent capabilities
@@ -23,12 +21,10 @@ pdf-goat --agent capabilities edit
 pdf-goat --agent info "$IN"
 ```
 
-- Success: exit 0, `"ok": true`, `inputs`, `outputs` (every file written) and the command's own fields.
-- Failure: exit 1, `"ok": false`, `error` (report it as written), empty `outputs`.
-- `capabilities` lists 16 families and 25 top-level commands (`command_count` 106). `capabilities <family or command>` adds `schemas` with every argument, default and help line: read it before an unfamiliar command.
-- `pdf-goat --agent jobs --limit 5` shows the latest runs from the ledger.
+- One JSON object back: `ok`, `inputs`, `outputs` (every file written), command fields; failure is exit 1 with `error` (report as written).
+- `capabilities <family or command>` gives `schemas` with every argument: read it before an unfamiliar command. `pdf-goat --agent jobs --limit 5` shows recent runs.
 
-MCP: when the `pdf-goat` server is connected (stdio, binary `pdf-goat-mcp` beside `pdf-goat`), the same commands run as three tools, one pdf-goat process per call. Clients list them under the server name; omp shows `xd://mcp__pdf_goat_capabilities`, `xd://mcp__pdf_goat_run` and `xd://mcp__pdf_goat_render`.
+MCP (`pdf-goat-mcp`; omp `xd://mcp__pdf_goat_capabilities`, `_run`, `_render`):
 
 ```mcp
 capabilities {"selector": "edit"}
@@ -77,39 +73,32 @@ F is a PDF, R a page range, `…` a rect `x0,y0,x1,y1`. Every command that write
 
 ## Verify before you report
 
-1. Locate the target: `search`, `get text-blocks`, `form list` or `inspect` give its page and rect.
-2. Mark it before changing anything: `render F --pages N --dpi 144 --clip <area around it> --mark <rect> -o DIR`, then open `outputs[0]` with Read and look. The magenta outline sits just outside the rect.
-3. Make the change with a new `-o`; check `ok` and the fields below.
-4. Read it back with a different command from the one that wrote it.
-5. Render the changed region with `--mark` on the returned `bbox` or rect and look at it.
-6. Report the output path, each change's page and rect, and what you checked.
+Locate the target (`search`, `get text-blocks`, `form list`, `inspect`), render it with `--mark` and look before and after the change; read back with a different command than the one that wrote; report output path, page and rect per change, and what you checked.
 
-| Change | Fields to check | Read back with |
+| Change | Check | Read back with |
 |---|---|---|
-| text or image placed | `bbox`, `placements`, `font`, `size` | `search` finds the text inside `bbox`; render with `--mark` |
-| form filled | `fields_set` (fields it set), `unknown_fields` (keys no field has; must be empty) | `form list` `value` and `checked` per field |
-| form flattened | `flattened: true` | `form list` `field_count` 0; `text` or `search` shows the values |
-| redaction | `redactions`, `field_redactions` | `search` count 0, `text` lacks it, render shows a black box |
-| certificate signature | `signer`, `self_signed`, `pades_level`, `timestamp`, `dss` | `security verify`, every field as returned |
-| pages moved | `merged_pages`, `order`, `deleted_pages`, `rotated_pages` | `info` `pages`, `text` per page, `inspect` `rotation` |
-| OCR | `standard`, `warnings` | `info` `has_text`, `search` a word you can see |
+| text or image placed | `bbox`, `font`, `size` | `search` inside `bbox`; render `--mark` |
+| form filled | `unknown_fields` empty | `form list` `value`, `checked` |
+| form flattened | `flattened: true` | `form list` `field_count` 0; `search` |
+| redaction | `redactions` | `search` count 0, `text`, render |
+| certificate signature | `signer`, `self_signed`, `pades_level`, `timestamp` | `security verify` |
+| pages moved | `merged_pages`, `order`, `deleted_pages`, `rotated_pages` | `info`, `text`, `inspect` |
+| OCR | `standard`, `warnings` | `info` `has_text`, `search` a visible word |
 | metadata, outline, links | `count`, `removed` | `meta get`, `get bookmarks`, `get links` |
-| encryption | `algorithm` | `info` fails without the password; `security decrypt` |
-| size | `saved_bytes`, `ratio` | `info` and a render of one page |
+| encryption | `algorithm` | `info` fails without password |
+| size | `saved_bytes` | `info`, render one page |
 
-## Honest limits
+## Limits
 
-- Rendering and colour fidelity are still being improved: judge renders for position and legibility, and never promise pixel-exact output.
-- `edit text` replaces simple text runs only; it does not reflow or match embedded fonts. `replacements: 0` means nothing changed, though `ok` is true.
-- `convert pdfa` writes PDF/A-2b and reports `conformance_validated: false`. `convert ocr` reports `standard` PDF/A-2u or PDF/A-2b (null with a warning if that step failed), also unvalidated. Say so when an archival file is required.
-- `accessibility set` sets Marked, Lang and Title; it does not build a tag tree.
-- `security verify`: `trusted` is the local policy and `chain_trusted` the certificate chain against the system roots plus any `--trust`. `pades_level` follows the evidence stored in the file, so a certificate without a revocation answer (listed in `dss.unchecked`) holds it at `B-T`, and a critical certificate extension pdf-goat does not process makes `chain_trusted: false` with a `trust_error` naming it. Report `pades_level`, `chain_trusted`, `trust_error`, `revocation` and `modified` exactly as returned, never as a plain "valid signature".
-- `security sign` without `--p12` uses a self-signed demo identity (signer "pdf-goat demo", `self_signed: true`): a test, never a real signature.
-- `security sanitize` keeps the title and author; run `meta strip` as well.
-- `redact` finds text only: OCR a scan first. `convert tables` finds ruled tables only.
-- `compress` and `optimize reduce` never grow a file; on an already lean file they save 0 bytes.
-- Encrypted input: `info`, `text` and `inspect` fail until `security decrypt`; `preflight` still answers with `needs_password`.
-- Helpers: `convert from-office` needs `office2pdf` on PATH; `office run` and `office export` need LibreOffice in /Applications; `convert audio` uses macOS `say`; `search --meaning` needs `setup meaning` once. `convert ocr` needs macOS; elsewhere it fails with "OCR needs the macOS Vision framework". Off macOS, `security verify` checks chains against `--trust` anchors only, so `chain_trusted` is false without one.
+- Judge renders for position and legibility, never pixel fidelity.
+- `edit text` replaces simple runs only, no reflow; `replacements: 0` with `ok: true` means nothing changed.
+- `convert pdfa` / `convert ocr` PDF/A output is never validated (`conformance_validated: false`): say so.
+- `accessibility set` builds no tag tree.
+- `security verify`: report `pades_level`, `chain_trusted`, `trust_error`, `revocation`, `modified` as returned, never "valid signature". Without `--p12`, `security sign` uses a self-signed demo identity: tests only.
+- `security sanitize` keeps title and author: also `meta strip`.
+- `redact` needs text: OCR scans first. `convert tables` finds ruled tables only.
+- Encrypted input: `info`, `text`, `inspect` fail until `security decrypt`; `preflight` reports `needs_password`.
+- Helpers: `convert from-office` needs `office2pdf`; `office run`/`export` need LibreOffice in /Applications; `convert audio` uses `say`; `search --meaning` needs `setup meaning` once; `convert ocr` needs macOS.
 
 ## References
 
@@ -119,8 +108,8 @@ F is a PDF, R a page range, `…` a rect `x0,y0,x1,y1`. Every command that write
 - `references/certificate-signing.md`: PKCS#12 signatures, visible box, timestamp, LTV, certify, verify
 - `references/redact.md`: redact text and scans, and prove it is gone
 - `references/ocr.md`: scan to searchable PDF/A
-- `references/compare.md`: text, visual and structure comparison
-- `references/organize-pages.md`: merge, split, reorder, rotate, insert, impose, stamp, number
-- `references/create-pdfs.md`: Markdown, HTML and images to PDF
-- `references/document-properties.md`: metadata, bookmarks, links, attachments, accessibility, encryption, size
-- `references/office.md`: PDF to and from Word, Excel and PowerPoint; LibreOffice scripts
+- `references/compare.md`: text, visual, structure
+- `references/organize-pages.md`: merge, split, reorder, rotate, impose, stamp, number
+- `references/create-pdfs.md`: Markdown, HTML, images to PDF
+- `references/document-properties.md`: metadata, outline, links, attachments, accessibility, encryption, size
+- `references/office.md`: Word, Excel, PowerPoint, LibreOffice scripts

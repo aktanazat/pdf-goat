@@ -1,6 +1,6 @@
 # Metadata, outline, links, attachments, accessibility, encryption, size
 
-Set `IN` to the PDF, `W` to an empty work directory and `ATTACH` to a file to embed, all absolute. The example `IN` is a 3-page report titled "Quarterly Report".
+`IN` the PDF, `W` an empty work dir, `ATTACH` a file to embed.
 
 ## 1. Metadata
 
@@ -9,10 +9,6 @@ pdf-goat --agent meta get "$IN"
 pdf-goat --agent meta set "$IN" --set "title=Quarterly Report Q3" --set "author=Finance Team" --set "subject=Q3 results" --set "keywords=revenue, costs" -o "$W/meta.pdf"
 pdf-goat --agent meta get "$W/meta.pdf"
 ```
-
-- `metadata` holds `format`, `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `creationDate`, `modDate` when present. `meta set` returns the new `metadata`; `meta get` on the output must show the same values.
-- `has_xmp` is true when the file also carries an XMP metadata stream (false for this report).
-- `meta strip` removes everything but `format` (see `redact.md`).
 
 ## 2. Outline and links
 
@@ -30,10 +26,7 @@ pdf-goat --agent links remove "$W/links.pdf" --external-only -o "$W/internal-lin
 pdf-goat --agent bookmarks clear "$W/outline.pdf" -o "$W/no-outline.pdf"
 ```
 
-- `bookmarks set` replaces the whole outline: `count` 3, and `get bookmarks` returns the same list (`level`, `title`, `page`, 1-based).
-- `links add` returns `page`. `get links` lists `page`, `rect` (search frame), `uri` and `target_page`, which counts from 0: the `--goto 3` link reads `target_page: 2`.
-- `links remove` reports `removed` (here 1) and `external_only`; `bookmarks clear` reports `removed` (here 3).
-- Find a link's rect with `search` on the words it should cover.
+- `bookmarks set` replaces the whole outline. `get links` `target_page` counts from 0.
 
 ## 3. Attachments
 
@@ -43,9 +36,6 @@ pdf-goat --agent get attachments "$W/attached.pdf" -o "$W/attachments"
 pdf-goat --agent detach "$W/attached.pdf" --name notes.csv -o "$W/detached.pdf"
 ```
 
-- `attach` reports `attached` (the file name). `get attachments` writes each one into the directory: `count` 1 and `outputs` `$W/attachments/notes.csv`, byte-identical to the original (`cmp` them).
-- `detach` reports `removed` (`["notes.csv"]`) and `count`; `--all` removes every attachment.
-
 ## 4. Accessibility basics
 
 ```bash
@@ -54,8 +44,7 @@ pdf-goat --agent accessibility set "$W/meta.pdf" --title "Quarterly Report Q3" -
 pdf-goat --agent accessibility check "$W/a11y.pdf"
 ```
 
-- `accessibility check`: `tagged`, `has_title`, `title`, `has_lang`, `lang`, `images`, `images_without_alt`, `issues`. Here `issues` `["untagged", "no_lang"]` before and `[]` after.
-- `accessibility set` sets the Marked flag, Lang and Title only; its `note` says it builds no tag tree. An empty `issues` list is not a full accessibility audit: say so.
+- Sets Marked, Lang and Title only; empty `issues` is not a full audit.
 
 ## 5. Passwords and permissions
 
@@ -83,10 +72,7 @@ pdf-goat --agent info "$W/smaller.pdf"
 pdf-goat --agent render "$W/smaller.pdf" --pages 1 --dpi 96 -o "$W/smaller-look"
 ```
 
-- `optimize reduce`: `preset` (`screen`, `ebook` default, `printer`, `prepress`), `original_bytes`, `reduced_bytes`, `ratio`, `saved_bytes`. Presets downsample images: a 200 dpi two-page scan went from 76,401 to 25,143 bytes with `screen`. A text-only file usually saves 0 bytes.
-- `compress` also reports `linearized` and `kept_original` (true when the result would not be smaller, so the original bytes are written).
-- `repair` rewrites the file's structure; `warnings` is true when the input was damaged and had to be rebuilt, false when it loaded cleanly.
-- Read the result back with `info` (same `pages`) and render a page to check images are still legible at the size it will be used.
+- Presets downsample images; text-only files usually save 0. `compress` `kept_original: true` means no gain. `repair` `warnings: true` means it rebuilt a damaged file. Render to check legibility.
 
 ## 7. Look inside
 
@@ -96,6 +82,3 @@ pdf-goat --agent inspect "$IN" --limit 1
 pdf-goat --agent get fonts "$IN"
 pdf-goat --agent get object "$IN" catalog
 ```
-
-- `count`: `pages`, `words`, `chars`. `inspect`: per page `width_pt`, `height_pt`, `rotation`, `text_chars`, `word_count`, `image_count`, `link_count`, `annotation_count`, `form_field_count`; `truncated` and `next_page` page through long files.
-- `get fonts`: `name`, `type`, `ext`, `encoding` per font. `get object` prints an object (`catalog`, `trailer`, `page:N` or a number) as text, for questions no other command answers.

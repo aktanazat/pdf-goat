@@ -1,6 +1,6 @@
 # Redact and prove the text is gone
 
-`redact` removes the matching text from the page content, clears the same area of any image under it, paints a black box, and clears matching form field values. Set `IN` to the PDF and `W` to an empty work directory, both absolute.
+`redact` removes matching text, clears image pixels under it, paints a black box and clears matching field values. `IN` the PDF, `W` an empty work dir.
 
 ## 1. Find every occurrence first
 
@@ -9,8 +9,7 @@ pdf-goat --agent search "$IN" "123-45-6789"
 pdf-goat --agent text "$IN" --mask '\d{3}-\d{2}-\d{4}'
 ```
 
-- `search` gives the count and rects to expect: here one hit, page 1, `[337.8, 191.9, 404.5, 204.8]`.
-- `text --mask RE` shows the text with every regex match replaced by `[REDACTED]`, a dry run of what a pattern catches. Check it catches every variant (spaces, no dashes) before redacting.
+- `text --mask` is a dry run of a pattern: check it catches every variant (spaces, no dashes).
 
 ## 2. Redact
 
@@ -42,8 +41,7 @@ pdf-goat --agent meta strip "$W/sanitized.pdf" -o "$W/clean.pdf"
 pdf-goat --agent meta get "$W/clean.pdf"
 ```
 
-- `security sanitize` reports `removed` (`javascript`, `embedded_files`, `attached_files`, `xml_metadata`, `thumbnails`). It keeps the title and author.
-- `meta strip` clears those: `meta get` then shows `metadata` with only `format`. A value can also hide in bookmarks, link targets or attachments: check `get bookmarks`, `get links`, `get attachments` when it matters.
+- `sanitize` keeps title and author; `meta strip` clears them. Values can also hide in bookmarks, links, attachments.
 
 ## 5. Scans
 
@@ -55,6 +53,4 @@ pdf-goat --agent search "$W/scan-redacted.pdf" "Revenue grew"
 pdf-goat --agent get images "$W/scan-redacted.pdf" -o "$W/scan-images"
 ```
 
-- `redactions` is 1 and `search` returns `count: 0`.
-- `get images` writes the page images as stored: open the first with Read; the redacted words are blank in the image itself, so nothing survives under the box.
-- OCR can misread a word, and a misread word escapes the pattern: compare `text` with a render before trusting the count.
+- Open the extracted image: the words must be blank in it. An OCR misread escapes the pattern: compare `text` with a render.

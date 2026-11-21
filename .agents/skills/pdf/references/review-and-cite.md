@@ -1,6 +1,6 @@
 # Review a document and cite page plus rectangle
 
-Set `IN` to the PDF and `W` to an empty work directory, both absolute. The numbers below come from a one-page A4 service agreement; yours will differ.
+`IN` the PDF, `W` an empty work dir, both absolute. Numbers below come from a one-page A4 agreement.
 
 ## 1. Size it up
 
@@ -22,8 +22,7 @@ pdf-goat --agent text "$IN" -o "$W/agreement.txt"
 pdf-goat --agent text "$IN" --pages 1
 ```
 
-- The first returns `pages[]` with `page` and `text`. For a long document use the second: the JSON carries only `outputs`, `page_count` and `char_count`, and you read the file with Read. The third reads only the pages `--pages` names (`2-5,9` form); each entry keeps its document page number.
-- Text comes out in reading order, not layout. Add `--layout` when columns matter.
+- Long documents: write to a file (JSON then carries only `outputs`, counts) and Read it. `--layout` when columns matter.
 
 ## 3. Find and cite
 
@@ -32,31 +31,24 @@ pdf-goat --agent search "$IN" "1,200 USD"
 pdf-goat --agent get text-blocks "$IN" --pages 1
 ```
 
-- `search` returns `count` and `hits[]` with `page` and `rect`: here one hit, page 1, `[139.9, 191.9, 193.3, 204.8]`. `truncated: true` means `--limit` or `--first` stopped early.
-- `search` is literal and ignores case; it finds substrings, so "pay" also hits "pays". It takes no regular expressions.
-- `get text-blocks` returns `blocks[]` with `page`, `block`, `rect`, `text`: cite a whole paragraph with its block rect (here block 3, `[62.69, 191.94, 404.46, 204.75]`).
-- Cite as: page 1, rect [139.9, 191.9, 193.3, 204.8] in points from the page's top-left corner, y down.
-
-Look at what you cite:
+- `search`: literal substring, ignores case, no regex. `hits[]` with `page`, `rect`; `truncated: true` means `--limit`/`--first` stopped it.
+- `get text-blocks`: `blocks[]` with `rect` for citing a paragraph.
+- Cite as: page 1, rect [139.9, 191.9, 193.3, 204.8] in points, top-left origin, y down.
 
 ```bash
 pdf-goat --agent render "$IN" --pages 1 --dpi 144 --clip 50,180,420,215 --mark 139.9,191.9,193.3,204.8 -o "$W/cite"
 ```
 
-- `outputs[0]` is `$W/cite/agreement_p001.png`; open it with Read. `marks` echoes the rect, outlined in magenta just outside it.
-- The clip here equals the search frame because `inspect` reported `rotation` 0. On a rotated page drop `--clip` (see SKILL.md for the conversion).
+- Open `outputs[0]` and look. On a rotated page drop `--clip` (SKILL.md).
 
 ## 4. Find by meaning
-
-When you know the idea but not the wording:
 
 ```bash
 pdf-goat --agent setup status
 pdf-goat --agent search "$IN" "monthly fee" --meaning --limit 3
 ```
 
-- `setup status`: `installed: true` means the meaning model is present; otherwise run `pdf-goat --agent setup meaning` once (about 30 MB download).
-- `--meaning` returns `mode: "meaning"` and `hits[]` with `page`, `block`, `rect`, `text` and `score`, best first. Here the top hit is the payment sentence. Confirm a meaning hit by reading its text; scores only rank.
+- `installed: false`: run `pdf-goat --agent setup meaning` once (~30 MB). Scores only rank: read the hit text.
 
 ## 5. Mark up a review
 
@@ -76,6 +68,5 @@ pdf-goat --agent transcript read "$TRANSCRIPT" --conferred 2026-06-15
 pdf-goat --agent transcript resolve --root "$TRANSCRIPTS" --glob "transcript*.pdf"
 ```
 
-- `transcript read` returns `document_identity`, `issue_date`, `degree` (`name`, `status`, `conferral_date`), `terms[]` with `courses[]` (`course`, `title`, `grade`, `units`, `points`) and `parse_quality.confidence`.
-- `freshness.verdict` compares the printed issue date and the terms with the conferral date you assert: `current`, `stale_before_conferral`, `stale_missing_terms`, `unknown_issue_date`, or `not_checked` without `--conferred`. Report `freshness.reason` with it; the filename is never evidence.
-- `transcript resolve` ranks the matching PDFs in one directory (not recursive) by printed issue date: `candidates[]` with `rank`, `path` and `issue_date`.
+- `freshness.verdict`: `current`, `stale_before_conferral`, `stale_missing_terms`, `unknown_issue_date`, `not_checked`; report `freshness.reason` too. The filename is never evidence.
+- `resolve` ranks PDFs in one directory (not recursive) by printed issue date.
